@@ -1071,4 +1071,44 @@ Untertitel"));
         assert_eq!(c.project.fps, 24);
         assert!(c.status.contains("HDR"), "{}", c.status);
     }
+
+    /// Bild-Effekte müssen auch bei Videoclips wirken, in der Vorschau (asynchroner Decoder) wie im Export.
+    #[test]
+    fn effects_apply_to_video_clips_in_renderer_and_preview_path() {
+        let mut a = app();
+        let red = crate::render::tests::solid_png("vfx_red.png", 320, 180, [220, 20, 20]);
+        let mut p = Project::default();
+        let ra = crate::render::tests::image_asset(&mut p, &red, 320.0, 180.0);
+        p.tracks[0].clips.push(crate::render::tests::clip(ra, 0.0, 2.0));
+        p.render_width = 320;
+        p.render_height = 180;
+        p.fps = 15;
+        let mp4 = tmp("vfx_src.mp4");
+        crate::export::export(&p, &mp4, &crate::export::ExportOpts::from_project(&p), &mut |_| true).unwrap();
+        a.import_file(mp4);
+        let vid = a.project.assets.iter().find(|x| !x.is_image).unwrap().id;
+        a.add_to_timeline(vid, None, Some(0.0), None);
+        let cid = a.selected.unwrap();
+        let ctx = egui::Context::default();
+        let center = |rgba: &[u8], w: usize| { let o = (90 * w + 160) * 4; [rgba[o] as i32, rgba[o + 1] as i32, rgba[o + 2] as i32] };
+        // Vorschau-Weg: Renderer mit asynchronem Decoder (wie im Monitor), Bild erst nach kurzer Wartezeit
+        let mut grab = |a: &mut App| {
+            for _ in 0..60 {
+                let tex_key_before = a.preview.dbg_key();
+                let _ = a.preview_image(&ctx, 320, 180);
+                if a.preview.dbg_key() != tex_key_before { /* neu gerechnet */ }
+                std::thread::sleep(Duration::from_millis(40));
+                a.project_rev += 0;
+            }
+            let pv = &mut a.preview;
+            pv.renderer.render_with(&a.project, 0.5, 320, 180, &mut pv.frames)
+        };
+        let plain = center(&grab(&mut a), 320);
+        assert!(plain[0] > 150 && plain[1] < 80, "rot ohne Effekt: {plain:?}");
+        a.project.clip_mut(cid).unwrap().set_channel(crate::anim::Channel::Saturation, 0.0, 0.5);
+        a.project_rev += 1;
+        let gray = center(&grab(&mut a), 320);
+        assert!((gray[0] - gray[1]).abs() < 12 && (gray[1] - gray[2]).abs() < 12, "Sättigung 0 = grau: {gray:?}");
+    }
 }
+

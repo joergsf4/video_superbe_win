@@ -565,7 +565,7 @@ impl App {
             dlg = dlg.set_directory(dir);
         }
         if let Some(files) = dlg
-            .add_filter("Medien", &["png", "jpg", "jpeg", "mp4", "mov", "m4v", "wmv", "avi", "mkv", "wav", "mp3", "m4a", "aac", "wma", "flac"])
+            .add_filter("Medien", &["png", "jpg", "jpeg", "mp4", "mov", "m4v", "wmv", "avi", "mkv", "mts", "m2ts", "ts", "wav", "mp3", "m4a", "aac", "wma", "flac"])
             .pick_files()
         {
             for f in files {
@@ -580,7 +580,7 @@ impl App {
             self.open_path_checked(p);
             return;
         }
-        if matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "wmv" | "avi" | "mkv") {
+        if matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "wmv" | "avi" | "mkv" | "mts" | "m2ts" | "ts") {
             match video::probe(&p) {
                 Ok(i) => {
                     let a = MediaAsset {
@@ -627,7 +627,7 @@ impl App {
         }
         if !matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
             self.status = format!("Dateityp .{ext} wird nicht unterstützt.");
-            self.import_failed(&p, format!("Dateityp „.{ext}“ wird nicht unterstützt. Möglich sind Videos (mp4, mov, m4v, wmv, avi, mkv), Bilder (png, jpg) und Ton (wav, mp3, m4a, aac, wma, flac)."));
+            self.import_failed(&p, format!("Dateityp „.{ext}“ wird nicht unterstützt. Möglich sind Videos (mp4, mov, m4v, wmv, avi, mkv, mts, m2ts, ts), Bilder (png, jpg) und Ton (wav, mp3, m4a, aac, wma, flac)."));
             return;
         }
         match image::image_dimensions(&p) {
