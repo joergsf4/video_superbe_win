@@ -1,0 +1,12 @@
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-clang"
+rustflags = ["-C", "target-feature=+crt-static", "-L", "shim64"]
+
+[env]
+CC_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-clang"
+CXX_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-clang++"
+AR_x86_64_pc_windows_gnu = "llvm-ar"
+

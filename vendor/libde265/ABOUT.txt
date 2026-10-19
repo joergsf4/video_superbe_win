@@ -1,0 +1,4 @@
+libde265 1.0.15 (https://github.com/strukturag/libde265), LGPL-3.0, Copyright struktur AG.
+Quellcode des Decoders (ohne Encoder und Beispielprogramme), statisch in MacVideoDeluxe.exe eingebunden.
+Lizenztext: COPYING. Der Quellcode liegt diesem Programm bei (Ordner vendor/libde265).
+Aenderung gegenueber dem Original: vui.cc behaelt transfer_characteristics = 18 (HLG, iPhone-HDR) bei, statt ihn auf 2 zurueckzusetzen (macvideo-Markierung im Code).
