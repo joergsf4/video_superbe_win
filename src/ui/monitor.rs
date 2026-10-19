@@ -49,6 +49,10 @@ impl PreviewState {
     }
 
     /// Nach Projektwechsel: Decoder und Bild verwerfen.
+    pub fn dbg_key(&self) -> Option<(u64, u64, usize, usize, u64)> {
+        self.key
+    }
+
     pub fn reset(&mut self) {
         self.frames.decs.clear();
         self.key = None;

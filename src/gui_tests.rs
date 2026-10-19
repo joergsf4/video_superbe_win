@@ -890,3 +890,32 @@ fn level_meter_is_drawn_while_playing() {
     h.frames(3);
 }
 
+#[test]
+fn effect_sliders_are_reachable_and_change_the_clip() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    h.app.selected = Some(ids.c_a);
+    h.app.inspector_tab = 3;
+    h.frames(3);
+    // Die Seitenleiste behält die volle Höhe (der Animator sitzt nur unter dem Monitor)
+    assert!(h.app.preview_rect.right() < 760.0, "Monitor schmaler als das Fenster: {:?}", h.app.preview_rect);
+    let start = h.clip(ids.c_a).fx.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..5 {
+        for y in (130..520).step_by(17) {
+            let c0 = h.clip(ids.c_a).fx.clone();
+            h.drag(Pos2::new(1110.0, y as f32), Pos2::new(1300.0, y as f32));
+            let c1 = h.clip(ids.c_a).fx.clone();
+            for (name, a, b) in [("Helligkeit", c0.brightness, c1.brightness), ("Kontrast", c0.contrast, c1.contrast), ("Sättigung", c0.saturation, c1.saturation), ("Wärme", c0.temperature, c1.temperature), ("Schärfe", c0.sharpness, c1.sharpness), ("Weichzeichner", c0.blur, c1.blur), ("Vignette", c0.vignette, c1.vignette)] {
+                if (a - b).abs() > 1e-9 {
+                    seen.insert(name);
+                }
+            }
+        }
+        h.mv(Pos2::new(1200.0, 300.0));
+        h.run(vec![Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -150.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel }]);
+        h.frames(2);
+    }
+    assert!(h.clip(ids.c_a).fx != start, "kein Regler hat den Clip verändert");
+    assert!(seen.len() >= 6, "erreichbare Effekt-Regler: {seen:?}");
+}

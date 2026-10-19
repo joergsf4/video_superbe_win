@@ -231,12 +231,8 @@ impl App {
             .frame(Frame::new().fill(BG))
             .resizable(true)
             .min_size(200.0)
-            .default_size(340.0)
+            .default_size(310.0)
             .show_inside(ui, |ui| self.timeline_panel(ui));
-        // Keyframe-Animator unter dem Monitor, solange der Reiter „Effekte“ offen ist
-        if let Some(clip) = self.animator_clip() {
-            egui::Panel::bottom("animator").frame(Frame::new().fill(PANEL)).resizable(false).exact_size(210.0).show_inside(ui, |ui| self.animator_panel(ui, clip));
-        }
         egui::Panel::right("inspector")
             .frame(Frame::new().fill(PANEL))
             .resizable(true)
@@ -249,6 +245,10 @@ impl App {
             .default_size(340.0)
             .size_range(260.0..=900.0)
             .show_inside(ui, |ui| self.pool_panel(ui));
+        // Keyframe-Animator nur unter dem Monitor (nach den Seitenleisten, damit diese die volle Höhe behalten), solange der Reiter „Effekte“ offen ist
+        if let Some(clip) = self.animator_clip() {
+            egui::Panel::bottom("animator").frame(Frame::new().fill(PANEL)).resizable(false).exact_size(170.0).show_inside(ui, |ui| self.animator_panel(ui, clip));
+        }
         egui::CentralPanel::default().frame(Frame::new().fill(PANEL)).show_inside(ui, |ui| self.preview_pane(ui));
 
         self.settings_window(&ctx);
