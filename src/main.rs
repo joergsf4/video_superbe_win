@@ -14,6 +14,7 @@ mod analysis;
 mod audio;
 mod loudness;
 mod model;
+mod navigation;
 mod ops;
 mod player;
 mod record;

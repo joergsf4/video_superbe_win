@@ -33,6 +33,9 @@ pub struct TrimDrag {
     pub left: bool,
     pub dl: f64,
     pub dr: f64,
+    /// zuletzt gewünschte (eingerastete) Kantenzeit und die Optionen (J-L-Schnitt, Ripple, Roll) dieser Geste
+    pub wanted: f64,
+    pub opts: crate::ops::TrimOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -156,7 +159,11 @@ impl App {
 
     /// Einrasten für Ziehen/Kürzen/Ablegen; setzt die Einrastlinie.
     fn snap_time(&mut self, ui: &Ui, t: f64, exclude: &HashSet<Uuid>) -> f64 {
-        let target = self.snap_target(t, exclude, Self::alt_down(ui));
+        self.snap_time_alt(t, exclude, Self::alt_down(ui))
+    }
+
+    fn snap_time_alt(&mut self, t: f64, exclude: &HashSet<Uuid>, alt: bool) -> f64 {
+        let target = self.snap_target(t, exclude, alt);
         self.tl.snap_guide = target;
         target.unwrap_or(t)
     }
@@ -176,6 +183,9 @@ impl App {
             ClipContent::Title(w) => format!("T  {}", w.v.text.replace('\n', " ")),
             ClipContent::Media(w) => self.project.asset(w.v).map(|a| a.name.clone()).unwrap_or_else(|| "?".into()),
         };
+        if c.group.is_some() {
+            s = format!("▣ {s}");
+        }
         if (c.speed - 1.0).abs() > 1e-6 {
             s += &format!("  ×{}", (c.speed * 100.0).round() / 100.0);
         }
@@ -416,7 +426,10 @@ impl App {
                     if !sel_set.contains(&c.id) {
                         self.select(c.id, false);
                     }
-                    let ids = self.project.with_partners(&self.selected_set());
+                    let mut ids = self.project.with_partners(&self.selected_set());
+                    // Mausmodus 7/8: alles dahinter rückt mit
+                    let fol = self.project.followers(&ids, self.mouse_mode);
+                    ids.extend(fol);
                     self.tl.move_drag = Some(MoveDrag { primary: c.id, ids, dt: 0.0, dtrack: 0 });
                 }
             }
@@ -441,6 +454,9 @@ impl App {
                             }
                         }
                     } else if let Some(md) = self.tl.move_drag.clone().filter(|m| m.primary == c.id) {
+                        // Umschalt: nur zwischen den Spuren verschieben, die Zeit bleibt
+                        let only_tracks = ui.input(|i| i.modifiers.shift);
+                        let dx = if only_tracks { 0.0 } else { dx };
                         let raw = c.start + dx as f64 / self.zoom;
                         let excl = md.ids.clone();
                         let (s_t, e_t) = (self.snap_target(raw, &excl, alt), self.snap_target(raw + c.duration, &excl, alt));
@@ -449,7 +465,7 @@ impl App {
                         let start = if ds <= de && s_t.is_some() { s_t.unwrap() } else if let Some(e) = e_t { e - c.duration } else { raw };
                         self.tl.snap_guide = if ds <= de { s_t } else { e_t };
                         let dt = start.max(0.0) - c.start;
-                        let dtrack = (dy / ROW_H).round() as isize;
+                        let dtrack = if self.mouse_mode == crate::ops::MouseMode::Single { (dy / ROW_H).round() as isize } else { 0 };
                         self.tl.move_drag = Some(MoveDrag { dt, dtrack, ..md });
                     }
                 }
@@ -503,25 +519,42 @@ impl App {
                 }
                 if resp.drag_started() && !locked {
                     self.select(c.id, false);
-                    let ids = self.project.with_partners(&[c.id].into());
-                    self.tl.trim = Some(TrimDrag { id: c.id, ids, left, dl: 0.0, dr: 0.0 });
+                    // Alt = J-L-Schnitt (nur Bild oder nur Ton), Strg = Roll, sonst Ripple nach Mausmodus
+                    let (alt_k, cmd_k) = ui.input(|i| (i.modifiers.alt, i.modifiers.command));
+                    let mut opts = crate::ops::TrimOptions::default();
+                    if alt_k && self.project.partner_id(c.id).is_some() {
+                        opts.linked = false;
+                    } else if cmd_k && self.project.roll_neighbor(c.id, left).is_some() {
+                        opts.roll = true;
+                    } else {
+                        opts.ripple = match self.mouse_mode {
+                            crate::ops::MouseMode::OneTrack => crate::ops::RippleScope::Track,
+                            crate::ops::MouseMode::AllTracks => crate::ops::RippleScope::All,
+                            crate::ops::MouseMode::Single => crate::ops::RippleScope::None,
+                        };
+                    }
+                    let mut ids = HashSet::from([c.id]);
+                    if opts.linked {
+                        ids.extend(self.project.partner_id(c.id));
+                    }
+                    self.tl.trim = Some(TrimDrag { id: c.id, ids, left, dl: 0.0, dr: 0.0, wanted: if left { c.start } else { c.end() }, opts });
                 }
                 if resp.dragged() {
                     if let (Some(tr), Some(cur), Some(press)) = (self.tl.trim.clone().filter(|t| t.id == c.id && t.left == left), ui.input(|i| i.pointer.latest_pos()), origin) {
                         let dt = (cur.x - press.x) as f64 / self.zoom;
                         let edge = if left { c.start } else { c.end() } + dt;
-                        let excl: HashSet<Uuid> = tr.ids.clone();
-                        let wanted = self.snap_time(ui, edge, &excl);
+                        let mut excl: HashSet<Uuid> = tr.ids.clone();
+                        excl.extend(self.project.trim_ignore_set(c.id, left, &tr.opts));
+                        // beim J-L-Schnitt hält Alt den Magneten nicht an
+                        let wanted = self.snap_time_alt(edge, &excl, alt && tr.opts.linked);
                         let mut p = self.project.clone();
-                        let ok = if left { p.trim_start(c.id, wanted) } else { p.trim_end(c.id, wanted) };
+                        let ok = if left { p.trim_start_opt(c.id, wanted, &tr.opts) } else { p.trim_end_opt(c.id, wanted, &tr.opts) };
                         if ok {
                             if let Some(nc) = p.clip(c.id) {
                                 let mut t2 = tr.clone();
-                                if left {
-                                    t2.dl = nc.start - c.start;
-                                } else {
-                                    t2.dr = nc.end() - c.end();
-                                }
+                                t2.dl = nc.start - c.start;
+                                t2.dr = nc.end() - c.end();
+                                t2.wanted = wanted;
                                 self.tl.trim = Some(t2);
                                 if let (Some(a), ClipPart::Video) = (nc.asset_id(), c.part) {
                                     let src = if left { nc.source_in } else { nc.source_in + nc.duration * nc.speed - 1.0 / self.project.fps.max(1) as f64 };
@@ -614,6 +647,11 @@ impl App {
                     });
                     ui.separator();
                 }
+                if cc.group.is_some() && ui.button("Gruppe auflösen").clicked() {
+                    self.select(cc.id, false);
+                    self.ungroup_selection();
+                    ui.close();
+                }
                 if cc.link.is_some() && ui.button("Verknüpfung lösen").clicked() {
                     self.project.unlink(cc.id);
                     ui.close();
@@ -635,12 +673,11 @@ impl App {
         }
         if commit_trim {
             if let Some(tr) = self.tl.trim.take() {
-                if let Some(c) = self.project.clip(tr.id).cloned() {
-                    if tr.left && tr.dl.abs() > 1e-9 {
-                        self.project.trim_start(tr.id, c.start + tr.dl);
-                    }
-                    if !tr.left && tr.dr.abs() > 1e-9 {
-                        self.project.trim_end(tr.id, c.end() + tr.dr);
+                if tr.dl.abs() > 1e-9 || tr.dr.abs() > 1e-9 {
+                    if tr.left {
+                        self.project.trim_start_opt(tr.id, tr.wanted, &tr.opts);
+                    } else {
+                        self.project.trim_end_opt(tr.id, tr.wanted, &tr.opts);
                     }
                 }
             }
@@ -834,6 +871,39 @@ impl App {
                         ui.close();
                     }
                 });
+            }
+        }
+        // Projektmarker 1–10: orangefarbene Kästchen mit der Nummer
+        let mut bm_delete: Option<u32> = None;
+        for (n, bt) in self.project.bookmark_list() {
+            let x = self.t2x(x0, bt);
+            if x < x0 - 12.0 || x > full.right() + 6.0 {
+                continue;
+            }
+            let r = Rect::from_min_size(Pos2::new(x - 6.0, ruler.top() + 1.0), Vec2::new(12.0, 11.0));
+            let orange = Color32::from_rgb(255, 140, 38);
+            rp.rect_filled(r, 2.0, orange);
+            rp.text(r.center(), Align2::CENTER_CENTER, n.to_string(), FontId::proportional(8.5), Color32::BLACK);
+            let hit = r.intersect(Rect::from_min_max(Pos2::new(x0, ruler.top()), ruler.max));
+            if hit.width() > 0.0 {
+                let resp = ui.interact(hit, ui.id().with(("bookmark", n)), Sense::click());
+                if resp.clicked() {
+                    seek_to = Some(bt);
+                }
+                resp.on_hover_text(format!("Projektmarker {n} · {}\nKlick: hinspringen · Rechtsklick: löschen", timecode(bt, self.project.fps))).context_menu(|ui| {
+                    if ui.button("Projektmarker löschen").clicked() {
+                        bm_delete = Some(n);
+                        ui.close();
+                    }
+                });
+            }
+        }
+        if let Some(n) = bm_delete {
+            if let Some(b) = self.project.bookmarks.as_mut() {
+                b.remove(&n.to_string());
+                if b.is_empty() {
+                    self.project.bookmarks = None;
+                }
             }
         }
         if let Some(t) = seek_to {

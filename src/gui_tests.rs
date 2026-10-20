@@ -919,3 +919,136 @@ fn effect_sliders_are_reachable_and_change_the_clip() {
     assert!(h.clip(ids.c_a).fx != start, "kein Regler hat den Clip verändert");
     assert!(seen.len() >= 6, "erreichbare Effekt-Regler: {seen:?}");
 }
+
+// ---------- Paket A: Schnittwerkzeuge des Mac-Originals ----------
+
+/// Zwei verknüpfte Bild/Ton-Clips à 4 s: A 0–4, B 4–8 (Bild auf Spur 1, Ton auf Spur 2).
+fn av_project() -> (Project, Uuid, Uuid) {
+    let a = MediaAsset { path: "gui_av_nicht_vorhanden.mp4".into(), name: "av".into(), duration: 20.0, has_video: true, has_audio: true, width: 100.0, height: 50.0, fps: 30.0, ..Default::default() };
+    let mut p = Project::default();
+    p.assets.push(a.clone());
+    let r1 = p.insert_media(&a, 0.0, Some(0), Some((0.0, 4.0))).unwrap();
+    let r2 = p.insert_media(&a, 4.0, Some(0), Some((4.0, 8.0))).unwrap();
+    (p, r1, r2)
+}
+
+impl H {
+    fn scoped_mods(&mut self, m: Modifiers, f: impl FnOnce(&mut H)) {
+        self.run(vec![Event::ModifiersChanged(m)]);
+        self.mods = m;
+        f(self);
+        self.mods = Modifiers::NONE;
+        self.run(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+    }
+}
+
+#[test]
+fn number_keys_set_insert_and_mouse_modes() {
+    let (p, _, _) = av_project();
+    let mut h = H::new(p);
+    h.key(Key::Num2);
+    assert_eq!(h.app.insert_mode, crate::ops::InsertMode::Ripple);
+    h.key(Key::Num5);
+    assert_eq!(h.app.insert_mode, crate::ops::InsertMode::Overwrite);
+    h.key(Key::Num1);
+    assert_eq!(h.app.insert_mode, crate::ops::InsertMode::Auto);
+    h.key(Key::Num8);
+    assert_eq!(h.app.mouse_mode, crate::ops::MouseMode::OneTrack);
+    h.key(Key::Num7);
+    assert_eq!(h.app.mouse_mode, crate::ops::MouseMode::AllTracks);
+    h.key(Key::Num6);
+    assert_eq!(h.app.mouse_mode, crate::ops::MouseMode::Single);
+}
+
+#[test]
+fn bookmark_keys_and_chapter_keys() {
+    let (p, _, _) = av_project();
+    let mut h = H::new(p);
+    h.app.playhead = 2.0;
+    h.scoped_mods(Modifiers::SHIFT, |h| h.key(Key::Num3));
+    assert_eq!(h.app.project.bookmarks.as_ref().unwrap()["3"], 2.0, "Umschalt+3 setzt Projektmarker 3");
+    h.app.playhead = 6.0;
+    h.scoped_mods(Modifiers::SHIFT, |h| h.key(Key::Num0));
+    assert_eq!(h.app.project.bookmarks.as_ref().unwrap()["10"], 6.0, "Umschalt+0 setzt Projektmarker 10");
+    h.app.playhead = 0.0;
+    h.cmd_key(Key::Num3);
+    assert_eq!(h.app.playhead, 2.0, "Strg+3 springt hin");
+    h.key(Key::W);
+    assert_eq!(h.app.playhead, 6.0, "W: nächster Marker");
+    h.key(Key::Q);
+    assert_eq!(h.app.playhead, 2.0, "Q: vorheriger Marker");
+    h.scoped_mods(Modifiers::SHIFT, |h| h.key(Key::Enter));
+    assert!(h.app.project.marker_list().iter().any(|m| (m.t - 2.0).abs() < 1e-9), "Umschalt+Enter setzt eine Kapitelmarke");
+}
+
+#[test]
+fn group_and_split_keys() {
+    let (p, r1, r2) = av_project();
+    let mut h = H::new(p);
+    h.app.select(r1, false);
+    h.app.select(r2, true);
+    h.key(Key::G);
+    assert!(h.clip(r1).group.is_some() && h.clip(r1).group == h.clip(r2).group, "G bildet eine Gruppe");
+    h.scoped_mods(Modifiers::SHIFT, |h| h.key(Key::G));
+    assert!(h.clip(r1).group.is_none(), "Umschalt+G löst auf");
+    h.app.clear_selection();
+    h.app.playhead = 2.0;
+    h.app.select(r1, false);
+    h.key(Key::T);
+    assert!(h.app.project.tracks[0].clips.len() == 3, "T teilt an der Abspielposition");
+}
+
+#[test]
+fn mouse_mode_moves_followers_with_the_dragged_clip() {
+    let (p, r1, r2) = av_project();
+    let mut h = H::new(p);
+    h.key(Key::Num8); // eine Spur: alles dahinter rückt mit
+    h.drag(h.at(1.0, 0), h.at(2.0, 0));
+    assert!((h.clip(r1).start - 1.0).abs() < 0.05, "A verschoben: {}", h.clip(r1).start);
+    assert!((h.clip(r2).start - 5.0).abs() < 0.05, "B rückt mit: {}", h.clip(r2).start);
+    // im Einzelmodus bleibt B stehen (dann ginge es nur mit Platz dahinter)
+    let (p, r1, r2) = av_project();
+    let mut h = H::new(p);
+    h.drag(h.at(1.0, 0), h.at(1.5, 0));
+    assert!((h.clip(r2).start - 4.0).abs() < 1e-6, "Mausmodus 6: B bleibt");
+    let _ = r1;
+}
+
+#[test]
+fn trim_gestures_jl_roll_and_ripple() {
+    // J-L-Schnitt: Alt + Kante ziehen kürzt nur das Bild
+    let (p, r1, _) = av_project();
+    let mut h = H::new(p);
+    let partner = h.app.project.partner_id(r1).unwrap();
+    h.scoped_mods(Modifiers::ALT, |h| h.drag(h.at(3.95, 0), h.at(3.0, 0)));
+    assert!((h.clip(r1).end() - 3.0).abs() < 0.06, "Bild gekürzt: {}", h.clip(r1).end());
+    assert!((h.clip(partner).end() - 4.0).abs() < 1e-6, "Ton bleibt: {}", h.clip(partner).end());
+    // Roll: Strg + Kante ziehen verschiebt den Schnittpunkt
+    let (p, r1, r2) = av_project();
+    let mut h = H::new(p);
+    h.scoped_mods(Modifiers::COMMAND, |h| h.drag(h.at(3.95, 0), h.at(3.0, 0)));
+    assert!((h.clip(r1).end() - 3.0).abs() < 0.06 && (h.clip(r2).start - h.clip(r1).end()).abs() < 1e-6, "Roll: {} / {}", h.clip(r1).end(), h.clip(r2).start);
+    // Ripple (Mausmodus 8): Nachfolger rückt auf
+    let (p, r1, r2) = av_project();
+    let mut h = H::new(p);
+    h.key(Key::Num8);
+    h.drag(h.at(3.95, 0), h.at(3.0, 0));
+    assert!((h.clip(r1).end() - 3.0).abs() < 0.06 && (h.clip(r2).start - 3.0).abs() < 0.06, "Ripple: {} / {}", h.clip(r1).end(), h.clip(r2).start);
+}
+
+#[test]
+fn timecode_dialog_jumps_and_status_shows_the_modes() {
+    let (p, _, _) = av_project();
+    let mut h = H::new(p);
+    h.app.tc_prompt = Some("00:00:05:00".into());
+    h.frames(2);
+    h.key(Key::Enter);
+    assert!((h.app.playhead - 5.0).abs() < 1e-6, "Zeitcode-Eingabe springt: {}", h.app.playhead);
+    assert!(h.app.tc_prompt.is_none());
+    // Lückensuche per Tastenkombination (Strg+Umschalt+C)
+    h.app.project.move_clips(&std::collections::HashSet::from([h.app.project.tracks[0].clips[1].id]), 0, 1.0);
+    h.app.playhead = 0.0;
+    h.scoped_mods(Modifiers::COMMAND | Modifiers::SHIFT, |h| h.key(Key::C));
+    assert_eq!(h.app.project.mark_in, Some(4.0), "Lücke 4–5 s markiert");
+}
+

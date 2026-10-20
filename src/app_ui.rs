@@ -23,141 +23,318 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (shift, alt) = ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
-        let k = |key: Key| ctx.input(|i| i.key_pressed(key) && !i.modifiers.command);
-        let cmd = |key: Key| ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(key));
+        let m = ctx.input(|i| i.modifiers);
+        let pressed = |key: Key| ctx.input(|i| i.key_pressed(key));
+        // genau diese Umschaltkombination (Strg bzw. ⌘ des Mac = `command`)
+        let ch = |key: Key, ctrl: bool, shift: bool, alt: bool| pressed(key) && m.command == ctrl && m.shift == shift && m.alt == alt;
+        let plain = |key: Key| ch(key, false, false, false);
+        let ctrl = |key: Key| ch(key, true, false, false);
+        let shift = |key: Key| ch(key, false, true, false);
+        let alt = |key: Key| ch(key, false, false, true);
+        let ctrl_shift = |key: Key| ch(key, true, true, false);
+        let typed: String = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect());
+
         // Quellmonitor aktiv: Transporttasten und I/O gelten für die Quelle
         if self.source.is_some() {
-            if k(Key::Space) {
+            if plain(Key::Space) {
                 self.toggle_source_play();
                 return;
             }
-            if k(Key::I) {
+            if plain(Key::I) {
                 self.set_source_in();
                 return;
             }
-            if k(Key::O) {
+            if plain(Key::O) {
                 self.set_source_out();
                 return;
             }
-            if k(Key::K) {
+            if plain(Key::K) {
                 self.pause_source();
                 return;
             }
-            if k(Key::ArrowLeft) {
+            if plain(Key::ArrowLeft) {
                 self.step_source(-1);
                 return;
             }
-            if k(Key::ArrowRight) {
+            if plain(Key::ArrowRight) {
                 self.step_source(1);
                 return;
             }
         }
-        if k(Key::Space) {
-            self.set_playing(!self.playing);
+
+        // Ziffern: Einfüge- und Mausmodus, Projektmarker, Zoomstufen
+        const NUMS: [Key; 10] = [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+        let fps = self.project.fps.max(1) as f64;
+        for (n, key) in NUMS.iter().copied().enumerate() {
+            if !pressed(key) {
+                continue;
+            }
+            let n = n as u32;
+            if shift(key) {
+                self.set_bookmark(if n == 0 { 10 } else { n });
+            } else if alt(key) {
+                match n {
+                    1 => self.zoom_to_span(1.0 / fps),
+                    2 => self.zoom_to_span(5.0 / fps),
+                    3 => self.zoom_to_span(1.0),
+                    4 => self.zoom_to_span(10.0),
+                    5 => self.zoom_to_span(60.0),
+                    _ => {}
+                }
+            } else if ch(key, true, false, true) && n == 6 {
+                self.zoom_to_span(600.0);
+            } else if ctrl(key) {
+                self.jump_to_bookmark(if n == 0 { 10 } else { n });
+            } else if plain(key) {
+                use crate::ops::{InsertMode as I, MouseMode as M};
+                match n {
+                    1 => self.set_insert_mode(I::Auto),
+                    2 => self.set_insert_mode(I::Ripple),
+                    3 => self.set_insert_mode(I::RippleAll),
+                    5 => self.set_insert_mode(I::Overwrite),
+                    6 => self.set_mouse_mode(M::Single),
+                    7 => self.set_mouse_mode(M::AllTracks),
+                    8 => self.set_mouse_mode(M::OneTrack),
+                    _ => {}
+                }
+            }
         }
-        if (k(Key::Delete) || k(Key::Backspace)) && !shift {
+
+        // Bild↑/↓: seitenweise scrollen; mit Strg+Umschalt Projektmarker, mit Alt Kapitelmarken
+        for (key, fwd) in [(Key::PageDown, true), (Key::PageUp, false)] {
+            if plain(key) {
+                self.scroll_pages(if fwd { 1.0 } else { -1.0 });
+            } else if ctrl_shift(key) {
+                self.jump_to_marker(fwd, false);
+            } else if alt(key) {
+                self.jump_to_marker(fwd, true);
+            }
+        }
+        // Pfeile: Alt = Clips verschieben (Umschalt = 10 Bilder), Umschalt = 5 Bilder springen
+        for (key, d) in [(Key::ArrowLeft, -1i64), (Key::ArrowRight, 1)] {
+            if ch(key, false, false, true) {
+                self.nudge_selection(d);
+            } else if ch(key, false, true, true) {
+                self.nudge_selection(10 * d);
+            } else if shift(key) {
+                self.step(5 * d);
+            }
+        }
+        // Eingabetaste: Kapitelmarke, Projektmarker
+        if pressed(Key::Enter) {
+            if m.shift && !m.command && !m.alt {
+                self.add_marker();
+            } else if ctrl_shift(Key::Enter) {
+                self.remove_chapter_near_playhead();
+            } else if ch(Key::Enter, true, false, true) {
+                self.remove_all_chapters();
+            } else if ctrl(Key::Enter) {
+                self.set_next_bookmark();
+            }
+        }
+        // Effekte und Animator (Handbuch: Alt+Umschalt+H, O, G, F, C, B; Animation I, P, R)
+        if m.shift && m.alt && !m.command && [Key::H, Key::O, Key::G, Key::F, Key::C, Key::B, Key::I, Key::P, Key::R].iter().any(|k| pressed(*k)) {
+            self.inspector_tab = 3;
+            self.status = "Effekte (Bild & Look, Animator)".into();
+        }
+
+        // Löschen
+        if (plain(Key::Delete) || plain(Key::Backspace)) && !ctx.egui_wants_keyboard_input() {
             self.delete_selection();
         }
-        if (k(Key::Delete) || k(Key::Backspace)) && shift {
+        if shift(Key::Delete) || shift(Key::Backspace) || ctrl(Key::Delete) || ctrl(Key::Backspace) {
             self.ripple_delete_selection();
         }
-        if k(Key::S) && !alt {
+
+        // Buchstaben
+        if plain(Key::Space) {
+            self.set_playing(!self.playing);
+        }
+        if plain(Key::S) || plain(Key::T) {
             self.split_at_playhead();
         }
-        if k(Key::N) {
+        if plain(Key::Z) {
+            self.trim_selection_to_playhead(true);
+        }
+        if plain(Key::U) {
+            self.trim_selection_to_playhead(false);
+        }
+        if plain(Key::X) {
+            self.mark_gap();
+        }
+        if plain(Key::D) {
+            self.duplicate_clips();
+        }
+        if plain(Key::F) {
+            self.zoom_fit();
+        }
+        if alt(Key::F) {
+            self.zoom_to_range();
+        }
+        if plain(Key::W) {
+            self.jump_to_any_marker(true);
+        }
+        if plain(Key::Q) {
+            self.jump_to_any_marker(false);
+        }
+        if alt(Key::W) {
+            self.jump_to_edit_point(true);
+        }
+        if alt(Key::Q) {
+            self.jump_to_edit_point(false);
+        }
+        if shift(Key::W) {
+            self.jump_to_selected(true);
+        }
+        if shift(Key::Q) {
+            self.jump_to_selected(false);
+        }
+        if ctrl(Key::W) {
+            self.select_neighbor(true);
+        }
+        if ctrl(Key::Q) {
+            self.select_neighbor(false);
+        }
+        if plain(Key::G) {
+            self.group_selection();
+        }
+        if shift(Key::G) {
+            self.ungroup_selection();
+        }
+        if shift(Key::I) {
+            if let Some(t) = self.project.mark_in {
+                self.seek(t);
+            }
+        }
+        if shift(Key::O) {
+            if let Some(t) = self.project.mark_out {
+                self.seek(t);
+            }
+        }
+        if alt(Key::L) {
+            self.duck_selected();
+        }
+        if alt(Key::A) {
+            self.inspector_tab = 0;
+        }
+        if typed.contains('<') {
+            self.jump_to_gap(true);
+        }
+        if typed.contains('>') {
+            self.jump_to_gap(false);
+        }
+        if typed.contains('#') {
+            self.play_range();
+        }
+        if plain(Key::N) {
             self.snapping = !self.snapping;
         }
-        if k(Key::E) {
+        if plain(Key::E) {
             self.show_settings = true;
         }
-        if k(Key::M) {
+        if plain(Key::M) {
             self.add_marker();
         }
-        if k(Key::I) {
+        if plain(Key::I) {
             self.set_mark_in();
         }
-        if k(Key::O) {
+        if plain(Key::O) {
             self.set_mark_out();
         }
         // J/K/L: zurück (1 s), anhalten, abspielen
-        if k(Key::K) {
+        if plain(Key::K) {
             self.set_playing(false);
         }
-        if k(Key::L) && !self.playing {
+        if plain(Key::L) && !self.playing {
             self.set_playing(true);
         }
-        if k(Key::J) {
+        if plain(Key::J) {
             self.set_playing(false);
             self.playhead = (self.playhead - 1.0).max(0.0);
         }
-        if k(Key::Backslash) {
+        if plain(Key::Backslash) {
             self.zoom_fit();
         }
-        if k(Key::Plus) || k(Key::Equals) {
+        if plain(Key::Plus) || plain(Key::Equals) {
             self.zoom = (self.zoom * 1.4).min(600.0);
         }
-        if k(Key::Minus) {
+        if plain(Key::Minus) {
             self.zoom = (self.zoom / 1.4).max(4.0);
         }
-        if k(Key::ArrowLeft) {
+        if plain(Key::ArrowLeft) {
             self.step(-1);
         }
-        if k(Key::ArrowRight) {
+        if plain(Key::ArrowRight) {
             self.step(1);
         }
-        if k(Key::ArrowUp) {
+        if plain(Key::ArrowUp) {
             self.jump_to_edit_point(false);
         }
-        if k(Key::ArrowDown) {
+        if plain(Key::ArrowDown) {
             self.jump_to_edit_point(true);
         }
-        if k(Key::Home) {
+        if plain(Key::Home) {
             self.set_playing(false);
             self.playhead = 0.0;
         }
-        if k(Key::End) {
+        if plain(Key::End) {
             self.set_playing(false);
             self.playhead = self.project.duration();
         }
-        if cmd(Key::Z) {
+        // Strg-Kürzel
+        if ctrl(Key::ArrowUp) {
+            self.zoom_step(true);
+        }
+        if ctrl(Key::ArrowDown) {
+            self.zoom_step(false);
+        }
+        if ctrl(Key::Z) {
             self.do_undo();
         }
-        if cmd(Key::Y) || ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::Z)) {
+        if ctrl(Key::Y) || ctrl_shift(Key::Z) {
             self.do_redo();
         }
-        if cmd(Key::S) {
+        if ctrl(Key::S) {
             self.save();
         }
-        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::S)) {
+        if ctrl_shift(Key::S) {
             self.save_as();
         }
-        if cmd(Key::O) {
+        if ctrl(Key::O) {
             self.open_dialog();
         }
-        if cmd(Key::N) {
+        if ctrl(Key::N) {
             self.new_project();
         }
-        if cmd(Key::I) {
+        if ctrl(Key::I) {
             self.import_dialog();
         }
-        if cmd(Key::E) {
+        if ctrl(Key::E) {
             self.export_dialog();
         }
-        if cmd(Key::D) {
+        if ctrl(Key::D) {
             self.duplicate_clips();
         }
-        if cmd(Key::A) {
+        if ctrl(Key::A) {
             self.select_all();
         }
-        if cmd(Key::C) {
+        if ctrl(Key::C) {
             self.copy_clips();
         }
-        if cmd(Key::X) {
+        if ctrl(Key::X) {
             self.cut_clips();
         }
-        if cmd(Key::V) {
+        if ctrl(Key::V) {
             self.paste_clips();
+        }
+        if ctrl_shift(Key::C) {
+            self.find_gap();
+        }
+        if ctrl_shift(Key::M) {
+            self.musical_cut_adjustment(1);
+        }
+        if ch(Key::R, true, false, true) {
+            self.toggle_recording();
         }
     }
 }
@@ -177,6 +354,10 @@ impl App {
         // Wiedergabe
         if self.playing {
             self.tick_playback();
+            if self.play_until.is_some_and(|u| self.playhead >= u) {
+                self.playhead = self.play_until.unwrap_or(self.playhead);
+                self.set_playing(false);
+            }
             if self.playhead >= self.project.duration() {
                 self.playhead = self.project.duration();
                 self.set_playing(false);
@@ -225,7 +406,12 @@ impl App {
             .exact_size(22.0)
             .resizable(false)
             .show_inside(ui, |ui| {
-                ui.label(RichText::new(&self.status).size(11.5).color(SECONDARY));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&self.status).size(11.5).color(SECONDARY));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(format!("Einfügen: {} ({}) · Maus: {} ({})", self.insert_mode.label(), self.insert_mode.key(), self.mouse_mode.label(), self.mouse_mode.key())).size(11.0).color(SECONDARY));
+                    });
+                });
             });
         egui::Panel::bottom("timeline")
             .frame(Frame::new().fill(BG))
@@ -253,6 +439,7 @@ impl App {
 
         self.settings_window(&ctx);
         self.marker_window(&ctx);
+        self.timecode_window(&ctx);
         self.import_error_window(&ctx);
         self.export_window(&ctx);
         self.feature_windows(&ctx);

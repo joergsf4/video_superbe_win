@@ -314,6 +314,23 @@ impl App {
         self.status = format!("Abdunkeln eingerichtet: {} Sprachabschnitte, {:.0} dB (Kurve im Clip änderbar)", speech.len(), db);
     }
 
+    /// Alt+L: Musik unter Sprache abdunkeln (−12 dB) für den gewählten Tonclip.
+    pub(crate) fn duck_selected(&mut self) {
+        let Some(id) = self.selected else {
+            self.status = "Einen Tonclip (Musik) wählen".into();
+            return;
+        };
+        let target = match self.project.clip(id) {
+            Some(c) if c.is_audio() => Some(id),
+            Some(_) => self.project.partner_id(id),
+            None => None,
+        };
+        match target {
+            Some(t) => self.apply_ducking(t, -12.0),
+            None => self.status = "Einen Tonclip (Musik) wählen".into(),
+        }
+    }
+
     pub(crate) fn clear_ducking(&mut self, id: Uuid) {
         if let Some(c) = self.project.clip_mut(id) {
             c.volume_points.clear();

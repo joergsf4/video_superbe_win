@@ -32,6 +32,13 @@ pub(crate) struct ExportCfg {
 }
 
 pub struct App {
+    /// Einfügemodus (Tasten 1/2/3/5) und Mausmodus (6/7/8)
+    pub(crate) insert_mode: crate::ops::InsertMode,
+    pub(crate) mouse_mode: crate::ops::MouseMode,
+    /// Wiedergabe bis zu dieser Zeit (Bereich abspielen, #)
+    pub(crate) play_until: Option<f64>,
+    /// Eingabefeld „Zu Zeitcode springen“
+    pub(crate) tc_prompt: Option<String>,
     pub(crate) feat: crate::features::FeatState,
     pub(crate) export_cfg: Option<ExportCfg>,
     pub(crate) player: Option<Player>,
@@ -117,6 +124,10 @@ impl App {
             export_job: None,
             export_cfg: None,
             feat: crate::features::FeatState::new(),
+            insert_mode: Default::default(),
+            mouse_mode: Default::default(),
+            play_until: None,
+            tc_prompt: None,
             project: p0.clone(),
             saved: p0,
             path: None,
@@ -224,6 +235,7 @@ impl App {
         } else {
             self.player = None;
             self.play_anchor = None;
+            self.play_until = None;
         }
         self.playing = on;
     }

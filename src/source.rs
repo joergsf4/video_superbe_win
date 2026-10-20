@@ -135,13 +135,6 @@ impl App {
         (!a.is_image && (s.mark_in > 0.001 || s.mark_out < a.duration - 0.001)).then_some((s.mark_in, s.mark_out))
     }
 
-    /// Fügt den gewählten Ausschnitt an der Abspielposition ein.
-    pub(crate) fn insert_source(&mut self) {
-        let Some(s) = self.source.as_ref().map(|s| s.asset) else { return };
-        let r = self.source_range();
-        self.add_to_timeline(s, None, None, r);
-    }
-
     /// Lässt die Quellwiedergabe weiterlaufen (jedes Bild).
     pub(crate) fn tick_source(&mut self) {
         let Some(s) = self.source.clone() else { return };

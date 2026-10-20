@@ -218,8 +218,13 @@ impl App {
             let gd = p.layout_no_wrap(dur, FontId::monospace(12.5), SECONDARY);
             let gt = p.layout_no_wrap(timecode(self.playhead, fps), FontId::monospace(12.5), Color32::WHITE);
             let x = header.right() - 10.0 - gd.size().x;
+            let (tw, th) = (gt.size().x, gt.size().y);
             p.galley(egui::pos2(x, header.center().y - gd.size().y / 2.0), gd, SECONDARY);
-            p.galley(egui::pos2(x - 8.0 - gt.size().x, header.center().y - gt.size().y / 2.0), gt, Color32::WHITE);
+            p.galley(egui::pos2(x - 8.0 - tw, header.center().y - th / 2.0), gt, Color32::WHITE);
+            let tc_rect = Rect::from_min_size(egui::pos2(x - 8.0 - tw, header.center().y - th / 2.0), Vec2::new(tw, th)).expand(3.0);
+            if ui.interact(tc_rect, ui.id().with("tc_click"), Sense::click()).on_hover_text("Klick: Zeitcode eintippen und hinspringen").clicked() {
+                self.tc_prompt = Some(timecode(self.playhead, fps));
+            }
         }
 
         let area = monitor.shrink(30.0);

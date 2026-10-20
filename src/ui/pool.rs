@@ -84,6 +84,7 @@ impl App {
         let mut add: Option<Uuid> = None;
         let mut remove: Option<Uuid> = None;
         let mut view: Option<Uuid> = None;
+        let mut append: Option<Uuid> = None;
         self.pool_tiles.clear();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if self.project.assets.is_empty() {
@@ -149,16 +150,20 @@ impl App {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                         }
                         if resp.double_clicked() {
-                            add = Some(a.id);
+                            append = Some(a.id);
                         }
                         resp.on_hover_text(format!(
-                            "{}\n{}\nDoppelklick: an Abspielposition einfügen · Ziehen: auf die Timeline ablegen",
+                            "{}\n{}\nDoppelklick: hinten anhängen (Musik darunter) · Ziehen: auf die Timeline ablegen",
                             a.name,
                             if a.is_image { format!("Bild {}×{}", a.width as i64, a.height as i64) } else if a.has_video { format!("Video {}×{}, {:.0} fps", a.width as i64, a.height as i64, a.fps) } else { "Ton".to_string() }
                         ))
                         .context_menu(|ui| {
                             if ui.button("Im Monitor ansehen (Bereich wählen)").clicked() {
                                 view = Some(a.id);
+                                ui.close();
+                            }
+                            if ui.button("Hinten anhängen").clicked() {
+                                append = Some(a.id);
                                 ui.close();
                             }
                             if ui.button("An Abspielposition einfügen").clicked() {
@@ -177,6 +182,9 @@ impl App {
         });
         if let Some(id) = add {
             self.add_asset_clip(id);
+        }
+        if let Some(id) = append {
+            self.add_from_pool(id);
         }
         if let Some(id) = view {
             self.load_source(id);

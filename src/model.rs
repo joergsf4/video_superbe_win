@@ -83,6 +83,48 @@ pub struct TitleStyle {
     pub outline: Option<bool>,
     #[serde(skip_serializing_if = "is_none")]
     pub subtitle: Option<bool>,
+    /// Schatten: `None` = Standard (Schatten, wenn kein Hintergrund), sonst ausdrücklich an/aus.
+    #[serde(skip_serializing_if = "is_none")]
+    pub shadow: Option<bool>,
+    /// Einlaufen/Auslaufen: none, flyUp, flyLeft, flyRight, zoom, typewriter (Dauer `anim_dur`, Standard 0,6 s).
+    #[serde(skip_serializing_if = "is_none")]
+    pub anim_in: Option<String>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub anim_out: Option<String>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub anim_dur: Option<f64>,
+    /// Rollender Abspann (von unten nach oben über die ganze Clipdauer) und Laufschrift (von rechts nach links).
+    #[serde(skip_serializing_if = "is_none")]
+    pub credits: Option<bool>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub ticker: Option<bool>,
+    /// `None` = Standard (erste Zeile fett)
+    #[serde(skip_serializing_if = "is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub italic: Option<bool>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub underline: Option<bool>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub right_aligned: Option<bool>,
+    /// Zeilenabstand, Anteil der Schrifthöhe (−0,3 … 1)
+    #[serde(skip_serializing_if = "is_none")]
+    pub line_spacing: Option<f64>,
+    /// Laufweite, Anteil der Schrifthöhe (−0,1 … 0,5)
+    #[serde(skip_serializing_if = "is_none")]
+    pub kerning: Option<f64>,
+    /// Transparenz (Standard 0,7) und Unschärfe (Anteil der Schrifthöhe, Standard 0,1) des Schattens
+    #[serde(skip_serializing_if = "is_none")]
+    pub shadow_alpha: Option<f64>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub shadow_blur: Option<f64>,
+    /// Breite der Umrandung (Standard 4) und „nur Rahmen“
+    #[serde(skip_serializing_if = "is_none")]
+    pub outline_width: Option<f64>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub outline_hollow: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl Default for TitleStyle {
@@ -97,6 +139,23 @@ impl Default for TitleStyle {
             font: None,
             outline: None,
             subtitle: None,
+            shadow: None,
+            anim_in: None,
+            anim_out: None,
+            anim_dur: None,
+            credits: None,
+            ticker: None,
+            bold: None,
+            italic: None,
+            underline: None,
+            right_aligned: None,
+            line_spacing: None,
+            kerning: None,
+            shadow_alpha: None,
+            shadow_blur: None,
+            outline_width: None,
+            outline_hollow: None,
+            extra: Map::new(),
         }
     }
 }
@@ -124,6 +183,49 @@ pub struct Effects {
     pub cutout_soft: Option<f64>,
     #[serde(skip_serializing_if = "is_none")]
     pub cutout_shift: Option<f64>,
+    /// Spiegeln und Drehen in 90°-Schritten (im Uhrzeigersinn, 0…3)
+    #[serde(skip_serializing_if = "is_none")]
+    pub flip_h: Option<bool>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub flip_v: Option<bool>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub quarter_turns: Option<i64>,
+    /// Horizont begradigen: Drehwinkel in Grad (−20…20), es wird automatisch hineingezoomt
+    #[serde(skip_serializing_if = "is_none")]
+    pub horizon: Option<f64>,
+    /// Greenscreen
+    #[serde(skip_serializing_if = "is_none")]
+    pub chroma: Option<ChromaKey>,
+    /// 3D-LUT (.cube) und Stärke (0…1, Standard 1)
+    #[serde(skip_serializing_if = "is_none")]
+    pub lut_path: Option<String>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub lut_amount: Option<f64>,
+    /// Bildstabilisierung: Glättungsstärke 0…1 (`None` = aus); Auto-Skalierung abschaltbar
+    #[serde(skip_serializing_if = "is_none")]
+    pub stabilize: Option<f64>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub stab_no_scale: Option<bool>,
+    /// Unbekannte Felder (z. B. `cutoutPick` der Mac-Version) bleiben erhalten
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Greenscreen: Schlüsselfarbe, Schwellwert (0…0,4), Überblendbereich (0…0,3) und Antispill (0…1).
+/// Alle Felder werden immer geschrieben (die Mac-Version verlangt sie).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ChromaKey {
+    pub color: Rgba,
+    pub tolerance: f64,
+    pub softness: f64,
+    pub antispill: f64,
+}
+
+impl Default for ChromaKey {
+    fn default() -> Self {
+        Self { color: Rgba { r: 0.1, g: 0.75, b: 0.2, a: 1.0 }, tolerance: 0.12, softness: 0.08, antispill: 0.5 }
+    }
 }
 
 impl Default for Effects {
@@ -145,6 +247,16 @@ impl Default for Effects {
             cutout_quality: None,
             cutout_soft: None,
             cutout_shift: None,
+            flip_h: None,
+            flip_v: None,
+            quarter_turns: None,
+            horizon: None,
+            chroma: None,
+            lut_path: None,
+            lut_amount: None,
+            stabilize: None,
+            stab_no_scale: None,
+            extra: Map::new(),
         }
     }
 }
@@ -255,6 +367,8 @@ impl Default for Transform2D {
 pub struct AudioFx {
     pub wind_filter: bool,
     pub denoise: f64,
+    /// Rückwärts (Bild und Ton); die Mac-Version verlangt den Schlüssel immer
+    pub reverse: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -265,6 +379,9 @@ pub struct Clip {
     pub part: ClipPart,
     #[serde(skip_serializing_if = "is_none")]
     pub link: Option<Uuid>,
+    /// Freie Gruppe (G / Umschalt+G): gemeinsam wählen, verschieben und kopieren
+    #[serde(skip_serializing_if = "is_none")]
+    pub group: Option<Uuid>,
     pub start: f64,
     pub source_in: f64,
     pub speed: f64,
@@ -276,6 +393,9 @@ pub struct Clip {
     pub fx: Effects,
     #[serde(rename = "audioFX")]
     pub audio_fx: AudioFx,
+    /// Rückwärts abspielen
+    #[serde(skip_serializing_if = "is_none")]
+    pub reversed: Option<bool>,
     #[serde(skip_serializing_if = "is_none")]
     pub beat_grid: Option<BeatGrid>,
     pub transition: String,
@@ -294,6 +414,7 @@ impl Default for Clip {
             content: ClipContent::Title(Wrap { v: TitleStyle::default() }),
             part: ClipPart::Video,
             link: None,
+            group: None,
             start: 0.0,
             source_in: 0.0,
             speed: one(),
@@ -303,6 +424,7 @@ impl Default for Clip {
             transform: Transform2D::default(),
             fx: Effects::default(),
             audio_fx: AudioFx::default(),
+            reversed: None,
             beat_grid: None,
             transition: "crossfade".into(),
             keys: Default::default(),
@@ -409,6 +531,9 @@ pub struct Project {
     pub mark_out: Option<f64>,
     #[serde(skip_serializing_if = "is_none")]
     pub markers: Option<Vec<Marker>>,
+    /// Projektmarker 1–10 (Schlüssel "1" … "10", Wert Zeit in Sekunden)
+    #[serde(skip_serializing_if = "is_none")]
+    pub bookmarks: Option<std::collections::BTreeMap<String, f64>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -424,6 +549,7 @@ impl Default for Project {
             mark_in: None,
             mark_out: None,
             markers: None,
+            bookmarks: None,
             extra: Map::new(),
         }
     }
@@ -642,4 +768,46 @@ mod tests {
         let v = serde_json::to_value(&t).unwrap();
         assert!(v["content"]["title"]["_0"]["text"].is_string());
     }
+
+    /// Alle Felder der neuen Mac-Version überleben Laden und Speichern unverändert; `audioFX.reverse` steht immer drin.
+    #[test]
+    fn mac_fields_survive_a_roundtrip() {
+        let json = r#"{"assets":[],"tracks":[{"name":"Spur 1","clips":[{"id":"6F6E1B0A-0000-4000-8000-0000000000A1","content":{"media":{"_0":"6F6E1B0A-0000-4000-8000-0000000000B1"}},"part":"video","group":"6F6E1B0A-0000-4000-8000-0000000000C1","reversed":true,"start":1,"sourceIn":0,"speed":1,"duration":3,"volume":1,"volumePoints":[],"transform":{"x":0,"y":0,"scale":1,"rotation":0},"fx":{"brightness":0,"contrast":1,"saturation":1,"temperature":0,"sharpness":0,"blur":0,"vignette":0,"fill":false,"cropL":0,"cropT":0,"cropR":0,"cropB":0,"flipH":true,"flipV":false,"quarterTurns":1,"horizon":3.5,"chroma":{"color":{"r":0.1,"g":0.75,"b":0.2,"a":1},"tolerance":0.12,"softness":0.08,"antispill":0.5},"lutPath":"C:/x/a.cube","lutAmount":0.6,"stabilize":0.5,"stabNoScale":true,"cutoutPick":{"x":0.5,"y":0.4,"t0":1.5,"track":[0.0,0.5,0.4]}},"audioFX":{"windFilter":false,"denoise":0,"reverse":true},"transition":"zoom","keys":[],"fadeIn":0,"fadeOut":0},{"id":"6F6E1B0A-0000-4000-8000-0000000000A2","content":{"title":{"_0":{"text":"T","fontSize":0.08,"color":{"r":1,"g":1,"b":1,"a":1},"background":false,"backgroundColor":{"r":0,"g":0,"b":0,"a":0.5},"leftAligned":false,"shadow":true,"animIn":"typewriter","animOut":"flyUp","animDur":0.6,"credits":true,"ticker":false,"bold":true,"italic":true,"underline":true,"rightAligned":true,"lineSpacing":0.2,"kerning":0.1,"shadowAlpha":0.5,"shadowBlur":0.2,"outlineWidth":6,"outlineHollow":true,"zukunft":1}}},"part":"video","start":0,"sourceIn":0,"speed":1,"duration":3,"volume":1,"volumePoints":[],"transform":{"x":0,"y":0,"scale":1,"rotation":0},"fx":{},"audioFX":{"windFilter":false,"denoise":0,"reverse":false},"transition":"crossfade","keys":[],"fadeIn":0,"fadeOut":0}]}],"renderWidth":1920,"renderHeight":1080,"fps":30,"bookmarks":{"1":2.5,"10":9}}"#;
+        let p: Project = serde_json::from_str(json).unwrap();
+        let c = &p.tracks[0].clips[0];
+        assert!(c.group.is_some() && c.reversed == Some(true) && c.audio_fx.reverse);
+        assert_eq!(c.fx.horizon, Some(3.5));
+        assert_eq!(c.fx.chroma.as_ref().unwrap().tolerance, 0.12);
+        assert_eq!(p.bookmarks.as_ref().unwrap()["10"], 9.0);
+        let out: Value = serde_json::to_value(&p).unwrap();
+        let c0 = &out["tracks"][0]["clips"][0];
+        let fx = &c0["fx"];
+        assert_eq!((fx["flipH"].as_bool(), fx["flipV"].as_bool(), fx["quarterTurns"].as_i64()), (Some(true), Some(false), Some(1)));
+        assert_eq!(fx["horizon"].as_f64(), Some(3.5));
+        assert_eq!(fx["lutAmount"].as_f64(), Some(0.6));
+        assert_eq!(fx["stabilize"].as_f64(), Some(0.5));
+        assert_eq!(fx["stabNoScale"].as_bool(), Some(true));
+        assert_eq!(fx["chroma"]["antispill"].as_f64(), Some(0.5), "Greenscreen vollständig");
+        assert_eq!(fx["cutoutPick"]["t0"].as_f64(), Some(1.5), "unbekanntes Mac-Feld bleibt erhalten");
+        assert_eq!(c0["reversed"].as_bool(), Some(true));
+        assert!(c0["group"].is_string());
+        assert_eq!(c0["audioFX"]["reverse"].as_bool(), Some(true));
+        assert_eq!(c0["transition"], "zoom");
+        assert_eq!(out["bookmarks"]["1"].as_f64(), Some(2.5));
+        let t = &out["tracks"][0]["clips"][1]["content"]["title"]["_0"];
+        for k in ["shadow", "credits", "bold", "italic", "underline", "rightAligned", "outlineHollow"] {
+            assert_eq!(t[k].as_bool(), Some(true), "{k}");
+        }
+        assert_eq!(t["ticker"].as_bool(), Some(false));
+        assert_eq!((t["animIn"].as_str(), t["animOut"].as_str()), (Some("typewriter"), Some("flyUp")));
+        assert_eq!((t["shadowAlpha"].as_f64(), t["shadowBlur"].as_f64(), t["outlineWidth"].as_f64(), t["lineSpacing"].as_f64(), t["kerning"].as_f64()), (Some(0.5), Some(0.2), Some(6.0), Some(0.2), Some(0.1)));
+        assert_eq!(t["zukunft"].as_i64(), Some(1), "unbekannte Titelfelder bleiben erhalten");
+        // zweites Laden ergibt dasselbe Modell
+        let p2: Project = serde_json::from_value(out).unwrap();
+        assert_eq!(p2, p);
+        // Ein neu angelegter Clip schreibt `reverse` immer (sonst scheitert die Mac-Version mit keyNotFound)
+        let v = serde_json::to_value(&Clip::default()).unwrap();
+        assert_eq!(v["audioFX"]["reverse"], false);
+    }
 }
+

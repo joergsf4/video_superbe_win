@@ -27,17 +27,26 @@ impl App {
         s
     }
 
+    /// Wählt den Clip; gehört er einer Gruppe an, werden alle Mitglieder mit gewählt (oder abgewählt).
     pub(crate) fn select(&mut self, id: Uuid, additive: bool) {
+        let members = self.project.group_members(id);
         if additive {
             let mut set = self.selected_set();
-            if !set.remove(&id) {
+            if set.contains(&id) {
+                for m in &members {
+                    set.remove(m);
+                }
+                set.remove(&id);
+            } else {
+                set.extend(members);
                 set.insert(id);
             }
             self.selected = if set.contains(&id) { Some(id) } else { set.iter().next().copied() };
             self.extra_sel = set;
         } else {
             self.selected = Some(id);
-            self.extra_sel.clear();
+            self.extra_sel = members;
+            self.extra_sel.remove(&id);
         }
     }
 
@@ -64,13 +73,17 @@ impl App {
     pub(crate) fn add_to_timeline(&mut self, aid: Uuid, track: Option<usize>, at: Option<f64>, range: Option<(f64, f64)>) {
         let Some(a) = self.project.asset(aid).cloned() else { return };
         let start = at.unwrap_or(self.playhead);
-        let id = self.project.insert_media(&a, start, track, range);
-        if a.has_video && !a.is_image && (a.fps - self.project.fps as f64).abs() > 2.0 && a.fps > 0.0 {
-            self.status = format!("Hinweis: Der Clip hat {:.0} Bilder/s, das Projekt {}. Der Export rechnet auf die Projekt-Bildrate um (Filmeinstellungen: Taste E).", a.fps, self.project.fps);
-        }
+        let mode = self.insert_mode;
+        let target = track.or_else(|| (mode != crate::ops::InsertMode::Auto).then(|| self.default_insert_track(&a)));
+        let id = self.project.insert_media_with(&a, start, target, range, mode, 1.0);
         match id {
-            Some(id) => self.select(id, false),
-            None => self.status = "Kein Platz zum Einfügen".into(),
+            Some(id) => {
+                if a.has_video && !a.is_image && (a.fps - self.project.fps as f64).abs() > 2.0 && a.fps > 0.0 {
+                    self.status = format!("Hinweis: Der Clip hat {:.0} Bilder/s, das Projekt {}. Der Export rechnet auf die Projekt-Bildrate um (Filmeinstellungen: Taste E).", a.fps, self.project.fps);
+                }
+                self.select(id, false);
+            }
+            None => self.status = if mode == crate::ops::InsertMode::Auto { "Hier ist kein Platz.".into() } else { "Einfügen nicht möglich (gesperrte Spur?).".into() },
         }
     }
 
@@ -128,8 +141,15 @@ impl App {
         let t = self.playhead;
         let sel = self.selected;
         let targets: Vec<Uuid> = self.project.tracks.iter().flat_map(|tr| &tr.clips).filter(|c| c.start < t && c.end() > t && (sel.is_none() || Some(c.id) == sel)).map(|c| c.id).collect();
+        let mut refused = false;
         for id in targets {
-            self.project.split(id, t);
+            // der Partner wurde evtl. schon mit geteilt
+            if self.project.clip(id).is_some_and(|c| c.start < t && c.end() > t) && self.project.split(id, t).is_none() {
+                refused = true;
+            }
+        }
+        if refused {
+            self.status = "Hier kann nicht geteilt werden: Innerhalb einer Blende würde ein Teilstück ganz überdeckt. Weiter vom Übergang entfernt teilen.".into();
         }
     }
 
@@ -239,6 +259,7 @@ impl App {
         pts.extend(self.project.marker_list().iter().map(|m| m.t));
         pts.extend(self.project.mark_in);
         pts.extend(self.project.mark_out);
+        pts.extend(self.project.bookmark_list().iter().map(|b| b.1));
         for c in self.project.tracks.iter().flat_map(|t| &t.clips).filter(|c| !exclude.contains(&c.id)) {
             pts.push(c.start);
             pts.push(c.end());

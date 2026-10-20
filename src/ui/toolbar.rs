@@ -121,6 +121,49 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                ui.menu_button("Einfügemodus", |ui| {
+                    for m in crate::ops::InsertMode::ALL {
+                        if ui.radio(self.insert_mode == m, format!("{}  ({})", m.label(), m.key())).clicked() {
+                            self.set_insert_mode(m);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Mausmodus", |ui| {
+                    for m in crate::ops::MouseMode::ALL {
+                        if ui.radio(self.mouse_mode == m, format!("{}  ({})", m.label(), m.key())).clicked() {
+                            self.set_mouse_mode(m);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                if ui.button("Gruppe bilden                G").clicked() {
+                    self.group_selection();
+                    ui.close();
+                }
+                if ui.button("Gruppe auflösen              Umschalt+G").clicked() {
+                    self.ungroup_selection();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Lückensuche                  Strg+Umschalt+C").clicked() {
+                    self.find_gap();
+                    ui.close();
+                }
+                if ui.button("Lücke an Abspielposition schließen").clicked() {
+                    self.close_gap_at_playhead();
+                    ui.close();
+                }
+                ui.menu_button("Musikalische Schnittanpassung", |ui| {
+                    for (label, every) in [("auf jeden Schlag", 1), ("auf jeden 2. Schlag", 2), ("auf den Taktanfang (4/4)", 4)] {
+                        if ui.button(label).clicked() {
+                            self.musical_cut_adjustment(every);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
                 if ui.button("Titel einfügen").clicked() {
                     self.add_title(crate::editing::TitlePreset::Title);
                     ui.close();
@@ -147,7 +190,91 @@ impl App {
                     ui.close();
                 }
             });
+            ui.menu_button("Marker", |ui| {
+                if ui.button("Zu Zeitcode springen …").clicked() {
+                    self.tc_prompt = Some(crate::ui::timecode(self.playhead, self.project.fps));
+                    ui.close();
+                }
+                ui.separator();
+                ui.menu_button("Projektmarker setzen", |ui| {
+                    for n in 1..=10u32 {
+                        if ui.button(format!("Marker {n}   Umschalt+{}", n % 10)).clicked() {
+                            self.set_bookmark(n);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Zu Projektmarker springen", |ui| {
+                    for n in 1..=10u32 {
+                        let set = self.project.bookmarks.as_ref().is_some_and(|b| b.contains_key(&n.to_string()));
+                        if ui.add_enabled(set, egui::Button::new(format!("Marker {n}   Strg+{}", n % 10))).clicked() {
+                            self.jump_to_bookmark(n);
+                            ui.close();
+                        }
+                    }
+                });
+                if ui.button("Nächsten freien Projektmarker setzen   Strg+Enter").clicked() {
+                    self.set_next_bookmark();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Nächster Marker                W").clicked() {
+                    self.jump_to_any_marker(true);
+                    ui.close();
+                }
+                if ui.button("Vorheriger Marker              Q").clicked() {
+                    self.jump_to_any_marker(false);
+                    ui.close();
+                }
+                if ui.button("Kapitelmarke an Abspielposition löschen   Strg+Umschalt+Enter").clicked() {
+                    self.remove_chapter_near_playhead();
+                    ui.close();
+                }
+                if ui.button("Alle Kapitelmarken löschen").clicked() {
+                    self.remove_all_chapters();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Nächste Lücke                <").clicked() {
+                    self.jump_to_gap(true);
+                    ui.close();
+                }
+                if ui.button("Vorherige Lücke              >").clicked() {
+                    self.jump_to_gap(false);
+                    ui.close();
+                }
+                if ui.button("Lücke als Bereich markieren  X").clicked() {
+                    self.mark_gap();
+                    ui.close();
+                }
+                if ui.button("Bereich abspielen            #").clicked() {
+                    self.play_range();
+                    ui.close();
+                }
+            });
             ui.menu_button("Ansicht", |ui| {
+                ui.menu_button("Zoom", |ui| {
+                    let fps = self.project.fps.max(1) as f64;
+                    for (label, span) in [("1 Bild   Alt+1", 1.0 / fps), ("5 Bilder   Alt+2", 5.0 / fps), ("1 Sekunde   Alt+3", 1.0), ("10 Sekunden   Alt+4", 10.0), ("1 Minute   Alt+5", 60.0), ("10 Minuten   Strg+Alt+6", 600.0)] {
+                        if ui.button(label).clicked() {
+                            self.zoom_to_span(span);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Markierter Bereich   Alt+F").clicked() {
+                        self.zoom_to_range();
+                        ui.close();
+                    }
+                    if ui.button("Vergrößern   Strg+↑").clicked() {
+                        self.zoom_step(true);
+                        ui.close();
+                    }
+                    if ui.button("Verkleinern   Strg+↓").clicked() {
+                        self.zoom_step(false);
+                        ui.close();
+                    }
+                });
                 if ui.button("Zoom: ganzen Film zeigen      \\").clicked() {
                     self.zoom_fit();
                     ui.close();
@@ -325,6 +452,45 @@ impl App {
             });
         if close {
             self.import_errors.clear();
+        }
+    }
+}
+
+impl App {
+    /// Dialog „Zu Zeitcode springen“ (HH:MM:SS:BB, MM:SS:BB oder Sekunden).
+    pub(crate) fn timecode_window(&mut self, ctx: &egui::Context) {
+        let Some(mut text) = self.tc_prompt.clone() else { return };
+        let mut done: Option<bool> = None;
+        egui::Window::new("Zu Zeitcode springen").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
+            ui.label(RichText::new("HH:MM:SS:BB, MM:SS:BB oder Sekunden (z. B. 12,5)").size(11.5));
+            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(220.0));
+            r.request_focus();
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Springen").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    done = Some(true);
+                }
+                if ui.button("Abbrechen").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    done = Some(false);
+                }
+            });
+        });
+        match done {
+            Some(true) => {
+                match crate::navigation::parse_timecode(&text, self.project.fps) {
+                    Some(t) => {
+                        let t = t.max(0.0);
+                        self.seek(t);
+                        self.tc_prompt = None;
+                    }
+                    None => self.status = "Zeitcode nicht lesbar (z. B. 00:00:12:15 oder 12,5)".into(),
+                }
+                if self.tc_prompt.is_some() {
+                    self.tc_prompt = Some(text);
+                }
+            }
+            Some(false) => self.tc_prompt = None,
+            None => self.tc_prompt = Some(text),
         }
     }
 }
