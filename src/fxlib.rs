@@ -120,19 +120,26 @@ impl Lut {
         let n = self.n;
         let m = (n - 1) as f32;
         let p = [c[0].clamp(0.0, 1.0) * m, c[1].clamp(0.0, 1.0) * m, c[2].clamp(0.0, 1.0) * m];
-        let i0 = [p[0].floor() as usize, p[1].floor() as usize, p[2].floor() as usize];
+        // p ≥ 0: Abschneiden entspricht floor (ohne Bibliotheksaufruf)
+        let i0 = [p[0] as usize, p[1] as usize, p[2] as usize];
         let f = [p[0] - i0[0] as f32, p[1] - i0[1] as f32, p[2] - i0[2] as f32];
-        let at = |r: usize, g: usize, b: usize| self.data[r.min(n - 1) + g.min(n - 1) * n + b.min(n - 1) * n * n];
+        let (r1, g1, b1) = ((i0[0] + 1).min(n - 1), (i0[1] + 1).min(n - 1) * n, (i0[2] + 1).min(n - 1) * n * n);
+        let (r0, g0, b0) = (i0[0].min(n - 1), i0[1].min(n - 1) * n, i0[2].min(n - 1) * n * n);
+        let d = &self.data;
+        // acht Eckpunkte, Gewichte einmal berechnet
+        let corners = [
+            (d[r0 + g0 + b0], (1.0 - f[0]) * (1.0 - f[1]) * (1.0 - f[2])),
+            (d[r0 + g0 + b1], (1.0 - f[0]) * (1.0 - f[1]) * f[2]),
+            (d[r0 + g1 + b0], (1.0 - f[0]) * f[1] * (1.0 - f[2])),
+            (d[r0 + g1 + b1], (1.0 - f[0]) * f[1] * f[2]),
+            (d[r1 + g0 + b0], f[0] * (1.0 - f[1]) * (1.0 - f[2])),
+            (d[r1 + g0 + b1], f[0] * (1.0 - f[1]) * f[2]),
+            (d[r1 + g1 + b0], f[0] * f[1] * (1.0 - f[2])),
+            (d[r1 + g1 + b1], f[0] * f[1] * f[2]),
+        ];
         let mut out = [0f32; 3];
         for ch in 0..3 {
-            let mut acc = 0.0;
-            for (dr, wr) in [(0, 1.0 - f[0]), (1, f[0])] {
-                for (dg, wg) in [(0, 1.0 - f[1]), (1, f[1])] {
-                    for (db, wb) in [(0, 1.0 - f[2]), (1, f[2])] {
-                        acc += at(i0[0] + dr, i0[1] + dg, i0[2] + db)[ch] * wr * wg * wb;
-                    }
-                }
-            }
+            let acc: f32 = corners.iter().map(|(v, w)| v[ch] * w).sum();
             out[ch] = if amount >= 0.999 { acc } else { c[ch] + (acc - c[ch]) * amount };
         }
         out

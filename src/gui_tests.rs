@@ -1173,3 +1173,36 @@ fn fullscreen_preview_starts_with_alt_enter_and_ends_with_escape() {
     e.key(Key::Enter);
     assert!(!e.app.fullscreen);
 }
+
+#[test]
+fn preview_is_recomposed_only_when_the_picture_can_change() {
+    // Standbild ohne Animation: die Abspielzeit allein ändert das Bild nicht
+    let mut p = Project::default();
+    let red = solid_png("gui_static.png", 64, 36, [200, 30, 30]);
+    let a = image_asset(&mut p, &red, 64.0, 36.0);
+    p.tracks[0].clips.push(clip(a, 0.0, 6.0));
+    let mut h = H::new(p);
+    h.frames(3);
+    let n = h.app.preview.renders;
+    assert!(n >= 1);
+    for i in 1..20 {
+        h.app.playhead = i as f64 * 0.2;
+        h.frames(1);
+    }
+    assert_eq!(h.app.preview.renders, n, "keine neue Zusammensetzung bei bloßer Zeitänderung");
+    // Ein-/Ausblenden: im Übergang jedes Bild neu, danach nicht mehr
+    h.app.project.tracks[0].clips[0].fade_in = 1.0;
+    h.frames(2);
+    let n = h.app.preview.renders;
+    h.app.playhead = 0.3;
+    h.frames(1);
+    h.app.playhead = 0.4;
+    h.frames(1);
+    assert_eq!(h.app.preview.renders, n + 2, "während der Einblendung ändert sich das Bild mit der Zeit");
+    h.app.playhead = 3.0;
+    h.frames(2);
+    let n = h.app.preview.renders;
+    h.app.playhead = 3.4;
+    h.frames(2);
+    assert_eq!(h.app.preview.renders, n, "nach der Einblendung wieder stabil");
+}

@@ -43,6 +43,21 @@ impl Img {
 /// Ein decodiertes Videobild (RGBA, bereits gedreht)
 pub type MediaFrame = Arc<Frame>;
 
+/// Quellbild eines Clips: Bild/Titel oder Videobild (ohne Kopie des Decoder-Bildes).
+enum Src {
+    Img(Arc<Img>),
+    Frame(MediaFrame),
+}
+
+impl Src {
+    fn parts(&self) -> (usize, usize, &[u8]) {
+        match self {
+            Src::Img(i) => (i.w, i.h, &i.px),
+            Src::Frame(f) => (f.width, f.height, &f.rgba),
+        }
+    }
+}
+
 /// Quelle der Videobilder (Vorschau: Hintergrund-Decoder, Export und Tests: blockierend).
 pub trait FrameSource {
     /// Videobild des Assets zur Quellzeit `t` (Sekunden).
@@ -133,7 +148,7 @@ impl Default for Renderer {
 
 /// Beschreibung eines zu zeichnenden Quellbildes mit allen Parametern.
 struct Draw<'a> {
-    src: &'a Img,
+    src: &'a Src,
     /// Titel: Originalgröße statt Einpassen
     native: bool,
     tr: Transform2D,
@@ -162,7 +177,7 @@ struct Draw<'a> {
 }
 
 impl Draw<'_> {
-    fn new<'a>(src: &'a Img, native: bool, tr: Transform2D, fx: Effects, alpha: f32, opaque: bool) -> Draw<'a> {
+    fn new<'a>(src: &'a Src, native: bool, tr: Transform2D, fx: Effects, alpha: f32, opaque: bool) -> Draw<'a> {
         Draw { src, native, tr, fx, alpha, dx: 0.0, wipe_x: None, opaque, dy: 0.0, wipe_y: None, zoom: 1.0, iris: None, orient: None, lut: None, stab: None }
     }
 }
@@ -214,9 +229,11 @@ impl Renderer {
 
     pub fn render_with(&mut self, p: &Project, t: f64, w: usize, h: usize, frames: &mut dyn FrameSource) -> Vec<u8> {
         let mut dst = vec![0u8; w * h * 4];
-        for px in dst.chunks_exact_mut(4) {
-            px[3] = 255;
-        }
+        par_rows(&mut dst, w * 4, |_, band| {
+            for px in band.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        });
         let px_scale = w as f32 / p.render_width.max(1) as f32;
         for tr in &p.tracks {
             if tr.hidden {
@@ -299,7 +316,7 @@ impl Renderer {
                 let fx = if c.is_title() { Effects::default() } else { c.fx_at(rel) };
                 let tr_now = c.transform_at(rel);
                 let (mut title_dx, mut title_dy, mut title_zoom) = (0.0f32, 0.0f32, 1.0f32);
-                let (src, native): (Arc<Img>, bool) = match &c.content {
+                let (src, native): (Src, bool) = match &c.content {
                     ClipContent::Title(s) => {
                         // Platzhalter, Schreibmaschine, Ein-/Auslaufen, Abspann und Laufschrift (alles zeitabhängig)
                         let mut style = s.v.clone();
@@ -343,7 +360,7 @@ impl Renderer {
                         title_dy += motion.1 as f32;
                         title_zoom = motion.2 as f32;
                         alpha *= motion.3 as f32;
-                        (img, true)
+                        (Src::Img(img), true)
                     }
                     ClipContent::Media(m) => {
                         let Some(asset) = p.asset(m.v) else { continue };
@@ -352,11 +369,10 @@ impl Renderer {
                             let Some(levels) = levels else { continue };
                             let (ow, oh) = Orient::from_fx(&fx).map(|o| o.dims(levels[0].w as f32, levels[0].h as f32)).map(|d| (d.0 as usize, d.1 as usize)).unwrap_or((levels[0].w, levels[0].h));
                             let k = fit_scale(ow, oh, &fx, w, h, false, tr_now.scale as f32);
-                            (pick_level(levels, k), false)
+                            (Src::Img(pick_level(levels, k)), false)
                         } else {
                             let Some(f) = frames.frame(asset, c.source_in + rel * c.speed) else { continue };
-                            let img = Img { w: f.width, h: f.height, px: f.rgba.clone() };
-                            (Arc::new(img), false)
+                            (Src::Frame(f), false)
                         }
                     }
                 };
@@ -385,17 +401,20 @@ impl Renderer {
                     let mut layer = vec![0u8; w * h * 4];
                     blit(&mut layer, w, h, &mk(false));
                     if fx.sharpness > 0.0 {
-                        sharpen_layer(&mut layer, w, h, fx.sharpness as f32);
+                        sharpen_layer(&mut layer, w, h, fx.sharpness as f32, px_scale);
                     }
                     if fx.blur > 0.0 {
                         blur_layer(&mut layer, w, h, fx.blur as f32 * px_scale);
                     }
-                    for (d, s) in dst.chunks_exact_mut(4).zip(layer.chunks_exact(4)) {
-                        if s[3] > 0 {
-                            over(d, [s[0], s[1], s[2], s[3]], alpha);
-                            d[3] = 255;
+                    par_rows(&mut dst, w * 4, |first, band| {
+                        let lay = &layer[first * w * 4..first * w * 4 + band.len()];
+                        for (d, s) in band.chunks_exact_mut(4).zip(lay.chunks_exact(4)) {
+                            if s[3] > 0 {
+                                over(d, [s[0], s[1], s[2], s[3]], alpha);
+                                d[3] = 255;
+                            }
                         }
-                    }
+                    });
                 } else {
                     blit(&mut dst, w, h, &mk(true));
                 }
@@ -688,10 +707,55 @@ fn fit_scale(sw: usize, sh: usize, fx: &Effects, dw: usize, dh: usize, native: b
     (if fx.fill { a.max(b) } else { a.min(b) }) * scale
 }
 
+/// Anzahl Rechenfäden für Bildbänder.
+fn threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if std::env::var("VSB_THREADS").is_ok_and(|v| v == "1") {
+            1
+        } else {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8)
+        }
+    })
+}
+
+/// Teilt `buf` (Zeilen à `row_len`) in waagerechte Bänder und ruft `f(erste Zeile, Band)` je Band auf (parallel).
+fn par_rows<T: Send>(buf: &mut [T], row_len: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    let rows = if row_len == 0 { 0 } else { buf.len() / row_len };
+    #[cfg(test)]
+    let serial = tests::SERIAL.with(|s| s.get());
+    #[cfg(not(test))]
+    let serial = false;
+    let n = if serial { 1 } else { threads().min(rows / 24).max(1) };
+    if n <= 1 {
+        f(0, buf);
+        return;
+    }
+    let per = rows.div_ceil(n);
+    std::thread::scope(|sc| {
+        let f = &f;
+        for (i, band) in buf.chunks_mut(per * row_len).enumerate() {
+            sc.spawn(move || f(i * per, band));
+        }
+    });
+}
+
 /// "Over" für Straight-Alpha-Pixel (dst RGBA, src RGBA, zusätzlicher Faktor).
 fn over(dst: &mut [u8], src: [u8; 4], k: f32) {
     let sa = src[3] as f32 / 255.0 * k;
     if sa <= 0.0 {
+        return;
+    }
+    if dst[3] == 255 {
+        // deckendes Ziel: ohne Division, Alpha bleibt 255
+        if sa >= 0.9999 {
+            dst[..3].copy_from_slice(&src[..3]);
+        } else {
+            let ia = 1.0 - sa;
+            for i in 0..3 {
+                dst[i] = (src[i] as f32 * sa + dst[i] as f32 * ia) as u8;
+            }
+        }
         return;
     }
     let da = dst[3] as f32 / 255.0;
@@ -705,8 +769,8 @@ fn over(dst: &mut [u8], src: [u8; 4], k: f32) {
 
 /// Zeichnet ein Quellbild mit Transformation, Effekten und Übergangsparametern auf `dst`.
 fn blit(dst: &mut [u8], dw: usize, dh: usize, d: &Draw) {
-    let (sw, sh) = (d.src.w, d.src.h);
-    if sw == 0 || sh == 0 || d.src.px.len() < sw * sh * 4 {
+    let (sw, sh, spx) = d.src.parts();
+    if sw == 0 || sh == 0 || spx.len() < sw * sh * 4 {
         return;
     }
     let fx = &d.fx;
@@ -739,99 +803,108 @@ fn blit(dst: &mut [u8], dw: usize, dh: usize, d: &Draw) {
     let y1 = ((center.1 + ey).ceil().min(dh as f32)) as usize;
     let fxn = !fx.is_neutral() || d.lut.is_some();
     let diag = (hw * hw + hh * hh).sqrt().max(1.0);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if let Some(wx) = d.wipe_x {
-                if x as f32 + 0.5 > wx {
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    par_rows(&mut dst[y0 * dw * 4..y1 * dw * 4], dw * 4, |first, band| {
+        for (i, row) in band.chunks_exact_mut(dw * 4).enumerate() {
+            let y = y0 + first + i;
+            for x in x0..x1 {
+                if let Some(wx) = d.wipe_x {
+                    if x as f32 + 0.5 > wx {
+                        continue;
+                    }
+                }
+                if let Some(wy) = d.wipe_y {
+                    if y as f32 + 0.5 > wy {
+                        continue;
+                    }
+                }
+                // Irisblende: voll sichtbar bis 97 % des Radius, dann linear auf 0
+                let mut mask = 1.0f32;
+                if let Some(r) = d.iris {
+                    let dist = ((x as f32 + 0.5 - c0.0).powi(2) + (y as f32 + 0.5 - c0.1).powi(2)).sqrt();
+                    mask = if dist <= r * 0.97 { 1.0 } else if dist >= r { 0.0 } else { (r - dist) / (r * 0.03) };
+                    if mask <= 0.0 {
+                        continue;
+                    }
+                }
+                let (rx, ry) = (x as f32 + 0.5 - center.0, y as f32 + 0.5 - center.1);
+                let (ux, uy) = (rx * cs + ry * sn, -rx * sn + ry * cs);
+                if ux.abs() > hw || uy.abs() > hh {
                     continue;
                 }
-            }
-            if let Some(wy) = d.wipe_y {
-                if y as f32 + 0.5 > wy {
-                    continue;
+                let px = cl * ow as f32 + (ux + hw) / k;
+                let py = ct * oh as f32 + (uy + hh) / k;
+                let (mut sx, mut sy) = match d.orient {
+                    Some(o) => o.to_source(px, py, sw as f32, sh as f32),
+                    None => (px, py),
+                };
+                if let Some((sdx, sdy, sc)) = d.stab {
+                    let (cx, cy) = (sw as f32 / 2.0, sh as f32 / 2.0);
+                    sx = cx + (sx - cx - sdx * sw as f32) / sc;
+                    sy = cy + (sy - cy - sdy * sh as f32) / sc;
                 }
-            }
-            // Irisblende: voll sichtbar bis 97 % des Radius, dann linear auf 0
-            let mut mask = 1.0f32;
-            if let Some(r) = d.iris {
-                let dist = ((x as f32 + 0.5 - c0.0).powi(2) + (y as f32 + 0.5 - c0.1).powi(2)).sqrt();
-                mask = if dist <= r * 0.97 { 1.0 } else if dist >= r { 0.0 } else { (r - dist) / (r * 0.03) };
-                if mask <= 0.0 {
-                    continue;
+                let mut s = sample(spx, sw, sh, sx - 0.5, sy - 0.5);
+                if let Some(ck) = &fx.chroma {
+                    let (a, col) = fxlib::chroma_key(s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0, ck);
+                    s[3] = (s[3] as f32 * a).round() as u8;
+                    for i in 0..3 {
+                        s[i] = (col[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                    if s[3] == 0 {
+                        continue;
+                    }
                 }
-            }
-            let (rx, ry) = (x as f32 + 0.5 - center.0, y as f32 + 0.5 - center.1);
-            let (ux, uy) = (rx * cs + ry * sn, -rx * sn + ry * cs);
-            if ux.abs() > hw || uy.abs() > hh {
-                continue;
-            }
-            let px = cl * ow as f32 + (ux + hw) / k;
-            let py = ct * oh as f32 + (uy + hh) / k;
-            let (mut sx, mut sy) = match d.orient {
-                Some(o) => o.to_source(px, py, sw as f32, sh as f32),
-                None => (px, py),
-            };
-            if let Some((sdx, sdy, sc)) = d.stab {
-                let (cx, cy) = (sw as f32 / 2.0, sh as f32 / 2.0);
-                sx = cx + (sx - cx - sdx * sw as f32) / sc;
-                sy = cy + (sy - cy - sdy * sh as f32) / sc;
-            }
-            let mut s = sample(&d.src.px, sw, sh, sx - 0.5, sy - 0.5);
-            if let Some(ck) = &fx.chroma {
-                let (a, col) = fxlib::chroma_key(s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0, ck);
-                s[3] = (s[3] as f32 * a).round() as u8;
-                for i in 0..3 {
-                    s[i] = (col[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                if fxn {
+                    apply_fx(&mut s, fx, ((ux * ux + uy * uy).sqrt()) / diag, d.lut.as_ref());
                 }
-                if s[3] == 0 {
-                    continue;
+                let o = x * 4;
+                over(&mut row[o..o + 4], s, d.alpha * mask);
+                if d.opaque {
+                    row[o + 3] = 255;
                 }
-            }
-            if fxn {
-                apply_fx(&mut s, fx, ((ux * ux + uy * uy).sqrt()) / diag, d.lut.as_ref());
-            }
-            let o = (y * dw + x) * 4;
-            over(&mut dst[o..o + 4], s, d.alpha * mask);
-            if d.opaque {
-                dst[o + 3] = 255;
             }
         }
-    }
+    });
 }
 
 fn sample(src: &[u8], w: usize, h: usize, x: f32, y: f32) -> [u8; 4] {
-    let (xf, yf) = (x.floor(), y.floor());
-    let (tx, ty) = (x - xf, y - yf);
+    // floor ohne Bibliotheksaufruf (auf dem GNU-Ziel ohne SSE4.1 ein Funktionsaufruf je Pixel)
+    let (xi, yi) = (x as i32 - (x < 0.0) as i32, y as i32 - (y < 0.0) as i32);
+    let (xf, yf) = (xi as f32, yi as f32);
+    let (tx, ty) = (((x - xf) * 256.0) as u32, ((y - yf) * 256.0) as u32);
     let cl = |v: f32, m: usize| (v.max(0.0) as usize).min(m - 1);
-    let (x0, x1, y0, y1) = (cl(xf, w), cl(xf + 1.0, w), cl(yf, h), cl(yf + 1.0, h));
-    let px = |xx: usize, yy: usize| &src[(yy * w + xx) * 4..(yy * w + xx) * 4 + 4];
-    let (a, b, c, d) = (px(x0, y0), px(x1, y0), px(x0, y1), px(x1, y1));
+    let (x0, x1, y0, y1) = (cl(xf, w) * 4, cl(xf + 1.0, w) * 4, cl(yf, h) * w * 4, cl(yf + 1.0, h) * w * 4);
+    let (a, b, c, d) = (&src[y0 + x0..y0 + x0 + 4], &src[y0 + x1..y0 + x1 + 4], &src[y1 + x0..y1 + x0 + 4], &src[y1 + x1..y1 + x1 + 4]);
     let mut o = [0u8; 4];
     for i in 0..4 {
-        let top = a[i] as f32 * (1.0 - tx) + b[i] as f32 * tx;
-        let bot = c[i] as f32 * (1.0 - tx) + d[i] as f32 * tx;
-        o[i] = (top * (1.0 - ty) + bot * ty + 0.5) as u8;
+        let top = a[i] as u32 * (256 - tx) + b[i] as u32 * tx;
+        let bot = c[i] as u32 * (256 - tx) + d[i] as u32 * tx;
+        o[i] = ((top * (256 - ty) + bot * ty + 32768) >> 16) as u8;
     }
     o
 }
 
 fn apply_fx(p: &mut [u8; 4], fx: &Effects, vign_d: f32, lut: Option<&(Arc<Lut>, f32)>) {
-    let mut c = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
+    const K: f32 = 1.0 / 255.0;
+    let (sat, contrast, bright, temp) = (fx.saturation as f32, fx.contrast as f32, fx.brightness as f32 * 0.5 + 0.5, 0.1 * fx.temperature as f32);
+    let mut c = [p[0] as f32 * K, p[1] as f32 * K, p[2] as f32 * K];
     let gray = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     for v in &mut c {
-        *v = gray + (*v - gray) * fx.saturation as f32;
+        *v = gray + (*v - gray) * sat;
         // wie CIColorControls: Helligkeit wirkt mit dem halben Wert, Kontrast um die Mitte
-        *v = (*v - 0.5) * fx.contrast as f32 + 0.5 + fx.brightness as f32 * 0.5;
+        *v = (*v - 0.5) * contrast + bright;
     }
-    c[0] += 0.1 * fx.temperature as f32;
-    c[2] -= 0.1 * fx.temperature as f32;
+    c[0] += temp;
+    c[2] -= temp;
     if let Some((l, amount)) = lut {
         c = l.apply([c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)], *amount);
     }
     if fx.vignette > 0.0 {
-        let f = 1.0 - fx.vignette as f32 * vign_d * vign_d;
+        let f = (1.0 - fx.vignette as f32 * vign_d * vign_d).max(0.0);
         for v in &mut c {
-            *v *= f.max(0.0);
+            *v *= f;
         }
     }
     for i in 0..3 {
@@ -864,26 +937,77 @@ fn box_radii(sigma: f32) -> [usize; 3] {
     r
 }
 
-fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, horizontal: bool) {
-    let (len, lines, stride_i, stride_l) = if horizontal { (w, h, 4, w * 4) } else { (h, w, w * 4, 4) };
+fn box_row(s: &[f32], d: &mut [f32], w: usize, r: usize) {
     let norm = 1.0 / (2 * r + 1) as f32;
-    for l in 0..lines {
-        let base = l * stride_l;
+    let at = |j: isize| -> &[f32] {
+        let j = j.clamp(0, w as isize - 1) as usize * 4;
+        &s[j..j + 4]
+    };
+    let mut acc = [0f32; 4];
+    for k in -(r as isize)..=(r as isize) {
+        let p = at(k);
         for c in 0..4 {
-            let at = |i: isize| -> f32 {
-                let j = i.clamp(0, len as isize - 1) as usize;
-                src[base + j * stride_i + c]
-            };
-            let mut acc = 0.0;
-            for k in -(r as isize)..=(r as isize) {
-                acc += at(k);
-            }
-            for i in 0..len {
-                dst[base + i * stride_i + c] = acc * norm;
-                acc += at(i as isize + r as isize + 1) - at(i as isize - r as isize);
-            }
+            acc[c] += p[c];
         }
     }
+    for i in 0..w {
+        for c in 0..4 {
+            d[i * 4 + c] = acc[c] * norm;
+        }
+        let (add, sub) = (at(i as isize + r as isize + 1), at(i as isize - r as isize));
+        for c in 0..4 {
+            acc[c] += add[c] - sub[c];
+        }
+    }
+}
+
+/// Kastenfilter waagerecht (Zeilen parallel) oder senkrecht (zeilenweise mit laufender Summe je Spalte).
+fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, horizontal: bool) {
+    if horizontal {
+        par_rows(dst, w * 4, |first, band| {
+            for (i, row) in band.chunks_exact_mut(w * 4).enumerate() {
+                let y = first + i;
+                box_row(&src[y * w * 4..(y + 1) * w * 4], row, w, r);
+            }
+        });
+        return;
+    }
+    let norm = 1.0 / (2 * r + 1) as f32;
+    let row = |y: isize| -> &[f32] {
+        let y = y.clamp(0, h as isize - 1) as usize;
+        &src[y * w * 4..(y + 1) * w * 4]
+    };
+    let mut acc = vec![0f32; w * 4];
+    for k in -(r as isize)..=(r as isize) {
+        for (a, v) in acc.iter_mut().zip(row(k)) {
+            *a += *v;
+        }
+    }
+    for y in 0..h {
+        for (o, a) in dst[y * w * 4..(y + 1) * w * 4].iter_mut().zip(&acc) {
+            *o = *a * norm;
+        }
+        let (add, sub) = (row(y as isize + r as isize + 1), row(y as isize - r as isize));
+        for ((a, p), q) in acc.iter_mut().zip(add).zip(sub) {
+            *a += *p - *q;
+        }
+    }
+}
+
+/// RGBA8 (gerade) → vormultipliziertes f32 (parallel).
+fn premultiplied(buf: &[u8], w: usize) -> Vec<f32> {
+    let mut a = vec![0f32; buf.len()];
+    par_rows(&mut a, w * 4, |first, band| {
+        let src = &buf[first * w * 4..first * w * 4 + band.len()];
+        for (q, p) in band.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            let al = p[3] as f32 / 255.0;
+            q[0] = p[0] as f32 * al;
+            q[1] = p[1] as f32 * al;
+            q[2] = p[2] as f32 * al;
+            q[3] = p[3] as f32;
+        }
+    });
+    a
 }
 
 /// Weichzeichner (Gauß, durch dreifachen Kastenfilter angenähert) auf einer Ebene mit Alpha.
@@ -892,11 +1016,7 @@ fn blur_layer(buf: &mut [u8], w: usize, h: usize, sigma: f32) {
         return;
     }
     // vormultipliziert rechnen, damit Ränder nicht dunkel auslaufen
-    let mut a: Vec<f32> = Vec::with_capacity(buf.len());
-    for p in buf.chunks_exact(4) {
-        let al = p[3] as f32 / 255.0;
-        a.extend([p[0] as f32 * al, p[1] as f32 * al, p[2] as f32 * al, p[3] as f32]);
-    }
+    let mut a = premultiplied(buf, w);
     let mut b = vec![0f32; a.len()];
     for r in box_radii(sigma) {
         if r == 0 {
@@ -905,41 +1025,47 @@ fn blur_layer(buf: &mut [u8], w: usize, h: usize, sigma: f32) {
         box_pass(&a, &mut b, w, h, r, true);
         box_pass(&b, &mut a, w, h, r, false);
     }
-    for (p, q) in buf.chunks_exact_mut(4).zip(a.chunks_exact(4)) {
-        let al = q[3] / 255.0;
-        if al > 0.0 {
-            p[0] = (q[0] / al).clamp(0.0, 255.0) as u8;
-            p[1] = (q[1] / al).clamp(0.0, 255.0) as u8;
-            p[2] = (q[2] / al).clamp(0.0, 255.0) as u8;
+    par_rows(buf, w * 4, |first, band| {
+        let q = &a[first * w * 4..first * w * 4 + band.len()];
+        for (p, q) in band.chunks_exact_mut(4).zip(q.chunks_exact(4)) {
+            let al = q[3] / 255.0;
+            if al > 0.0 {
+                p[0] = (q[0] / al).clamp(0.0, 255.0) as u8;
+                p[1] = (q[1] / al).clamp(0.0, 255.0) as u8;
+                p[2] = (q[2] / al).clamp(0.0, 255.0) as u8;
+            }
+            p[3] = q[3].clamp(0.0, 255.0) as u8;
         }
-        p[3] = q[3].clamp(0.0, 255.0) as u8;
-    }
+    });
 }
 
-/// Schärfen (Unscharfmaske auf der Leuchtdichte) einer Ebene.
-fn sharpen_layer(buf: &mut [u8], w: usize, h: usize, amount: f32) {
-    let mut a: Vec<f32> = Vec::with_capacity(buf.len());
-    for p in buf.chunks_exact(4) {
-        let al = p[3] as f32 / 255.0;
-        a.extend([p[0] as f32 * al, p[1] as f32 * al, p[2] as f32 * al, p[3] as f32]);
-    }
+/// Schärfen (Unscharfmaske auf der Leuchtdichte) einer Ebene. `px_scale`: Vorschaugröße zur Projektgröße, damit der
+/// Radius im Bild (nicht in Pixeln) gleich bleibt.
+fn sharpen_layer(buf: &mut [u8], w: usize, h: usize, amount: f32, px_scale: f32) {
+    let r = ((2.0 * px_scale).round() as usize).clamp(1, 4);
+    let a = premultiplied(buf, w);
     let mut b = vec![0f32; a.len()];
     let mut c = vec![0f32; a.len()];
-    box_pass(&a, &mut b, w, h, 2, true);
-    box_pass(&b, &mut c, w, h, 2, false);
-    for (i, p) in buf.chunks_exact_mut(4).enumerate() {
-        if p[3] == 0 {
-            continue;
+    box_pass(&a, &mut b, w, h, r, true);
+    box_pass(&b, &mut c, w, h, r, false);
+    drop(b);
+    par_rows(buf, w * 4, |first, band| {
+        let off = first * w * 4;
+        for (i, p) in band.chunks_exact_mut(4).enumerate() {
+            if p[3] == 0 {
+                continue;
+            }
+            let j = off + i * 4;
+            let al = p[3] as f32 / 255.0;
+            let lum_now = 0.2126 * a[j] + 0.7152 * a[j + 1] + 0.0722 * a[j + 2];
+            let lum_blur = 0.2126 * c[j] + 0.7152 * c[j + 1] + 0.0722 * c[j + 2];
+            let d = (lum_now - lum_blur) * amount * 0.8;
+            for ch in 0..3 {
+                let v = (a[j + ch] + d) / al.max(1e-3);
+                p[ch] = v.clamp(0.0, 255.0) as u8;
+            }
         }
-        let al = p[3] as f32 / 255.0;
-        let lum_now = 0.2126 * a[i * 4] + 0.7152 * a[i * 4 + 1] + 0.0722 * a[i * 4 + 2];
-        let lum_blur = 0.2126 * c[i * 4] + 0.7152 * c[i * 4 + 1] + 0.0722 * c[i * 4 + 2];
-        let d = (lum_now - lum_blur) * amount * 0.8;
-        for ch in 0..3 {
-            let v = (a[i * 4 + ch] + d) / al.max(1e-3);
-            p[ch] = v.clamp(0.0, 255.0) as u8;
-        }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -1270,7 +1396,7 @@ pub mod tests {
         let plain = r.render(&q, 0.5, 64, 64);
         q.tracks[1].clips[0].fx.sharpness = 2.0;
         let sharpened = r.render(&q, 0.5, 64, 64);
-        let (pa, pb) = (px(&plain, 64, 17, 32)[0] as i32, px(&sharpened, 64, 17, 32)[0] as i32);
+        let (pa, pb) = (px(&plain, 64, 16, 32)[0] as i32, px(&sharpened, 64, 16, 32)[0] as i32);
         assert!(pb > pa + 3, "innen an der Kante heller: {pa} → {pb}");
         let _ = grey_r;
     }
@@ -1550,5 +1676,129 @@ pub mod tests {
         // Platzhalter: Timecode ändert sich mit der Zeit
         let p = mk(TitleStyle { credits: None, ..title_style("{timecode}") });
         assert_ne!(r.render(&p, 0.0, w, h), r.render(&p, 1.0, w, h), "Timecode zählt");
+    }
+
+    thread_local! {
+        pub(super) static SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Das parallele Rechnen in Bändern liefert Pixel für Pixel dasselbe wie der einfädige Durchlauf.
+    #[test]
+    fn parallel_rendering_equals_serial_rendering() {
+        let mut p = Project::default();
+        p.render_width = 200;
+        p.render_height = 120;
+        let png = solid_png("par_a.png", 40, 24, [200, 90, 30]);
+        let img = std::env::temp_dir().join("video-superbe-tests").join("par_grad.png");
+        image::RgbaImage::from_fn(97, 61, |x, y| image::Rgba([(x * 2) as u8, (y * 4) as u8, ((x * y) & 255) as u8, 255])).save(&img).unwrap();
+        let a = image_asset(&mut p, &img, 97.0, 61.0);
+        let b = image_asset(&mut p, &png, 40.0, 24.0);
+        p.tracks[0].clips.push(clip(a, 0.0, 4.0));
+        let mut c2 = clip(b, 2.0, 4.0);
+        c2.transition = "crossfade".into();
+        p.tracks[0].clips.push(c2);
+        let mut r = Renderer::new();
+        let variants: Vec<(&str, Box<dyn Fn(&mut Project)>)> = vec![
+            ("plain", Box::new(|_| {})),
+            ("colour+vignette", Box::new(|p| {
+                let f = &mut p.tracks[0].clips[0].fx;
+                f.saturation = 1.5;
+                f.contrast = 1.2;
+                f.vignette = 0.6;
+            })),
+            ("blur", Box::new(|p| p.tracks[0].clips[0].fx.blur = 9.0)),
+            ("sharpen", Box::new(|p| p.tracks[0].clips[0].fx.sharpness = 1.5)),
+            ("rotated", Box::new(|p| p.tracks[0].clips[0].transform.rotation = 17.0)),
+        ];
+        for (name, f) in &variants {
+            let mut q = p.clone();
+            f(&mut q);
+            for t in [1.0, 2.5] {
+                SERIAL.with(|s| s.set(true));
+                let one = r.render(&q, t, 200, 120);
+                SERIAL.with(|s| s.set(false));
+                let many = r.render(&q, t, 200, 120);
+                assert!(one == many, "{name} bei {t} s: Bänder liefern andere Pixel");
+            }
+        }
+    }
+
+    #[test]
+    fn sharpen_radius_follows_the_preview_scale() {
+        // gleiche Kante, einmal in voller, einmal in halber Größe: die Überschwinger bleiben im Bild gleich breit
+        let mk = |w: usize, h: usize| {
+            let mut buf = vec![0u8; w * h * 4];
+            for y in 0..h {
+                for x in 0..w {
+                    let v = if x < w / 2 { 80 } else { 160 };
+                    buf[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+                }
+            }
+            buf
+        };
+        let width_of_overshoot = |w: usize, h: usize, scale: f32| {
+            let mut b = mk(w, h);
+            sharpen_layer(&mut b, w, h, 2.0, scale);
+            let row = h / 2;
+            (0..w).filter(|x| (b[(row * w + x) * 4] as i32 - if *x < w / 2 { 80 } else { 160 }).abs() > 2).count() as f32 / w as f32
+        };
+        let (full, half) = (width_of_overshoot(200, 40, 1.0), width_of_overshoot(100, 20, 0.5));
+        assert!((full - half).abs() < 0.01, "Breite der Kantenüberhöhung: voll {full}, halb {half}");
+    }
+
+    /// Messung (cargo test bench_render -- --ignored --nocapture): ms je 1080p-Bild für typische Fälle.
+    #[test]
+    #[ignore]
+    fn bench_render() {
+        let dir = std::env::temp_dir().join("video-superbe-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("bench_grad.png");
+        image::RgbaImage::from_fn(1920, 1080, |x, y| image::Rgba([(x / 8) as u8, (y / 5) as u8, ((x ^ y) & 255) as u8, 255])).save(&png).unwrap();
+        let cube = dir.join("bench.cube");
+        let n = 17;
+        let mut t = format!("LUT_3D_SIZE {n}
+");
+        for b in 0..n {
+            for g in 0..n {
+                for r in 0..n {
+                    t += &format!("{} {} {}
+", r as f32 / 16.0, (g as f32 / 16.0).powf(0.9), b as f32 / 16.0);
+                }
+            }
+        }
+        std::fs::write(&cube, t).unwrap();
+        let mk = |f: &dyn Fn(&mut Project)| {
+            let mut p = Project::default();
+            p.render_width = 1920;
+            p.render_height = 1080;
+            let a = image_asset(&mut p, &png, 1920.0, 1080.0);
+            let b = image_asset(&mut p, &png, 1920.0, 1080.0);
+            p.tracks[0].clips.push(clip(a, 0.0, 4.0));
+            let mut c2 = clip(b, 3.0, 4.0);
+            c2.transition = "crossfade".into();
+            p.tracks[0].clips.push(c2);
+            f(&mut p);
+            p
+        };
+        let cases: Vec<(&str, f64, Project)> = vec![
+            ("einfach", 1.0, mk(&|_| {})),
+            ("Farbe", 1.0, mk(&|p| p.tracks[0].clips[0].fx.saturation = 1.4)),
+            ("LUT", 1.0, mk(&|p| p.tracks[0].clips[0].fx.lut_path = Some(cube.to_string_lossy().into_owned()))),
+            ("Schärfe", 1.0, mk(&|p| p.tracks[0].clips[0].fx.sharpness = 1.0)),
+            ("Weichzeichner 8", 1.0, mk(&|p| p.tracks[0].clips[0].fx.blur = 8.0)),
+            ("Vignette", 1.0, mk(&|p| p.tracks[0].clips[0].fx.vignette = 0.5)),
+            ("Überblendung", 3.5, mk(&|_| {})),
+        ];
+        let mut r = Renderer::new();
+        for (name, t, p) in &cases {
+            for (w, h) in [(1920usize, 1080usize), (1280, 720)] {
+                r.render(p, *t, w, h);
+                let t0 = std::time::Instant::now();
+                for _ in 0..5 {
+                    r.render(p, *t, w, h);
+                }
+                eprintln!("BENCH {name:<16} {w}x{h}: {:6.1} ms", t0.elapsed().as_secs_f64() * 200.0);
+            }
+        }
     }
 }

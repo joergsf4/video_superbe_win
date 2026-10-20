@@ -32,6 +32,8 @@ pub(crate) struct ExportCfg {
 }
 
 pub struct App {
+    /// Projekt wurde während der Wiedergabe geändert: Ton nach dem Loslassen der Maus neu starten
+    pub(crate) player_dirty: bool,
     /// Messinstrumente (ersetzen den Medienpool) und Vollbildvorschau
     pub(crate) scope_mode: crate::scopes::ScopeMode,
     pub(crate) scope_data: Option<crate::scopes::ScopeData>,
@@ -139,6 +141,7 @@ impl App {
             export_cfg: None,
             feat: crate::features::FeatState::new(),
             show_guides: true,
+            player_dirty: false,
             scope_mode: Default::default(),
             scope_data: None,
             scope_tex: None,

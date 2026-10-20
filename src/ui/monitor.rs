@@ -29,6 +29,36 @@ impl PreviewFrames {
     fn version(&self) -> u64 {
         self.decs.values().map(|d| d.version()).sum()
     }
+
+    /// Zeit des Videobildes, das für `t` gezeigt würde (`None`, solange der Decoder noch nichts geliefert hat).
+    fn frame_time(&mut self, asset: &crate::model::MediaAsset, t: f64) -> Option<f64> {
+        self.frame(asset, t).map(|f| f.time)
+    }
+}
+
+/// Ändert sich das Projektbild bei gleichem Projekt und gleichen Videobildern mit der Zeit? (Keyframes, Ein-/Ausblenden,
+/// Überblendungen, bewegte oder zeitabhängige Titel, Stabilisierung, Lautstärke-/Deckkraftkurve)
+fn time_dependent(p: &crate::model::Project, t: f64) -> bool {
+    p.tracks.iter().filter(|tr| !tr.hidden).flat_map(|tr| tr.clips.iter()).any(|c| {
+        if c.is_audio() || t < c.start || t >= c.end() {
+            return false;
+        }
+        let rel = t - c.start;
+        let (xin, xout) = p.overlaps(c.id);
+        let ramp = c.fade_in.max(xin) > 0.0 && rel < c.fade_in.max(xin) || c.fade_out.max(xout) > 0.0 && c.duration - rel < c.fade_out.max(xout);
+        if ramp || !c.keys.is_empty() || !c.volume_points.is_empty() || c.fx.stabilize.is_some() {
+            return true;
+        }
+        match &c.content {
+            crate::model::ClipContent::Title(s) => {
+                let s = &s.v;
+                let d = s.anim_dur.unwrap_or(0.6).max(0.1);
+                let moving = |a: &Option<String>| a.as_deref().is_some_and(|a| a != "none");
+                s.text.contains('{') || s.credits == Some(true) || s.ticker == Some(true) || moving(&s.anim_in) && rel < d || moving(&s.anim_out) && c.duration - rel < d
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Zustand der Vorschau: Kompositor, Decoder und das zuletzt gezeichnete Bild.
@@ -43,11 +73,13 @@ pub struct PreviewState {
     pub error: Option<String>,
     /// zuletzt gezeichnetes Projektbild (für die Messinstrumente)
     pub last: Option<(Vec<u8>, usize, usize)>,
+    /// Anzahl der Zusammensetzungen (Tests und Leistungsprotokoll)
+    pub renders: u64,
 }
 
 impl PreviewState {
     pub fn new(ctx: &egui::Context) -> Self {
-        PreviewState { renderer: Renderer::new(), frames: PreviewFrames { decs: HashMap::new(), ctx: ctx.clone() }, tex: None, src_tex: None, edge_tex: None, src_key: None, key: None, error: None, last: None }
+        PreviewState { renderer: Renderer::new(), frames: PreviewFrames { decs: HashMap::new(), ctx: ctx.clone() }, tex: None, src_tex: None, edge_tex: None, src_key: None, key: None, error: None, last: None, renders: 0 }
     }
 
     /// Nach Projektwechsel: Decoder und Bild verwerfen.
@@ -65,19 +97,42 @@ impl PreviewState {
 impl App {
     /// Rechnet das Projektbild bei Bedarf neu (Zeit, Projekt, Größe oder neue Videobilder) und gibt es zurück.
     pub(crate) fn preview_image(&mut self, ctx: &egui::Context, w: usize, h: usize) -> Option<egui::TextureHandle> {
-        let ver = self.preview.frames.version();
-        let key = (self.playhead.to_bits(), self.project_rev, w, h, ver);
+        // Schlüssel: Projektstand, Größe und die gewählten Videobilder; die Abspielzeit nur, wenn sie das Bild verändert.
+        // So wird ein 30-fps-Video auf einem 60-Hz-Bildschirm nur je Videobild einmal zusammengesetzt.
+        let t = self.playhead;
+        let mut sig = 0xcbf29ce484222325u64;
+        let mut missing = false;
+        for tr in self.project.tracks.iter().filter(|tr| !tr.hidden) {
+            for c in tr.clips.iter().filter(|c| !c.is_audio() && t >= c.start && t < c.end()) {
+                let Some(a) = c.asset_id().and_then(|id| self.project.asset(id)) else { continue };
+                if a.is_image {
+                    continue;
+                }
+                match self.preview.frames.frame_time(a, c.source_in + (t - c.start) * c.speed) {
+                    Some(ft) => sig = (sig ^ ft.to_bits()).wrapping_mul(0x100000001b3),
+                    None => missing = true,
+                }
+            }
+        }
+        let tkey = if time_dependent(&self.project, t) { t.to_bits() } else { 0 };
+        let ver = if missing { self.preview.frames.version() } else { 0 };
+        let key = (tkey ^ sig.rotate_left(17), self.project_rev, w, h, ver);
         if self.preview.key != Some(key) || self.preview.tex.is_none() {
+            let t0 = std::time::Instant::now();
+            self.preview.renders += 1;
             let (p, t) = (&self.project, self.playhead);
             let pv = &mut self.preview;
             let rgba = pv.renderer.render_with(p, t, w, h, &mut pv.frames);
-            let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            let t1 = std::time::Instant::now();
+            // Das Bild ist deckend: ohne Vormultiplizieren direkt in Color32 übernehmen
+            let ci = egui::ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels: rgba.chunks_exact(4).map(|p| Color32::from_rgb(p[0], p[1], p[2])).collect() };
             pv.last = Some((rgba, w, h));
             match &mut pv.tex {
                 Some(tex) => tex.set(ci, egui::TextureOptions::LINEAR),
                 None => pv.tex = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR)),
             }
             pv.key = Some(key);
+            crate::perf::record(t1 - t0, t1.elapsed(), w, h);
             // Fehler beim Öffnen von Videos in der Statuszeile melden
             for d in pv.frames.decs.values() {
                 if let Some(e) = d.error() {

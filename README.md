@@ -34,7 +34,7 @@ Standbilder), liegt im Ordner `VideoSuperbe-Daten` neben der EXE.
 | **Sonstiges** | Standbild einfügen und exportieren, Kapitelmarken für YouTube, Autosave mit Wiederherstellung, fehlende Medien neu verknüpfen |
 | **Export** | MP4 (H.264 + AAC), Qualität mit Größenanzeige, nur der Bereich zwischen den Marken, Lautheit normalisieren (−14 / −16 / −23 LUFS, ITU-R BS.1770) |
 
-Die Vorschau benutzt denselben Renderer wie der Export: Was man sieht, kommt auch in die Datei.
+Die Vorschau benutzt denselben Renderer wie der Export: Was man sieht, kommt auch in die Datei. Der Renderer rechnet in parallelen Bildbändern auf allen Prozessorkernen und setzt das Vorschaubild nur neu zusammen, wenn sich etwas ändert. Mit `VSB_PERF=1` schreibt das Programm ein Leistungsprotokoll (`perf.log` im Datenordner).
 
 <table>
 <tr>

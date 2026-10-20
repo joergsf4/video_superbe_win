@@ -493,11 +493,19 @@ impl App {
             self.redo.clear();
             self.gesture_open = ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input();
             if self.playing {
-                self.start_player();
+                // Beim Ziehen (Regler, Keyframes) den Ton erst nach dem Loslassen neu starten, nicht bei jedem Bild
+                self.player_dirty = true;
             }
             ctx.request_repaint();
         } else if !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.gesture_open = false;
+        }
+
+        if self.player_dirty && !ctx.input(|i| i.pointer.any_down()) {
+            self.player_dirty = false;
+            if self.playing {
+                self.start_player();
+            }
         }
 
         let title = format!(

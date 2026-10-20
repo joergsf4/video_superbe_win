@@ -442,7 +442,7 @@ struct AsyncShared {
     info: Option<Info>,
 }
 
-const PREFETCH_FRAMES: usize = 6;
+const PREFETCH_FRAMES: usize = 10;
 
 impl AsyncDecoder {
     /// Öffnet `path` im Hintergrund; `wake` wird aufgerufen, sobald ein neues Bild bereitsteht.
