@@ -1252,3 +1252,20 @@ fn tracks_can_be_inserted_and_deleted_and_the_bars_scroll() {
     h.click(Pos2::new(r.right() - 40.0, hy));
     assert!(h.app.scroll > 0.0, "waagerechte Leiste scrollt: {}", h.app.scroll);
 }
+
+#[test]
+fn preview_texture_keeps_its_handle_and_size_while_a_slider_changes_the_picture() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    h.app.select(ids.c_a, false);
+    h.frames(3);
+    let id0 = h.app.preview.tex.as_ref().map(|t| t.id()).expect("Vorschautextur");
+    for i in 0..10 {
+        h.app.project.tracks[0].clips[0].fx.contrast = 1.0 + i as f64 * 0.05;
+        h.app.project_rev += 1; // wie die Oberfläche bei einer Reglerbewegung
+        h.frames(1);
+    }
+    let id1 = h.app.preview.tex.as_ref().map(|t| t.id()).unwrap();
+    assert_eq!(id0, id1, "dieselbe Textur wird weiterverwendet (kein neues Speicherobjekt je Bild); bei langsamen Bildern darf nur die Größe wechseln");
+    assert!(h.app.preview.renders >= 10);
+}

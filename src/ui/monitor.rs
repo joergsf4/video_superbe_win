@@ -75,11 +75,13 @@ pub struct PreviewState {
     pub last: Option<(Vec<u8>, usize, usize)>,
     /// Anzahl der Zusammensetzungen (Tests und Leistungsprotokoll)
     pub renders: u64,
+    /// Bis dahin in halber Auflösung rechnen (nach einem langsamen Bild, z. B. beim Ziehen eines Reglers)
+    reduced_until: Option<std::time::Instant>,
 }
 
 impl PreviewState {
     pub fn new(ctx: &egui::Context) -> Self {
-        PreviewState { renderer: Renderer::new(), frames: PreviewFrames { decs: HashMap::new(), ctx: ctx.clone() }, tex: None, src_tex: None, edge_tex: None, src_key: None, key: None, error: None, last: None, renders: 0 }
+        PreviewState { renderer: Renderer::new(), frames: PreviewFrames { decs: HashMap::new(), ctx: ctx.clone() }, tex: None, src_tex: None, edge_tex: None, src_key: None, key: None, error: None, last: None, renders: 0, reduced_until: None }
     }
 
     /// Nach Projektwechsel: Decoder und Bild verwerfen.
@@ -127,7 +129,12 @@ impl App {
             // Das Bild ist deckend: ohne Vormultiplizieren direkt in Color32 übernehmen
             let ci = egui::ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels: rgba.chunks_exact(4).map(|p| Color32::from_rgb(p[0], p[1], p[2])).collect() };
             pv.last = Some((rgba, w, h));
+            if t1 - t0 > std::time::Duration::from_millis(40) {
+                pv.reduced_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+            }
             match &mut pv.tex {
+                // gleiche Größe: nur Pixel ersetzen (kein neues Speicherobjekt je Bild, das flackern kann)
+                Some(tex) if tex.size() == [w, h] => tex.set_partial([0, 0], ci, egui::TextureOptions::LINEAR),
                 Some(tex) => tex.set(ci, egui::TextureOptions::LINEAR),
                 None => pv.tex = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR)),
             }
@@ -162,6 +169,15 @@ impl App {
         let w = ((frame.width() * ppp).round() as usize).clamp(16, 1920) & !1;
         let h = ((frame.height() * ppp).round() as usize).clamp(16, 1080) & !1;
         let ctx = ui.ctx().clone();
+        // Ist das letzte Bild zu langsam gewesen (Regler ziehen bei großem Fenster), rechnet die Vorschau kurz in halber
+        // Auflösung und danach wieder scharf.
+        let (w, h) = match self.preview.reduced_until {
+            Some(t) if std::time::Instant::now() < t => {
+                ctx.request_repaint_after(t - std::time::Instant::now() + std::time::Duration::from_millis(20));
+                (((w / 2).max(16)) & !1, ((h / 2).max(16)) & !1)
+            }
+            _ => (w, h),
+        };
         let painter = ui.painter_at(avail);
         painter.rect_filled(frame, 0.0, Color32::BLACK);
         if let Some(tex) = self.preview_image(&ctx, w, h) {
@@ -253,6 +269,7 @@ impl App {
             let rgba = pv.renderer.render_with(&sp, pos.min(a.duration - 1e-3).max(0.0), w, h, &mut pv.frames);
             let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
             match &mut pv.src_tex {
+                Some(t) if t.size() == [w, h] => t.set_partial([0, 0], ci, egui::TextureOptions::LINEAR),
                 Some(t) => t.set(ci, egui::TextureOptions::LINEAR),
                 None => pv.src_tex = Some(ctx.load_texture("source", ci, egui::TextureOptions::LINEAR)),
             }
