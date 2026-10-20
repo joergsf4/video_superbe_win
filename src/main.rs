@@ -22,7 +22,10 @@ mod player;
 mod record;
 mod render;
 mod source;
+mod scopes;
+mod scenes;
 mod stabilize;
+mod sync;
 mod ui;
 mod video;
 

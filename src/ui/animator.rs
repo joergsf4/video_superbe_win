@@ -153,6 +153,12 @@ impl App {
         }
     }
 
+    /// Höhe des Animators: Werkzeugleiste (28) + Zeitlineal (24) + Zeilen (bis zu 10, danach Scrollen); ohne Zeilen Platz für den Hinweis.
+    pub(crate) fn animator_height(&self, clip: &Clip) -> f32 {
+        let n = rows_for(clip, self.anim_expanded).len();
+        if n == 0 { 28.0 + 24.0 + 58.0 } else { 28.0 + 24.0 + n.min(10) as f32 * ROW_H + 2.0 }
+    }
+
     pub(crate) fn animator_panel(&mut self, ui: &mut Ui, clip: Clip) {
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());

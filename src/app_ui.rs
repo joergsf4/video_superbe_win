@@ -121,6 +121,9 @@ impl App {
             }
         }
         // Eingabetaste: Kapitelmarke, Projektmarker
+        if alt(Key::Enter) {
+            self.toggle_fullscreen(ctx);
+        }
         if pressed(Key::Enter) {
             if m.shift && !m.command && !m.alt {
                 self.add_marker();
@@ -158,6 +161,11 @@ impl App {
         }
         if plain(Key::U) {
             self.trim_selection_to_playhead(false);
+        }
+        if shift(Key::Z) {
+            if let Some(id) = self.selected {
+                self.detect_scenes(id);
+            }
         }
         if plain(Key::X) {
             self.mark_gap();
@@ -399,6 +407,11 @@ impl App {
             }
         }
 
+        self.refresh_scopes(false);
+        if self.scope_mode != crate::scopes::ScopeMode::Off {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+
         // Dateien per Drag & Drop (aus dem Explorer)
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
@@ -406,43 +419,54 @@ impl App {
         }
         self.handle_keys(&ctx);
 
-        egui::Panel::top("menu").frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(4, 2))).show_inside(ui, |ui| self.menu_bar(ui));
-        egui::Panel::top("toolbar").frame(Frame::new().fill(BAR)).exact_size(40.0).resizable(false).show_inside(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("status")
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 2)))
-            .exact_size(22.0)
-            .resizable(false)
-            .show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.status).size(11.5).color(SECONDARY));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("Einfügen: {} ({}) · Maus: {} ({})", self.insert_mode.label(), self.insert_mode.key(), self.mouse_mode.label(), self.mouse_mode.key())).size(11.0).color(SECONDARY));
+        if self.fullscreen {
+            self.fullscreen_ui(ui);
+        } else {
+            egui::Panel::top("menu").frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(4, 2))).show_inside(ui, |ui| self.menu_bar(ui));
+            egui::Panel::top("toolbar").frame(Frame::new().fill(BAR)).exact_size(40.0).resizable(false).show_inside(ui, |ui| self.toolbar(ui));
+            egui::Panel::bottom("status")
+                .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 2)))
+                .exact_size(22.0)
+                .resizable(false)
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&self.status).size(11.5).color(SECONDARY));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(format!("Einfügen: {} ({}) · Maus: {} ({})", self.insert_mode.label(), self.insert_mode.key(), self.mouse_mode.label(), self.mouse_mode.key())).size(11.0).color(SECONDARY));
+                        });
                     });
                 });
+            egui::Panel::bottom("timeline")
+                .frame(Frame::new().fill(BG))
+                .resizable(true)
+                .min_size(200.0)
+                .default_size(310.0)
+                .show_inside(ui, |ui| self.timeline_panel(ui));
+            egui::Panel::right("inspector")
+                .frame(Frame::new().fill(PANEL))
+                .resizable(true)
+                .default_size(340.0)
+                .size_range(300.0..=460.0)
+                .show_inside(ui, |ui| self.inspector_panel(ui));
+            egui::Panel::right("pool")
+                .frame(Frame::new().fill(PANEL))
+                .resizable(true)
+                .default_size(340.0)
+                .size_range(260.0..=900.0)
+                .show_inside(ui, |ui| {
+                if self.scope_mode != crate::scopes::ScopeMode::Off {
+                    self.scopes_panel(ui);
+                } else {
+                    self.pool_panel(ui);
+                }
             });
-        egui::Panel::bottom("timeline")
-            .frame(Frame::new().fill(BG))
-            .resizable(true)
-            .min_size(200.0)
-            .default_size(310.0)
-            .show_inside(ui, |ui| self.timeline_panel(ui));
-        egui::Panel::right("inspector")
-            .frame(Frame::new().fill(PANEL))
-            .resizable(true)
-            .default_size(340.0)
-            .size_range(300.0..=460.0)
-            .show_inside(ui, |ui| self.inspector_panel(ui));
-        egui::Panel::right("pool")
-            .frame(Frame::new().fill(PANEL))
-            .resizable(true)
-            .default_size(340.0)
-            .size_range(260.0..=900.0)
-            .show_inside(ui, |ui| self.pool_panel(ui));
-        // Keyframe-Animator nur unter dem Monitor (nach den Seitenleisten, damit diese die volle Höhe behalten), solange der Reiter „Effekte“ offen ist
-        if let Some(clip) = self.animator_clip() {
-            egui::Panel::bottom("animator").frame(Frame::new().fill(PANEL)).resizable(false).exact_size(170.0).show_inside(ui, |ui| self.animator_panel(ui, clip));
+            // Keyframe-Animator nur unter dem Monitor (nach den Seitenleisten, damit diese die volle Höhe behalten), solange der Reiter „Effekte“ offen ist
+            if let Some(clip) = self.animator_clip() {
+                egui::Panel::bottom("animator").frame(Frame::new().fill(PANEL)).resizable(false).exact_size(self.animator_height(&clip)).show_inside(ui, |ui| self.animator_panel(ui, clip));
+            }
+            egui::CentralPanel::default().frame(Frame::new().fill(PANEL)).show_inside(ui, |ui| self.preview_pane(ui));
+
         }
-        egui::CentralPanel::default().frame(Frame::new().fill(PANEL)).show_inside(ui, |ui| self.preview_pane(ui));
 
         self.settings_window(&ctx);
         self.marker_window(&ctx);

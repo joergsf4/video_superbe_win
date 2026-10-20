@@ -41,11 +41,13 @@ pub struct PreviewState {
     src_key: Option<(u64, u64, usize, usize, u64)>,
     key: Option<(u64, u64, usize, usize, u64)>,
     pub error: Option<String>,
+    /// zuletzt gezeichnetes Projektbild (für die Messinstrumente)
+    pub last: Option<(Vec<u8>, usize, usize)>,
 }
 
 impl PreviewState {
     pub fn new(ctx: &egui::Context) -> Self {
-        PreviewState { renderer: Renderer::new(), frames: PreviewFrames { decs: HashMap::new(), ctx: ctx.clone() }, tex: None, src_tex: None, edge_tex: None, src_key: None, key: None, error: None }
+        PreviewState { renderer: Renderer::new(), frames: PreviewFrames { decs: HashMap::new(), ctx: ctx.clone() }, tex: None, src_tex: None, edge_tex: None, src_key: None, key: None, error: None, last: None }
     }
 
     /// Nach Projektwechsel: Decoder und Bild verwerfen.
@@ -70,6 +72,7 @@ impl App {
             let pv = &mut self.preview;
             let rgba = pv.renderer.render_with(p, t, w, h, &mut pv.frames);
             let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            pv.last = Some((rgba, w, h));
             match &mut pv.tex {
                 Some(tex) => tex.set(ci, egui::TextureOptions::LINEAR),
                 None => pv.tex = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR)),
@@ -90,6 +93,10 @@ impl App {
 
     /// Zeichnet das Projektbild in `avail`; das Format wird eingepasst.
     pub(crate) fn draw_project(&mut self, ui: &mut egui::Ui, avail: Rect) {
+        self.draw_project_opts(ui, avail, true);
+    }
+
+    pub(crate) fn draw_project_opts(&mut self, ui: &mut egui::Ui, avail: Rect, overlay: bool) {
         let aspect = self.project.render_width as f32 / self.project.render_height.max(1) as f32;
         let mut size = Vec2::new(avail.width(), avail.width() / aspect);
         if size.y > avail.height() {
@@ -116,7 +123,50 @@ impl App {
                 painter.line_segment([egui::pos2(frame.left(), frame.top() + frame.height() * f), egui::pos2(frame.right(), frame.top() + frame.height() * f)], line);
             }
         }
-        self.draw_overlay(ui, frame);
+        if overlay {
+            self.draw_overlay(ui, frame);
+        }
+    }
+
+    /// Vollbildvorschau: Film ab der Abspielposition auf dem ganzen Bildschirm; Esc, Klick oder das Filmende schließen.
+    pub(crate) fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        if self.fullscreen {
+            self.fullscreen = false;
+            self.set_playing(false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return;
+        }
+        if self.project.duration() <= 0.0 {
+            return;
+        }
+        self.fullscreen = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        if self.playhead >= self.project.duration() - 0.05 {
+            self.playhead = 0.0;
+        }
+        self.set_playing(true);
+    }
+
+    pub(crate) fn fullscreen_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let (esc, space, click) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Space), i.pointer.primary_clicked()));
+        if esc || click {
+            self.toggle_fullscreen(&ctx);
+            return;
+        }
+        if space {
+            self.set_playing(!self.playing);
+        }
+        if !self.playing && self.playhead >= self.project.duration() - 0.05 {
+            self.toggle_fullscreen(&ctx);
+            return;
+        }
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show_inside(ui, |ui| {
+            let r = ui.available_rect_before_wrap();
+            ui.allocate_rect(r, Sense::hover());
+            self.draw_project_opts(ui, r, false);
+        });
+        ctx.set_cursor_icon(egui::CursorIcon::None);
     }
 }
 
@@ -268,6 +318,10 @@ impl App {
             ui.painter().rect_filled(chip, 3.0, Color32::from_black_alpha(140));
             ui.painter().galley(chip.min + Vec2::new(5.0, 4.0), g, Color32::WHITE);
         } else if area.width() > 40.0 && area.height() > 40.0 {
+            if ui.interact(monitor, ui.id().with("monitor_dbl"), Sense::click()).on_hover_text("Doppelklick: Vollbild").double_clicked() {
+                let ctx = ui.ctx().clone();
+                self.toggle_fullscreen(&ctx);
+            }
             self.draw_project(ui, area);
             self.draw_edge_preview(ui, monitor);
         }

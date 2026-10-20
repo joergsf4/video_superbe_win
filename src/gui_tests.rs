@@ -1136,3 +1136,40 @@ Zeile".into(), credits: Some(true), outline: Some(true), outline_hollow: Some(tr
     h.frames(4);
 }
 
+
+#[test]
+fn scopes_replace_the_pool_and_follow_the_preview() {
+    let (p, _) = project();
+    let mut h = H::new(p);
+    h.app.set_scope(crate::scopes::ScopeMode::Both);
+    for _ in 0..40 {
+        h.frames(2);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if h.app.scope_data.is_some() {
+            break;
+        }
+    }
+    let d = h.app.scope_data.as_ref().expect("Messwerte aus dem Vorschaubild");
+    assert!(d.hist[0][200] > 0.0, "rotes Testbild: Rot bei 200");
+    h.app.set_scope(crate::scopes::ScopeMode::Off);
+    h.frames(3);
+    assert_eq!(h.app.scope_mode, crate::scopes::ScopeMode::Off);
+}
+
+#[test]
+fn fullscreen_preview_starts_with_alt_enter_and_ends_with_escape() {
+    let (p, _) = project();
+    let mut h = H::new(p);
+    h.with_mods(Modifiers::ALT);
+    h.key(Key::Enter);
+    h.with_mods(Modifiers::NONE);
+    assert!(h.app.fullscreen && h.app.playing, "Vollbild läuft");
+    h.frames(3);
+    h.key(Key::Escape);
+    assert!(!h.app.fullscreen && !h.app.playing, "Esc beendet");
+    // leeres Projekt: kein Vollbild
+    let mut e = H::new(Project::default());
+    e.with_mods(Modifiers::ALT);
+    e.key(Key::Enter);
+    assert!(!e.app.fullscreen);
+}

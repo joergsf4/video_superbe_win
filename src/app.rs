@@ -32,6 +32,12 @@ pub(crate) struct ExportCfg {
 }
 
 pub struct App {
+    /// Messinstrumente (ersetzen den Medienpool) und Vollbildvorschau
+    pub(crate) scope_mode: crate::scopes::ScopeMode,
+    pub(crate) scope_data: Option<crate::scopes::ScopeData>,
+    pub(crate) scope_tex: Option<egui::TextureHandle>,
+    pub(crate) scope_last: Instant,
+    pub(crate) fullscreen: bool,
     /// laufende Bewegungsanalysen (Stabilisierung) je Medium
     pub(crate) stab_jobs: HashMap<Uuid, crate::stabilize::StabJob>,
     /// Hilfslinien im Monitor beim Begradigen des Horizonts
@@ -133,6 +139,11 @@ impl App {
             export_cfg: None,
             feat: crate::features::FeatState::new(),
             show_guides: true,
+            scope_mode: Default::default(),
+            scope_data: None,
+            scope_tex: None,
+            scope_last: Instant::now(),
+            fullscreen: false,
             stab_jobs: HashMap::new(),
             title_templates: vec![],
             fx_clipboard: None,
@@ -225,6 +236,9 @@ impl App {
         }
         if std::env::var("VSB_TEST_CONFIRM").is_ok() {
             a.feat.pending = Some(crate::features::Pending::New);
+        }
+        if let Some(m) = std::env::var("VSB_TEST_SCOPE").ok().and_then(|v| v.parse::<usize>().ok()) {
+            a.scope_mode = [crate::scopes::ScopeMode::Off, crate::scopes::ScopeMode::Histogram, crate::scopes::ScopeMode::Parade, crate::scopes::ScopeMode::Both][m.min(3)];
         }
         if std::env::var("VSB_TEST_METER").is_ok() {
             a.feat.meter = [-14.0, -6.0];
@@ -404,6 +418,15 @@ impl App {
                     ui.selectable_value(&mut cfg.quality, 1, "Normal");
                     ui.selectable_value(&mut cfg.quality, 2, "Hoch");
                 });
+                {
+                    let kbps = (export::ExportOpts::from_project(&self.project).video_kbps as f64 * [0.5, 1.0, 1.8][cfg.quality.min(2)]) as u32;
+                    let secs = match (cfg.use_range, mark_range) {
+                        (true, Some((a, b))) => b - a,
+                        _ => self.project.duration(),
+                    };
+                    let mb = (kbps as f64 + 160.0) * secs / 8.0 / 1000.0;
+                    ui.weak(format!("{:.1} Mbit/s · Dauer {}:{:02} · ca. {:.0} MB", kbps as f64 / 1000.0, secs as u64 / 60, secs as u64 % 60, mb));
+                }
                 if let Some((a, b)) = mark_range {
                     let r = ui.checkbox(&mut cfg.use_range, format!("Nur Bereich zwischen den Marken ({:.1} s – {:.1} s)", a, b));
                     if r.changed() {
@@ -417,6 +440,11 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label("Ziel");
                             ui.add(egui::DragValue::new(&mut cfg.target).range(-30.0..=-6.0).speed(0.1).suffix(" LUFS").fixed_decimals(1));
+                            for (t, name) in [(-14.0, "−14 Streaming"), (-16.0, "−16 Podcast"), (-23.0, "−23 Rundfunk")] {
+                                if ui.selectable_label((cfg.target - t).abs() < 0.05, name).clicked() {
+                                    cfg.target = t;
+                                }
+                            }
                             if cfg.measuring.is_none() && ui.button("Messen").clicked() {
                                 measure = true;
                             }

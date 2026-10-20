@@ -201,6 +201,18 @@ impl App {
                     self.paste_effects();
                     ui.close();
                 }
+                if ui.add_enabled(self.selected.is_some_and(|id| self.can_align_audio(id)), egui::Button::new("Ton an zweiter Aufnahme ausrichten")).clicked() {
+                    if let Some(id) = self.selected {
+                        self.align_audio(id);
+                    }
+                    ui.close();
+                }
+                if ui.add_enabled(self.selected.is_some(), egui::Button::new("Szenen erkennen und teilen   Umschalt+Z")).clicked() {
+                    if let Some(id) = self.selected {
+                        self.detect_scenes(id);
+                    }
+                    ui.close();
+                }
                 if ui.button("Standbild aus Clip einfügen").clicked() {
                     self.freeze_frame();
                     ui.close();
@@ -273,6 +285,19 @@ impl App {
                 }
             });
             ui.menu_button("Ansicht", |ui| {
+                ui.menu_button("Messinstrumente", |ui| {
+                    for m in [crate::scopes::ScopeMode::Off, crate::scopes::ScopeMode::Histogram, crate::scopes::ScopeMode::Parade, crate::scopes::ScopeMode::Both] {
+                        if ui.radio(self.scope_mode == m, m.label()).clicked() {
+                            self.set_scope(m);
+                            ui.close();
+                        }
+                    }
+                });
+                if ui.add_enabled(self.project.duration() > 0.0, egui::Button::new("Film im Vollbild abspielen   Alt+Enter")).clicked() {
+                    self.toggle_fullscreen(&ctx);
+                    ui.close();
+                }
+                ui.separator();
                 ui.menu_button("Zoom", |ui| {
                     let fps = self.project.fps.max(1) as f64;
                     for (label, span) in [("1 Bild   Alt+1", 1.0 / fps), ("5 Bilder   Alt+2", 5.0 / fps), ("1 Sekunde   Alt+3", 1.0), ("10 Sekunden   Alt+4", 10.0), ("1 Minute   Alt+5", 60.0), ("10 Minuten   Strg+Alt+6", 600.0)] {

@@ -16,6 +16,8 @@ pub(crate) enum Bg {
     Beats(Uuid, Option<BeatGrid>),
     /// (Musikclip, dB, Sprachintervalle je Tonquelle)
     Voices(Uuid, f64, Vec<(Uuid, Vec<(f64, f64)>)>),
+    /// erkannte Szenenwechsel (Quellsekunden) für einen Videoclip
+    Scenes(Uuid, Vec<f64>),
 }
 
 /// Was nach der Rückfrage „Änderungen sichern?“ geschehen soll.
@@ -34,7 +36,8 @@ pub(crate) enum Answer {
 }
 
 pub(crate) struct FeatState {
-    tx: Sender<Bg>,
+    pub(crate) tx: Sender<Bg>,
+    pub(crate) scene_busy: bool,
     rx: Receiver<Bg>,
     pub(crate) beat_busy: HashSet<Uuid>,
     beat_cache: HashMap<Uuid, BeatGrid>,
@@ -78,6 +81,7 @@ impl FeatState {
         let (tx, rx) = channel();
         FeatState {
             tx,
+            scene_busy: false,
             rx,
             beat_busy: HashSet::new(),
             beat_cache: HashMap::new(),
@@ -351,6 +355,7 @@ impl App {
                         None => self.status = "Kein gleichmäßiger Takt gefunden".into(),
                     }
                 }
+                Bg::Scenes(id, ts) => self.apply_scene_cuts(id, ts),
                 Bg::Voices(music, db, res) => {
                     self.feat.duck_busy = false;
                     for (a, iv) in res {
@@ -360,7 +365,7 @@ impl App {
                 }
             }
         }
-        if !self.feat.beat_busy.is_empty() || self.feat.duck_busy {
+        if !self.feat.beat_busy.is_empty() || self.feat.duck_busy || self.feat.scene_busy {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }

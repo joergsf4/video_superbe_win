@@ -19,16 +19,20 @@ Standbilder), liegt im Ordner `VideoSuperbe-Daten` neben der EXE.
 
 | | |
 |---|---|
-| **Timeline** | beliebig viele Spuren, Schneiden, Verschieben, Kürzen mit Kantenvorschau, Ripple-Löschen, Mehrfachauswahl, Zwischenablage, magnetisches Einrasten (Clips, Marken, Beat-Linien), Überblendungen und Übergänge, Rückgängig/Wiederholen |
-| **Medienpool** | Videos, Bilder und Ton per Dialog oder Drag & Drop; doppelte Dateien werden erkannt; das erste Video legt Format (auch 9:16) und Bildrate fest |
+| **Timeline** | beliebig viele Spuren, Schneiden, Verschieben, Kürzen mit Kantenvorschau, Mehrfachauswahl, Zwischenablage, magnetisches Einrasten (Clips, Marken, Beat-Linien), Gruppen, Projektmarker 1–10, Rückgängig/Wiederholen |
+| **Schnittlogik** | Einfügemodi (automatisch, Ripple, Überschreiben), Mausmodi (Auswahl, Ripple-Trim, Rolle), J-/L-Schnitt (Alt-Ziehen), Rollschnitt (Strg-Ziehen), Lückensuche und -schließen, Drei-/Vierpunktschnitt aus dem Quellmonitor, Zeitcode eintippen, Taktschnitt (Schnitte auf Beats) |
+| **Medienpool** | Videos, Bilder und Ton per Dialog oder Drag & Drop; Doppelklick hängt ans Ende an; doppelte Dateien werden erkannt; das erste Video legt Format (auch 9:16) und Bildrate fest |
 | **Quellmonitor** | Medium ansehen, Anfang/Ende wählen (I/O), Auswahl auf die Timeline ziehen oder einfügen |
-| **Bild** | Position, Größe, Drehung, Beschnitt, Look (Helligkeit, Kontrast, Sättigung, Wärme, Schärfe, Weichzeichner, Vignette), Voreinstellungen |
+| **Blenden** | Überblendung, Abblenden, Blitz, Wischen (seitlich/von oben), Schieben, Zoom, Iris; Kacheln per Drag & Drop auf die Überlappung, Dauer 0,5–2 s |
+| **Bild** | Position, Größe, Drehung, Beschnitt, Spiegeln, 90°-Drehung, Horizont-Ausrichtung mit Hilfslinien, Look (Helligkeit, Kontrast, Sättigung, Wärme, Schärfe, Weichzeichner, Vignette), 3D-LUT (`.cube`), Greenscreen (Chroma-Key), **Stabilisierung** (eigene Bewegungsmessung), Effekte kopieren/einfügen |
 | **Animator** | Keyframes für alle Kanäle mit Interpolation (linear, Bézier, Halten), Objektrahmen direkt im Monitor |
-| **Titel** | Text, Schriftart, Größe, Farbe, Kontur, Hintergrund, Bauchbinde, Untertitel-Clips, SRT-Export |
+| **Titel** | Schrift (fett, kursiv, unterstrichen, Laufweite, Zeilenabstand), Schatten, Umrandung, Hintergrund, Bauchbinde, Ein-/Auslaufen (Fliegen, Zoom, Schreibmaschine), Abspann, Laufschrift, Platzhalter (`{datum}`, `{timecode}` …), Vorlagen, Untertitel-Clips, SRT-Export |
 | **Ton** | Wellenform, Lautstärkekurve im Clip, Ein-/Ausblenden, Geschwindigkeit, Windfilter, Rauschminderung, Pegelanzeige |
-| **Automatik** | Musik bei Sprache abdunkeln (Ducking), Beat-Erkennung mit Beat-Linien, Sprecher aufnehmen |
+| **Automatik** | Musik bei Sprache abdunkeln (Ducking), Beat-Erkennung, **Ton-Synchronisation** zweier Aufnahmen, **Szenenerkennung** (Clip an Schnitten teilen), Sprecher aufnehmen |
+| **Messinstrumente** | Histogramm und RGB-Parade (Ansicht ▸ Messinstrumente) |
+| **Ansicht** | Vollbildvorschau (Doppelklick auf den Monitor oder Alt+Enter) |
 | **Sonstiges** | Standbild einfügen und exportieren, Kapitelmarken für YouTube, Autosave mit Wiederherstellung, fehlende Medien neu verknüpfen |
-| **Export** | MP4 (H.264 + AAC), Qualität wählbar, nur der Bereich zwischen den Marken, Lautheit auf Zielwert normalisieren (−14 LUFS, ITU-R BS.1770) |
+| **Export** | MP4 (H.264 + AAC), Qualität mit Größenanzeige, nur der Bereich zwischen den Marken, Lautheit normalisieren (−14 / −16 / −23 LUFS, ITU-R BS.1770) |
 
 Die Vorschau benutzt denselben Renderer wie der Export: Was man sieht, kommt auch in die Datei.
 
@@ -38,12 +42,39 @@ Die Vorschau benutzt denselben Renderer wie der Export: Was man sieht, kommt auc
 <td><img src="docs/export.png" alt="Export"><br><sub>Export mit Lautheits-Normalisierung</sub></td>
 </tr>
 <tr>
-<td><img src="docs/titel.png" alt="Titel"><br><sub>Titel, Bauchbinde, Schriftart und Kontur</sub></td>
+<td><img src="docs/titel.png" alt="Titel"><br><sub>Titel: Schrift, Schatten, Umrandung, Bewegung, Vorlagen</sub></td>
 <td><img src="docs/ton.png" alt="Ton"><br><sub>Lautstärkekurve (Ducking), Beat-Linien, Tonbearbeitung</sub></td>
+</tr>
+<tr>
+<td><img src="docs/blenden.png" alt="Blenden"><br><sub>Blenden-Kacheln und Messinstrumente (Histogramm, RGB-Parade)</sub></td>
+<td><img src="docs/messinstrumente.png" alt="Effekte"><br><sub>Effekte, Animator und Messinstrumente</sub></td>
 </tr>
 </table>
 
-Nicht enthalten: Person freistellen und automatische Untertitel per Spracherkennung (beides braucht Modelle bzw. Dienste).
+## Wichtige Tasten
+
+Wie in der Mac-Version, mit Strg statt ⌘ und Alt statt ⌥.
+
+| Taste | Wirkung |
+|---|---|
+| Leertaste, K, L, J | Wiedergabe/Pause, anhalten, abspielen, 1 s zurück |
+| S oder T | Teilen an der Abspielposition |
+| Z / U | Clip-Anfang / -Ende auf die Abspielposition kürzen |
+| 1 / 2 / 3 / 5 | Einfügemodus: automatisch, Einspur-Ripple, Mehrspur-Ripple, Überschreiben |
+| 6 / 7 / 8 | Mausmodus: Auswahl, Ripple-Trim, Rolle |
+| Umschalt+Ziffer / Strg+Ziffer | Projektmarker 1–10 setzen / dorthin springen |
+| `<` / `>`, X, Strg+Umschalt+C | Lücke davor/danach, Lücke markieren, nächste Lücke suchen |
+| W / Q | zum nächsten / vorigen Marker (Alt: Schnittpunkt, Umschalt: gewählter Clip) |
+| D, F, Alt+F, N | Duplizieren, Zoom auf alles, Zoom auf Bereich, Einrasten |
+| Alt+Pfeile | gewählte Clips verschieben |
+| G / Umschalt+G | Gruppieren / Gruppe lösen |
+| Strg+Alt+C / V | Effekte kopieren / einfügen |
+| Umschalt+Z | Szenen erkennen und teilen |
+| Strg+Umschalt+M | Schnitte auf Beats legen |
+| Alt+Enter | Vollbildvorschau |
+
+Nicht enthalten: Person freistellen, Webcam- und Bildschirmaufnahme, rückwärts abspielen, HEVC-Export und automatische
+Untertitel per Spracherkennung.
 
 ## HEVC / H.265 (iPhone, GoPro) und HDR
 

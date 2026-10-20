@@ -673,6 +673,14 @@ impl App {
                     });
                     ui.separator();
                 }
+                if cc.part == ClipPart::Video && !cc.is_title() && ui.button("Szenen erkennen und teilen").clicked() {
+                    self.detect_scenes(cc.id);
+                    ui.close();
+                }
+                if self.can_align_audio(cc.id) && ui.button("Ton an zweiter Aufnahme ausrichten").clicked() {
+                    self.align_audio(cc.id);
+                    ui.close();
+                }
                 if !cc.is_audio() && !cc.is_title() && ui.button("Datum als Titel einblenden").clicked() {
                     self.add_date_title(cc.id);
                     ui.close();
