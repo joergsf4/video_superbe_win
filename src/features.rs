@@ -1050,7 +1050,7 @@ mod tests {
     fn subtitle_preset_sits_at_the_bottom_and_feeds_the_srt() {
         let mut a = app();
         a.playhead = 2.0;
-        a.add_title(crate::editing::TitlePreset::Subtitle);
+        a.add_title(crate::fx_edit::TitlePreset::Subtitle);
         let c = a.project.clip(a.selected.unwrap()).unwrap().clone();
         let ClipContent::Title(t) = &c.content else { panic!() };
         assert_eq!(t.v.subtitle, Some(true));
@@ -1061,7 +1061,7 @@ Untertitel"));
         let mut b = app();
         b.project.render_width = 1080;
         b.project.render_height = 1920;
-        b.add_title(crate::editing::TitlePreset::Subtitle);
+        b.add_title(crate::fx_edit::TitlePreset::Subtitle);
         let c = b.project.clip(b.selected.unwrap()).unwrap();
         assert!((c.transform.y - 0.30).abs() < 1e-9);
     }

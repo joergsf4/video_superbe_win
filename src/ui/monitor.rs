@@ -106,6 +106,16 @@ impl App {
             painter.image(tex.id(), frame, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
         painter.rect_stroke(frame, 0.0, Stroke::new(1.0, Color32::from_gray(70)), StrokeKind::Outside);
+        // Hilfslinien beim Begradigen des Horizonts (Gitter über dem Bild)
+        let guides = self.show_guides && self.selected.and_then(|id| self.project.clip(id)).is_some_and(|c| c.fx.horizon.is_some() && self.playhead >= c.start && self.playhead <= c.end());
+        if guides {
+            let line = Stroke::new(0.5, Color32::from_white_alpha(90));
+            for k in 1..8 {
+                let f = k as f32 / 8.0;
+                painter.line_segment([egui::pos2(frame.left() + frame.width() * f, frame.top()), egui::pos2(frame.left() + frame.width() * f, frame.bottom())], line);
+                painter.line_segment([egui::pos2(frame.left(), frame.top() + frame.height() * f), egui::pos2(frame.right(), frame.top() + frame.height() * f)], line);
+            }
+        }
         self.draw_overlay(ui, frame);
     }
 }

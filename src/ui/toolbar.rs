@@ -165,15 +165,27 @@ impl App {
                 });
                 ui.separator();
                 if ui.button("Titel einfügen").clicked() {
-                    self.add_title(crate::editing::TitlePreset::Title);
+                    self.add_title(crate::fx_edit::TitlePreset::Title);
                     ui.close();
                 }
                 if ui.button("Bauchbinde einfügen").clicked() {
-                    self.add_title(crate::editing::TitlePreset::LowerThird);
+                    self.add_title(crate::fx_edit::TitlePreset::LowerThird);
+                    ui.close();
+                }
+                if ui.button("Abspann einfügen").clicked() {
+                    self.add_title(crate::fx_edit::TitlePreset::Credits);
+                    ui.close();
+                }
+                if ui.button("Laufschrift einfügen").clicked() {
+                    self.add_title(crate::fx_edit::TitlePreset::Ticker);
+                    ui.close();
+                }
+                if ui.button("Timecode-Titel einfügen").clicked() {
+                    self.add_title(crate::fx_edit::TitlePreset::Timecode);
                     ui.close();
                 }
                 if ui.button("Untertitel einfügen").clicked() {
-                    self.add_title(crate::editing::TitlePreset::Subtitle);
+                    self.add_title(crate::fx_edit::TitlePreset::Subtitle);
                     ui.close();
                 }
                 if ui.button("Spur hinzufügen").clicked() {
@@ -181,6 +193,14 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Effekte kopieren              Strg+Alt+C").clicked() {
+                    self.copy_effects();
+                    ui.close();
+                }
+                if ui.add_enabled(self.fx_clipboard.is_some(), egui::Button::new("Effekte einfügen              Strg+Alt+V")).clicked() {
+                    self.paste_effects();
+                    ui.close();
+                }
                 if ui.button("Standbild aus Clip einfügen").clicked() {
                     self.freeze_frame();
                     ui.close();

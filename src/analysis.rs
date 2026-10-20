@@ -126,7 +126,7 @@ const FFT_N: usize = 1024;
 const LATENCY: f64 = 0.0235;
 
 /// In-place-FFT (Radix 2) über `re`/`im` (Länge Zweierpotenz).
-fn fft(re: &mut [f32], im: &mut [f32], tw: &[(f32, f32)]) {
+pub(crate) fn fft(re: &mut [f32], im: &mut [f32], tw: &[(f32, f32)]) {
     let n = re.len();
     let mut j = 0usize;
     for i in 1..n {

@@ -3,6 +3,7 @@
 
 mod animator;
 mod inspector;
+mod inspector2;
 mod monitor;
 mod overlay;
 pub use animator::AnimGeom;

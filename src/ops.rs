@@ -962,6 +962,14 @@ impl Project {
     /// dahinter nach vorn.
     pub fn set_transition(&mut self, a: Uuid, b: Uuid, kind: Option<&str>, duration: f64) -> bool {
         let (Some(ca), Some(cb)) = (self.clip(a).cloned(), self.clip(b).cloned()) else { return false };
+        // gesperrte Spuren bleiben unberührt
+        for id in [a, b] {
+            for x in std::iter::once(id).chain(self.partner_id(id)) {
+                if self.find_clip(x).is_some_and(|(t, _)| self.tracks[t].locked) {
+                    return false;
+                }
+            }
+        }
         let backup = self.clone();
         let finish = |s: &mut Project| {
             if let Some(k) = kind {

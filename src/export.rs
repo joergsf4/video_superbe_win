@@ -125,7 +125,12 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
         vin.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32)).map_err(e)?;
         vin.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)).map_err(e)?;
         vin.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).map_err(e)?;
-        writer.SetInputMediaType(vi, &vin, None).map_err(|er| format!("Videoformat: {er}"))?;
+        // Keine B-Bilder: sonst beginnt das Bild um ein Bild später als der Ton (Zeitversatz im Container)
+        let mut enc: Option<IMFAttributes> = None;
+        MFCreateAttributes(&mut enc, 1).map_err(e)?;
+        let enc = enc.ok_or("Attribute")?;
+        enc.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0).map_err(e)?;
+        writer.SetInputMediaType(vi, &vin, Some(&enc)).map_err(|er| format!("Videoformat: {er}"))?;
 
         // Audio
         let mut ai = 0;

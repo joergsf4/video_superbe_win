@@ -32,6 +32,14 @@ pub(crate) struct ExportCfg {
 }
 
 pub struct App {
+    /// laufende Bewegungsanalysen (Stabilisierung) je Medium
+    pub(crate) stab_jobs: HashMap<Uuid, crate::stabilize::StabJob>,
+    /// Hilfslinien im Monitor beim Begradigen des Horizonts
+    pub(crate) show_guides: bool,
+    /// Eigene Titelvorlagen, kopierte Effekte, Eingabe „Name der Vorlage“
+    pub(crate) title_templates: Vec<crate::fx_edit::TitleTemplate>,
+    pub(crate) fx_clipboard: Option<crate::fx_edit::FxClipboard>,
+    pub(crate) template_prompt: Option<(Uuid, String)>,
     /// Einfügemodus (Tasten 1/2/3/5) und Mausmodus (6/7/8)
     pub(crate) insert_mode: crate::ops::InsertMode,
     pub(crate) mouse_mode: crate::ops::MouseMode,
@@ -124,6 +132,11 @@ impl App {
             export_job: None,
             export_cfg: None,
             feat: crate::features::FeatState::new(),
+            show_guides: true,
+            stab_jobs: HashMap::new(),
+            title_templates: vec![],
+            fx_clipboard: None,
+            template_prompt: None,
             insert_mode: Default::default(),
             mouse_mode: Default::default(),
             play_until: None,
@@ -180,6 +193,7 @@ impl App {
         if let Some(p) = arg {
             a.open_path(p);
         }
+        a.title_templates = crate::fx_edit::load_templates(&a.templates_path());
         // Testhilfen (Umgebungsvariablen): Auswahl "Spur:Clip" und Inspektor-Reiter.
         if let Ok(v) = std::env::var("VSB_TEST_SELECT") {
             let mut it = v.split(':').filter_map(|x| x.parse::<usize>().ok());

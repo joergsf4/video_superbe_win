@@ -1,8 +1,9 @@
-//! Software-Kompositor: rendert ein Projektbild zu einer Zeit als RGBA. Gleicher Code für vorschau und Export.
+﻿//! Software-Kompositor: rendert ein Projektbild zu einer Zeit als RGBA. Gleicher Code für vorschau und Export.
 //! Bilder, Videos, Titel, Position/Skalierung/Drehung (auch animiert), Beschnitt, Deckkraft, Überblendung,
 //! Übergänge (Überblenden, Schwarzblende, Wischen, Schieben) und die Effekte Helligkeit, Kontrast, Sättigung,
 //! Farbtemperatur, Vignette, Schärfe und Weichzeichner.
 
+use crate::fxlib::{self, Lut, Orient};
 use crate::model::*;
 use crate::video::{Decoder, Frame};
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
@@ -75,6 +76,8 @@ pub struct Renderer {
     bold: Option<FontVec>,
     /// weitere Schriftfamilien (normal, fett), bei Bedarf geladen
     faces: HashMap<String, (FontVec, FontVec)>,
+    /// geladene 3D-LUTs (`.cube`) nach Pfad
+    luts: HashMap<String, Option<Arc<Lut>>>,
     blocking: BlockingFrames,
 }
 
@@ -142,6 +145,26 @@ struct Draw<'a> {
     wipe_x: Option<f32>,
     /// Ziel ist deckend (Hauptbild) statt durchsichtig (Ebene für Weichzeichner)
     opaque: bool,
+    /// Verschiebung nach unten in Zielpixeln (Titelbewegung, Abspann)
+    dy: f32,
+    /// Sichtbar nur oberhalb dieser y-Position (Übergang „Wischen von oben“)
+    wipe_y: Option<f32>,
+    /// Vergrößerung um die Bildmitte (Übergang „Zoom“, Titel-Zoom)
+    zoom: f32,
+    /// Kreisförmige Blende um die Bildmitte mit diesem Radius (Irisblende)
+    iris: Option<f32>,
+    /// Spiegeln/Drehen/Horizont
+    orient: Option<Orient>,
+    /// 3D-LUT mit Stärke
+    lut: Option<(Arc<Lut>, f32)>,
+    /// Stabilisierung: Verschiebung (Anteile von Breite/Höhe) und Skalierung um die Bildmitte
+    stab: Option<(f32, f32, f32)>,
+}
+
+impl Draw<'_> {
+    fn new<'a>(src: &'a Img, native: bool, tr: Transform2D, fx: Effects, alpha: f32, opaque: bool) -> Draw<'a> {
+        Draw { src, native, tr, fx, alpha, dx: 0.0, wipe_x: None, opaque, dy: 0.0, wipe_y: None, zoom: 1.0, iris: None, orient: None, lut: None, stab: None }
+    }
 }
 
 fn transition_kind(clip: &Clip) -> &str {
@@ -156,20 +179,25 @@ impl Renderer {
             regular: load_font("segoeui.ttf"),
             bold: load_font("segoeuib.ttf"),
             faces: HashMap::new(),
+            luts: HashMap::new(),
             blocking: BlockingFrames::default(),
         }
     }
 
-    /// Größe der Titelgrafik (Pixel) bei der Bildhöhe `canvas_h` (zwischengespeichert).
-    pub fn title_size(&mut self, s: &TitleStyle, canvas_h: usize) -> Option<(usize, usize)> {
-        let key = format!("size|{canvas_h}|{s:?}");
+    /// Größe der Titelgrafik (Pixel) bei Bildbreite `canvas_w` und -höhe `canvas_h` (zwischengespeichert).
+    pub fn title_size(&mut self, s: &TitleStyle, canvas_w: usize, canvas_h: usize) -> Option<(usize, usize)> {
+        let key = format!("size|{canvas_w}x{canvas_h}|{s:?}");
         if let Some(i) = self.titles.get(&key) {
             return Some((i.w, i.h));
         }
-        let img = self.render_title(s, canvas_h)?;
+        let img = self.render_title(s, canvas_w, canvas_h, None)?;
         let r = (img.w, img.h);
         self.titles.insert(key, Arc::new(Img { w: img.w, h: img.h, px: vec![] }));
         Some(r)
+    }
+
+    fn lut(&mut self, path: &str) -> Option<Arc<Lut>> {
+        self.luts.entry(path.to_string()).or_insert_with(|| fxlib::load_cube(path)).clone()
     }
 
     pub fn has_fonts(&self) -> bool {
@@ -223,12 +251,25 @@ impl Renderer {
                 }
                 // Übergänge
                 let (mut dx, mut wipe_x) = (0.0f32, None);
+                let (mut wipe_y, mut zoom, mut iris, mut flash): (Option<f32>, f32, Option<f32>, Option<f32>) = (None, 1.0, None, None);
                 if xin > 0.0 && in_kind != "crossfade" {
                     let p_in = (rel / xin).clamp(0.0, 1.0) as f32;
                     match in_kind.as_str() {
-                        "dip" => alpha *= ((p_in - 0.5) * 2.0).max(0.0),
+                        "dip" | "flash" => alpha *= ((p_in - 0.5) * 2.0).max(0.0),
                         "wipe" => wipe_x = Some(w as f32 * p_in),
+                        "wipeDown" => wipe_y = Some(h as f32 * p_in),
                         "slide" => dx += (1.0 - p_in) * w as f32,
+                        "zoom" => {
+                            alpha *= p_in;
+                            zoom *= 1.0 + 0.35 * (1.0 - p_in);
+                        }
+                        "iris" => {
+                            if p_in <= 0.001 {
+                                alpha = 0.0;
+                            } else if p_in < 0.999 {
+                                iris = Some(p_in * (w as f32).hypot(h as f32) / 2.0 * 1.05);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -236,8 +277,20 @@ impl Renderer {
                     let p_out = ((rel - (c.duration - xout)) / xout).clamp(0.0, 1.0) as f32;
                     match k {
                         "dip" => alpha *= (1.0 - 2.0 * p_out).max(0.0),
+                        "flash" => {
+                            alpha *= (1.0 - 2.0 * p_out).max(0.0);
+                            flash = Some(1.0 - (2.0 * p_out - 1.0).abs());
+                        }
                         "slide" => dx -= p_out * w as f32,
+                        "zoom" => zoom *= 1.0 + 0.35 * p_out,
                         _ => {}
+                    }
+                }
+                if let Some(wa) = flash {
+                    // Weißblende: weiße Fläche über dem bisherigen Ergebnis
+                    for px in dst.chunks_exact_mut(4) {
+                        over(px, [255, 255, 255, 255], wa);
+                        px[3] = 255;
                     }
                 }
                 if alpha <= 0.0 {
@@ -245,25 +298,60 @@ impl Renderer {
                 }
                 let fx = if c.is_title() { Effects::default() } else { c.fx_at(rel) };
                 let tr_now = c.transform_at(rel);
+                let (mut title_dx, mut title_dy, mut title_zoom) = (0.0f32, 0.0f32, 1.0f32);
                 let (src, native): (Arc<Img>, bool) = match &c.content {
                     ClipContent::Title(s) => {
-                        let key = format!("{w}x{h}|{:?}", s.v);
+                        // Platzhalter, Schreibmaschine, Ein-/Auslaufen, Abspann und Laufschrift (alles zeitabhängig)
+                        let mut style = s.v.clone();
+                        style.text = fxlib::expand_tokens(&style.text, t, p.fps, Some(rel));
+                        let dur = style.anim_dur.unwrap_or(0.6).max(0.1);
+                        let mut visible: Option<usize> = None;
+                        let mut motion = (0.0, 0.0, 1.0, 1.0);
+                        if let Some(a) = style.anim_in.as_deref().filter(|a| *a != "none") {
+                            if rel < dur {
+                                if a == "typewriter" {
+                                    visible = Some((style.text.chars().count() as f64 * (rel / dur).clamp(0.0, 1.0)) as usize);
+                                } else {
+                                    motion = fxlib::title_motion(a, 1.0 - fxlib::ease(rel / dur), w as f64, h as f64);
+                                }
+                            }
+                        }
+                        if let Some(a) = style.anim_out.as_deref().filter(|a| *a != "none" && *a != "typewriter") {
+                            if c.duration - rel < dur {
+                                motion = fxlib::title_motion(a, 1.0 - fxlib::ease((c.duration - rel) / dur), w as f64, h as f64);
+                            }
+                        }
+                        let key = format!("{w}x{h}|{visible:?}|{style:?}");
                         if !self.titles.contains_key(&key) {
-                            if let Some(img) = self.render_title(&s.v, h) {
+                            if let Some(img) = self.render_title(&style, w, h, visible) {
                                 self.titles.insert(key.clone(), Arc::new(img));
                             }
                         }
-                        match self.titles.get(&key) {
-                            Some(i) => (i.clone(), true),
-                            None => continue,
+                        let Some(img) = self.titles.get(&key).cloned() else { continue };
+                        let p01 = (rel / c.duration.max(0.1)).clamp(0.0, 1.0) as f32;
+                        if style.credits == Some(true) {
+                            // Abspann: von unten nach oben über die ganze Clip-Dauer
+                            let (hh, ih) = (h as f32, img.h as f32);
+                            title_dy = (hh - p01 * (hh + ih) + ih / 2.0) - hh / 2.0;
                         }
+                        if style.ticker == Some(true) {
+                            // Laufschrift: von rechts nach links über die ganze Clip-Dauer
+                            let (ww, iw) = (w as f32, img.w as f32);
+                            title_dx = (ww - p01 * (ww + iw) + iw / 2.0) - ww / 2.0;
+                        }
+                        title_dx += motion.0 as f32;
+                        title_dy += motion.1 as f32;
+                        title_zoom = motion.2 as f32;
+                        alpha *= motion.3 as f32;
+                        (img, true)
                     }
                     ClipContent::Media(m) => {
                         let Some(asset) = p.asset(m.v) else { continue };
                         if asset.is_image {
                             let levels = self.images.entry(m.v).or_insert_with(|| load_image(&asset.path).map(|i| vec![Arc::new(i)]));
                             let Some(levels) = levels else { continue };
-                            let k = fit_scale(levels[0].w, levels[0].h, &fx, w, h, false, tr_now.scale as f32);
+                            let (ow, oh) = Orient::from_fx(&fx).map(|o| o.dims(levels[0].w as f32, levels[0].h as f32)).map(|d| (d.0 as usize, d.1 as usize)).unwrap_or((levels[0].w, levels[0].h));
+                            let k = fit_scale(ow, oh, &fx, w, h, false, tr_now.scale as f32);
                             (pick_level(levels, k), false)
                         } else {
                             let Some(f) = frames.frame(asset, c.source_in + rel * c.speed) else { continue };
@@ -273,7 +361,26 @@ impl Renderer {
                     }
                 };
                 let needs_layer = fx.blur > 0.0 || fx.sharpness > 0.0;
-                let mk = |opaque: bool| Draw { src: &src, native, tr: tr_now.clone(), fx: fx.clone(), alpha: if opaque { alpha } else { 1.0 }, dx, wipe_x, opaque };
+                let lut = fx.lut_path.clone().and_then(|pth| self.lut(&pth)).map(|l| (l, fx.lut_amount.unwrap_or(1.0) as f32));
+                let orient = Orient::from_fx(&fx);
+                // Stabilisierung: Verschiebung und Skalierung aus den gemessenen Bewegungsdaten der Quelle
+                let stab = match (&c.content, fx.stabilize) {
+                    (ClipContent::Media(m), Some(strength)) if strength > 0.001 => crate::stabilize::get(m.v).and_then(|path| path.transform_at(c.source_in + rel * c.speed, strength, fx.stab_no_scale != Some(true))),
+                    _ => None,
+                };
+                let mk = |opaque: bool| {
+                    let mut d = Draw::new(&src, native, tr_now.clone(), fx.clone(), if opaque { alpha } else { 1.0 }, opaque);
+                    d.dx = dx + title_dx;
+                    d.dy = title_dy;
+                    d.wipe_x = wipe_x;
+                    d.wipe_y = wipe_y;
+                    d.zoom = zoom * title_zoom;
+                    d.iris = iris;
+                    d.orient = orient;
+                    d.lut = lut.clone();
+                    d.stab = stab;
+                    d
+                };
                 if needs_layer {
                     let mut layer = vec![0u8; w * h * 4];
                     blit(&mut layer, w, h, &mk(false));
@@ -297,7 +404,10 @@ impl Renderer {
         dst
     }
 
-    fn render_title(&mut self, s: &TitleStyle, canvas_h: usize) -> Option<Img> {
+    /// Rendert Titel/Bauchbinden als enges Bild (Text samt Hintergrundbox): Auszeichnung (fett, kursiv, unterstrichen),
+    /// Ausrichtung, Zeilenabstand, Laufweite, Umbruch bei 90 % der Bildbreite, Schatten mit Unschärfe, Umrandung (auch nur
+    /// Rahmen). `visible`: Schreibmaschine, nur die ersten Zeichen sind sichtbar (das Layout bleibt gleich).
+    fn render_title(&mut self, s: &TitleStyle, canvas_w: usize, canvas_h: usize, visible: Option<usize>) -> Option<Img> {
         let family = s.font.as_deref().and_then(resolve_family);
         if let Some(f) = family {
             if !self.faces.contains_key(f) {
@@ -316,39 +426,130 @@ impl Renderer {
             }
         };
         let fs = (canvas_h as f64 * s.font_size).max(4.0) as f32;
-        let lines: Vec<&str> = s.text.split('\n').collect();
-        struct L<'a> {
-            text: &'a str,
+        let kern = s.kerning.unwrap_or(0.0) as f32 * fs;
+        let line_gap_extra = s.line_spacing.unwrap_or(0.0) as f32 * fs;
+        let max_w = if s.ticker == Some(true) { 1.0e6 } else { canvas_w as f32 * 0.9 };
+        let width_of = |font: &FontVec, size: f32, text: &str| -> f32 {
+            let sf = font.as_scaled(PxScale::from(size));
+            let (mut w, mut prev) = (0.0, None);
+            for ch in text.chars() {
+                let g = sf.glyph_id(ch);
+                if let Some(p) = prev {
+                    w += sf.kern(p, g);
+                }
+                w += sf.h_advance(g) + kern;
+                prev = Some(g);
+            }
+            w
+        };
+        // Zeilen mit Umbruch
+        struct Row<'a> {
+            text: String,
             size: f32,
             font: &'a FontVec,
+            start: usize,
             w: f32,
             asc: f32,
             lh: f32,
         }
-        let ls: Vec<L> = lines
-            .iter()
-            .enumerate()
-            .map(|(i, text)| {
-                let size = if i == 0 { fs } else { fs * 0.6 };
-                let font = if i == 0 { bold } else { reg };
-                let sf = font.as_scaled(PxScale::from(size));
-                let mut w = 0.0;
-                let mut prev = None;
-                for ch in text.chars() {
-                    let g = sf.glyph_id(ch);
-                    if let Some(pg) = prev {
-                        w += sf.kern(pg, g);
-                    }
-                    w += sf.h_advance(g);
-                    prev = Some(g);
+        let mut rows: Vec<Row> = vec![];
+        let mut idx = 0usize;
+        for (li, line) in s.text.split('\n').enumerate() {
+            let size = if li == 0 { fs } else { fs * 0.6 };
+            let font = if s.bold.unwrap_or(li == 0) { bold } else { reg };
+            let sf = font.as_scaled(PxScale::from(size));
+            let (asc, lh) = (sf.ascent(), sf.height() + sf.line_gap());
+            let mut cur = String::new();
+            let mut cur_start = idx;
+            let mut pos = idx;
+            for word in line.split(' ') {
+                let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+                if !cur.is_empty() && width_of(font, size, &cand) > max_w {
+                    let w = width_of(font, size, &cur);
+                    rows.push(Row { text: std::mem::take(&mut cur), size, font, start: cur_start, w, asc, lh });
+                    cur = word.to_string();
+                    cur_start = pos;
+                } else {
+                    cur = cand;
                 }
-                L { text, size, font, w, asc: sf.ascent(), lh: sf.height() + sf.line_gap() }
-            })
-            .collect();
-        let pad = if s.background { fs * 0.5 } else if s.outline == Some(true) { fs * 0.25 } else { fs * 0.2 };
-        let tw = ls.iter().map(|l| l.w).fold(0.0, f32::max);
-        let th: f32 = ls.iter().map(|l| l.lh).sum();
+                pos += word.chars().count() + 1;
+            }
+            let w = width_of(font, size, &cur);
+            rows.push(Row { text: cur, size, font, start: cur_start, w, asc, lh });
+            idx += line.chars().count() + 1;
+        }
+        let outline = s.outline == Some(true);
+        let hollow = outline && s.outline_hollow == Some(true);
+        let ow = s.outline_width.unwrap_or(4.0) as f32;
+        let ring_r = (ow / 200.0 * fs).max(0.75);
+        let pad = (if s.background { fs * 0.5 } else { fs * 0.2 }) + if outline { ring_r } else { 0.0 };
+        let tw = rows.iter().map(|r| r.w).fold(0.0, f32::max);
+        let th: f32 = rows.iter().map(|r| r.lh).sum::<f32>() + line_gap_extra * (rows.len().saturating_sub(1)) as f32;
         let (iw, ih) = ((tw + 2.0 * pad).ceil().max(1.0) as usize, (th + 2.0 * pad).ceil().max(1.0) as usize);
+        if iw > 16000 || ih > 16000 {
+            return None;
+        }
+        let align = if s.left_aligned { 0 } else if s.right_aligned == Some(true) { 2 } else { 1 };
+        let italic = s.italic == Some(true);
+        let underline = s.underline == Some(true);
+
+        // Abdeckung (0…1) des sichtbaren Textes, um (ox, oy) verschoben
+        let coverage = |ox: f32, oy: f32| -> Vec<f32> {
+            let mut cov = vec![0f32; iw * ih];
+            let mut y = pad;
+            for row in &rows {
+                let x0 = match align {
+                    0 => pad,
+                    2 => pad + tw - row.w,
+                    _ => pad + (tw - row.w) / 2.0,
+                };
+                let sf = row.font.as_scaled(PxScale::from(row.size));
+                let base = y + row.asc;
+                let (mut x, mut prev) = (x0, None);
+                let mut drawn_end = x0;
+                for (ci, ch) in row.text.chars().enumerate() {
+                    let gid = sf.glyph_id(ch);
+                    if let Some(p) = prev {
+                        x += sf.kern(p, gid);
+                    }
+                    let shown = visible.is_none_or(|v| row.start + ci < v);
+                    if shown {
+                        let glyph = gid.with_scale_and_position(PxScale::from(row.size), ab_glyph::point(x + ox, base + oy));
+                        if let Some(og) = row.font.outline_glyph(glyph) {
+                            let b = og.px_bounds();
+                            og.draw(|gx, gy, c| {
+                                let py = b.min.y as i32 + gy as i32;
+                                let mut px = b.min.x as i32 + gx as i32;
+                                if italic {
+                                    px += ((base + oy - py as f32) * 0.21) as i32;
+                                }
+                                if px >= 0 && py >= 0 && (px as usize) < iw && (py as usize) < ih {
+                                    let o = py as usize * iw + px as usize;
+                                    cov[o] = cov[o].max(c);
+                                }
+                            });
+                        }
+                        drawn_end = x + sf.h_advance(gid) + kern;
+                    }
+                    x += sf.h_advance(gid) + kern;
+                    prev = Some(gid);
+                }
+                if underline && drawn_end > x0 {
+                    let th_u = (row.size / 14.0).max(1.0);
+                    let yu = base + oy + row.size * 0.12;
+                    for yy in (yu.floor() as i32)..((yu + th_u).ceil() as i32) {
+                        for xx in ((x0 + ox).floor() as i32)..((drawn_end + ox).ceil() as i32) {
+                            if xx >= 0 && yy >= 0 && (xx as usize) < iw && (yy as usize) < ih {
+                                cov[yy as usize * iw + xx as usize] = 1.0;
+                            }
+                        }
+                    }
+                }
+                y += row.lh + line_gap_extra;
+            }
+            cov
+        };
+
         let mut img = Img { w: iw, h: ih, px: vec![0; iw * ih * 4] };
         if s.background {
             let b = s.background_color;
@@ -366,49 +567,94 @@ impl Renderer {
                 }
             }
         }
+        let paint = |img: &mut Img, cov: &[f32], color: [u8; 4]| {
+            for (i, c) in cov.iter().enumerate() {
+                if *c > 0.0 {
+                    over(&mut img.px[i * 4..i * 4 + 4], color, *c);
+                }
+            }
+        };
         let c = s.color;
         let main = [(c.r * 255.0) as u8, (c.g * 255.0) as u8, (c.b * 255.0) as u8, (c.a * 255.0) as u8];
-        // Kontur: schwarze Kopien rund um die Buchstaben; sonst ein weicher Schatten (nur ohne Hintergrund)
-        let passes: Vec<([u8; 4], f32, f32)> = if s.outline == Some(true) {
-            let r = (fs * 0.05).max(1.0);
-            let mut v: Vec<([u8; 4], f32, f32)> = (0..12).map(|k| { let a = k as f32 * std::f32::consts::TAU / 12.0; ([0, 0, 0, 255], r * a.cos(), r * a.sin()) }).collect();
-            v.push((main, 0.0, 0.0));
-            v
-        } else if s.background {
-            vec![(main, 0.0, 0.0)]
-        } else {
-            vec![([0, 0, 0, 150], fs * 0.04, fs * 0.04), (main, 0.0, 0.0)]
-        };
-        for (col, offx, offy) in passes {
-            let mut y = pad;
-            for l in &ls {
-                let x0 = if s.left_aligned { pad } else { (iw as f32 - l.w) / 2.0 };
-                let sf = l.font.as_scaled(PxScale::from(l.size));
-                let mut x = x0;
-                let mut prev = None;
-                for ch in l.text.chars() {
-                    let gid = sf.glyph_id(ch);
-                    if let Some(pg) = prev {
-                        x += sf.kern(pg, gid);
-                    }
-                    let glyph = gid.with_scale_and_position(PxScale::from(l.size), ab_glyph::point(x + offx, y + l.asc + offy));
-                    if let Some(og) = l.font.outline_glyph(glyph) {
-                        let b = og.px_bounds();
-                        og.draw(|gx, gy, cov| {
-                            let (px, py) = (b.min.x as i32 + gx as i32, b.min.y as i32 + gy as i32);
-                            if px >= 0 && py >= 0 && (px as usize) < iw && (py as usize) < ih {
-                                let o = (py as usize * iw + px as usize) * 4;
-                                over(&mut img.px[o..o + 4], col, cov);
-                            }
-                        });
-                    }
-                    x += sf.h_advance(gid);
-                    prev = Some(gid);
-                }
-                y += l.lh;
+        let fill = coverage(0.0, 0.0);
+        // Schatten (Standard: nur ohne Hintergrund)
+        if s.shadow.unwrap_or(!s.background) {
+            let off = fs * 0.04;
+            let mut sh = coverage(0.0, off);
+            let sigma = fs * s.shadow_blur.unwrap_or(0.1) as f32 / 2.0;
+            if sigma > 0.3 {
+                blur_cov(&mut sh, iw, ih, sigma);
             }
+            let alpha = s.shadow_alpha.unwrap_or(0.7).clamp(0.0, 1.0) as f32;
+            paint(&mut img, &sh, [0, 0, 0, (alpha * 255.0) as u8]);
+        }
+        if outline {
+            // Umrandung als Ring um die Buchstaben: aufgeweitete minus (bei „nur Rahmen“) verkleinerte Abdeckung
+            let offs: Vec<(f32, f32)> = (0..12).map(|k| { let a = k as f32 * std::f32::consts::TAU / 12.0; (ring_r * a.cos(), ring_r * a.sin()) }).collect();
+            let mut grown = fill.clone();
+            for (ox, oy) in &offs {
+                for (g, v) in grown.iter_mut().zip(coverage(*ox, *oy)) {
+                    *g = g.max(v);
+                }
+            }
+            if hollow {
+                let mut shrunk = fill.clone();
+                for (ox, oy) in &offs {
+                    for (g, v) in shrunk.iter_mut().zip(coverage(*ox, *oy)) {
+                        *g = g.min(v);
+                    }
+                }
+                let ring: Vec<f32> = grown.iter().zip(&shrunk).map(|(g, s)| (g - s).clamp(0.0, 1.0)).collect();
+                paint(&mut img, &ring, main);
+            } else {
+                paint(&mut img, &grown, [0, 0, 0, 255]);
+                paint(&mut img, &fill, main);
+            }
+        } else {
+            paint(&mut img, &fill, main);
         }
         Some(img)
+    }
+}
+
+/// Weichzeichnen einer Abdeckungskarte (3 Kastenfilter ≈ Gauß).
+fn blur_cov(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
+    for r in box_radii(sigma) {
+        if r == 0 {
+            continue;
+        }
+        let mut tmp = vec![0f32; buf.len()];
+        // waagerecht
+        for y in 0..h {
+            let row = &buf[y * w..(y + 1) * w];
+            let n = (2 * r + 1) as f32;
+            let mut sum: f32 = (0..=r.min(w - 1)).map(|i| row[i]).sum::<f32>();
+            for x in 0..w {
+                tmp[y * w + x] = sum / n;
+                let add = x + r + 1;
+                if add < w {
+                    sum += row[add];
+                }
+                if x >= r {
+                    sum -= row[x - r];
+                }
+            }
+        }
+        // senkrecht
+        for x in 0..w {
+            let n = (2 * r + 1) as f32;
+            let mut sum: f32 = (0..=r.min(h - 1)).map(|i| tmp[i * w + x]).sum::<f32>();
+            for y in 0..h {
+                buf[y * w + x] = sum / n;
+                let add = y + r + 1;
+                if add < h {
+                    sum += tmp[add * w + x];
+                }
+                if y >= r {
+                    sum -= tmp[(y - r) * w + x];
+                }
+            }
+        }
     }
 }
 
@@ -464,17 +710,24 @@ fn blit(dst: &mut [u8], dw: usize, dh: usize, d: &Draw) {
         return;
     }
     let fx = &d.fx;
+    // Größe nach Spiegeln/Drehen; Beschnitt und Einpassen beziehen sich darauf
+    let (ow, oh) = d.orient.map(|o| o.dims(sw as f32, sh as f32)).map(|q| (q.0 as usize, q.1 as usize)).unwrap_or((sw, sh));
     let (cl, ct, cr, cb) = (fx.crop_l as f32, fx.crop_t as f32, fx.crop_r as f32, fx.crop_b as f32);
-    let cw = sw as f32 * (1.0 - cl - cr);
-    let ch = sh as f32 * (1.0 - ct - cb);
+    let cw = ow as f32 * (1.0 - cl - cr);
+    let ch = oh as f32 * (1.0 - ct - cb);
     if cw < 1.0 || ch < 1.0 {
         return;
     }
-    let k = fit_scale(sw, sh, fx, dw, dh, d.native, d.tr.scale as f32);
-    if k <= 0.0 {
+    let k0 = fit_scale(ow, oh, fx, dw, dh, d.native, d.tr.scale as f32);
+    if k0 <= 0.0 {
         return;
     }
-    let center = (dw as f32 / 2.0 + d.tr.x as f32 * dw as f32 + d.dx, dh as f32 / 2.0 + d.tr.y as f32 * dh as f32);
+    let k = k0 * d.zoom;
+    let c0 = (dw as f32 / 2.0, dh as f32 / 2.0);
+    let mut center = (c0.0 + d.tr.x as f32 * dw as f32 + d.dx, c0.1 + d.tr.y as f32 * dh as f32 + d.dy);
+    if d.zoom != 1.0 {
+        center = (c0.0 + (center.0 - c0.0) * d.zoom, c0.1 + (center.1 - c0.1) * d.zoom);
+    }
     let ang = (d.tr.rotation as f32).to_radians();
     let (sn, cs) = ang.sin_cos();
     let (hw, hh) = (cw * k / 2.0, ch * k / 2.0);
@@ -484,7 +737,7 @@ fn blit(dst: &mut [u8], dw: usize, dh: usize, d: &Draw) {
     let x1 = ((center.0 + ex).ceil().min(dw as f32)) as usize;
     let y0 = ((center.1 - ey).floor().max(0.0)) as usize;
     let y1 = ((center.1 + ey).ceil().min(dh as f32)) as usize;
-    let fxn = !fx.is_neutral();
+    let fxn = !fx.is_neutral() || d.lut.is_some();
     let diag = (hw * hw + hh * hh).sqrt().max(1.0);
     for y in y0..y1 {
         for x in x0..x1 {
@@ -493,19 +746,52 @@ fn blit(dst: &mut [u8], dw: usize, dh: usize, d: &Draw) {
                     continue;
                 }
             }
+            if let Some(wy) = d.wipe_y {
+                if y as f32 + 0.5 > wy {
+                    continue;
+                }
+            }
+            // Irisblende: voll sichtbar bis 97 % des Radius, dann linear auf 0
+            let mut mask = 1.0f32;
+            if let Some(r) = d.iris {
+                let dist = ((x as f32 + 0.5 - c0.0).powi(2) + (y as f32 + 0.5 - c0.1).powi(2)).sqrt();
+                mask = if dist <= r * 0.97 { 1.0 } else if dist >= r { 0.0 } else { (r - dist) / (r * 0.03) };
+                if mask <= 0.0 {
+                    continue;
+                }
+            }
             let (rx, ry) = (x as f32 + 0.5 - center.0, y as f32 + 0.5 - center.1);
             let (ux, uy) = (rx * cs + ry * sn, -rx * sn + ry * cs);
             if ux.abs() > hw || uy.abs() > hh {
                 continue;
             }
-            let sx = cl * sw as f32 + (ux + hw) / k;
-            let sy = ct * sh as f32 + (uy + hh) / k;
+            let px = cl * ow as f32 + (ux + hw) / k;
+            let py = ct * oh as f32 + (uy + hh) / k;
+            let (mut sx, mut sy) = match d.orient {
+                Some(o) => o.to_source(px, py, sw as f32, sh as f32),
+                None => (px, py),
+            };
+            if let Some((sdx, sdy, sc)) = d.stab {
+                let (cx, cy) = (sw as f32 / 2.0, sh as f32 / 2.0);
+                sx = cx + (sx - cx - sdx * sw as f32) / sc;
+                sy = cy + (sy - cy - sdy * sh as f32) / sc;
+            }
             let mut s = sample(&d.src.px, sw, sh, sx - 0.5, sy - 0.5);
+            if let Some(ck) = &fx.chroma {
+                let (a, col) = fxlib::chroma_key(s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0, ck);
+                s[3] = (s[3] as f32 * a).round() as u8;
+                for i in 0..3 {
+                    s[i] = (col[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+                if s[3] == 0 {
+                    continue;
+                }
+            }
             if fxn {
-                apply_fx(&mut s, fx, ((ux * ux + uy * uy).sqrt()) / diag);
+                apply_fx(&mut s, fx, ((ux * ux + uy * uy).sqrt()) / diag, d.lut.as_ref());
             }
             let o = (y * dw + x) * 4;
-            over(&mut dst[o..o + 4], s, d.alpha);
+            over(&mut dst[o..o + 4], s, d.alpha * mask);
             if d.opaque {
                 dst[o + 3] = 255;
             }
@@ -529,7 +815,7 @@ fn sample(src: &[u8], w: usize, h: usize, x: f32, y: f32) -> [u8; 4] {
     o
 }
 
-fn apply_fx(p: &mut [u8; 4], fx: &Effects, vign_d: f32) {
+fn apply_fx(p: &mut [u8; 4], fx: &Effects, vign_d: f32, lut: Option<&(Arc<Lut>, f32)>) {
     let mut c = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
     let gray = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     for v in &mut c {
@@ -539,6 +825,9 @@ fn apply_fx(p: &mut [u8; 4], fx: &Effects, vign_d: f32) {
     }
     c[0] += 0.1 * fx.temperature as f32;
     c[2] -= 0.1 * fx.temperature as f32;
+    if let Some((l, amount)) = lut {
+        c = l.apply([c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)], *amount);
+    }
     if fx.vignette > 0.0 {
         let f = 1.0 - fx.vignette as f32 * vign_d * vign_d;
         for v in &mut c {
@@ -994,17 +1283,17 @@ pub mod tests {
         }
         // Schriftart: Courier New (Festbreite) ist deutlich anders breit als die Standardschrift
         let base = TitleStyle { text: "Wiiiii".into(), ..Default::default() };
-        let (w0, _) = r.title_size(&base, 360).unwrap();
+        let (w0, _) = r.title_size(&base, 640, 360).unwrap();
         if crate::render::installed_fonts().contains(&"Courier New") {
             let mono = TitleStyle { font: Some("Courier New".into()), ..base.clone() };
-            let (w1, _) = r.title_size(&mono, 360).unwrap();
+            let (w1, _) = r.title_size(&mono, 640, 360).unwrap();
             assert!(w1 > w0 + 20, "Festbreitenschrift breiter: {w1} vs {w0}");
         }
         // unbekannte oder Mac-Namen fallen auf eine vorhandene Schrift zurück
         let mac = TitleStyle { font: Some("Zapfino".into()), ..base.clone() };
-        assert!(r.title_size(&mac, 360).is_some());
+        assert!(r.title_size(&mac, 640, 360).is_some());
         let unknown = TitleStyle { font: Some("Gibt es nicht".into()), ..base.clone() };
-        assert_eq!(r.title_size(&unknown, 360), Some((w0, r.title_size(&base, 360).unwrap().1)));
+        assert_eq!(r.title_size(&unknown, 640, 360), Some((w0, r.title_size(&base, 640, 360).unwrap().1)));
         assert_eq!(installed_fonts()[0], "System");
 
         // Kontur: auf weißem Grund erscheinen schwarze Randpixel um rote Schrift
@@ -1020,8 +1309,246 @@ pub mod tests {
         let plain = dark(&r.render(&p, 0.5, 640, 360));
         if let ClipContent::Title(t) = &mut p.tracks[1].clips[0].content {
             t.v.outline = Some(true);
+            t.v.outline_width = Some(10.0);
         }
         let outlined = dark(&r.render(&p, 0.5, 640, 360));
         assert!(outlined > plain + 100, "Kontur sichtbar: {outlined} vs {plain}");
+    }
+
+    // ---------- Neuerungen des Mac-Originals: Blenden, Spiegeln, Greenscreen, LUT, Titel ----------
+
+    fn lit(buf: &[u8], x0: usize, x1: usize, y0: usize, y1: usize, w: usize) -> usize {
+        (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| px(buf, w, x, y).iter().any(|c| *c > 40)).count()
+    }
+
+    #[test]
+    fn transitions_wipe_down_zoom_iris_flash() {
+        let mut r = Renderer::new();
+        // Wischen von oben: oben schon das neue Bild
+        let p = two_clip_project("wipeDown");
+        let b = r.render(&p, 1.5, 32, 32);
+        assert_eq!(px(&b, 32, 16, 4), [0, 0, 255], "oben neu");
+        assert_eq!(px(&b, 32, 16, 28), [255, 0, 0], "unten noch alt");
+        // Zoom: das neue Bild blendet ein (Deckkraft p)
+        let p = two_clip_project("zoom");
+        let b = r.render(&p, 1.5, 32, 32);
+        assert!(near(px(&b, 32, 16, 16), [128, 0, 127], 4), "Zoom: halbe Deckkraft {:?}", px(&b, 32, 16, 16));
+        assert_eq!(px(&r.render(&p, 2.5, 32, 32), 32, 16, 16), [0, 0, 255]);
+        // Irisblende: in der Mitte schon neu, in der Ecke noch alt
+        let p = two_clip_project("iris");
+        let b = r.render(&p, 1.5, 32, 32);
+        assert_eq!(px(&b, 32, 16, 16), [0, 0, 255], "Iris Mitte neu");
+        assert_eq!(px(&b, 32, 1, 1), [255, 0, 0], "Iris Ecke alt");
+        assert_eq!(px(&r.render(&p, 1.0, 32, 32), 32, 16, 16), [255, 0, 0], "Iris am Anfang: nur das alte Bild");
+        // Weißblende: in der Mitte ganz weiß
+        let p = two_clip_project("flash");
+        assert_eq!(px(&r.render(&p, 1.5, 32, 32), 32, 16, 16), [255, 255, 255], "Weißblende Mitte");
+        assert_eq!(px(&r.render(&p, 2.5, 32, 32), 32, 16, 16), [0, 0, 255]);
+        assert!(px(&r.render(&p, 1.25, 32, 32), 32, 16, 16)[0] > 100, "Weißblende steigt an");
+    }
+
+    #[test]
+    fn flip_turn_and_horizon_remap_the_picture() {
+        let dir = std::env::temp_dir().join("video-superbe-tests");
+        let path = dir.join("two_px.png");
+        let mut im = image::RgbaImage::new(2, 1);
+        im.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        im.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+        im.save(&path).unwrap();
+        let build = |fx: Effects| {
+            let mut p = Project::default();
+            let a = image_asset(&mut p, &path, 2.0, 1.0);
+            let mut c = clip(a, 0.0, 2.0);
+            c.fx = fx;
+            p.tracks[0].clips.push(c);
+            p
+        };
+        let mut r = Renderer::new();
+        let b = r.render(&build(Effects::default()), 0.5, 32, 16);
+        assert!(px(&b, 32, 4, 8)[0] > 200 && px(&b, 32, 28, 8)[2] > 200, "ohne Spiegeln: links rot, rechts blau");
+        let b = r.render(&build(Effects { flip_h: Some(true), ..Default::default() }), 0.5, 32, 16);
+        assert!(px(&b, 32, 4, 8)[2] > 200 && px(&b, 32, 28, 8)[0] > 200, "gespiegelt: links blau");
+        let b = r.render(&build(Effects { quarter_turns: Some(1), ..Default::default() }), 0.5, 16, 32);
+        assert!(px(&b, 16, 8, 4)[0] > 200 && px(&b, 16, 8, 28)[2] > 200, "90° im Uhrzeigersinn: rot oben, blau unten");
+        // Horizont: keine schwarzen Ränder, obwohl gedreht wird
+        let mut p = Project::default();
+        let red = solid_png("horizon_red.png", 64, 36, [220, 30, 30]);
+        let a = image_asset(&mut p, &red, 64.0, 36.0);
+        let mut c = clip(a, 0.0, 2.0);
+        c.fx.horizon = Some(5.0);
+        p.tracks[0].clips.push(c);
+        let b = r.render(&p, 0.5, 64, 36);
+        for (x, y) in [(0, 0), (63, 0), (0, 35), (63, 35), (32, 18)] {
+            assert!(px(&b, 64, x, y)[0] > 150, "Rand ({x},{y}) bleibt gefüllt: {:?}", px(&b, 64, x, y));
+        }
+    }
+
+    #[test]
+    fn greenscreen_and_lut_change_pixels() {
+        let mut r = Renderer::new();
+        let mut p = Project::default();
+        let bg = solid_png("gs_blue.png", 16, 16, [20, 20, 220]);
+        let green = solid_png("gs_green.png", 16, 16, [25, 190, 50]);
+        let (ba, ga) = (image_asset(&mut p, &bg, 16.0, 16.0), image_asset(&mut p, &green, 16.0, 16.0));
+        p.tracks[0].clips.push(clip(ba, 0.0, 2.0));
+        let mut top = clip(ga, 0.0, 2.0);
+        top.fx.chroma = Some(ChromaKey::default());
+        p.tracks[1].clips.push(top);
+        let b = r.render(&p, 0.5, 16, 16);
+        assert!(near(px(&b, 16, 8, 8), [20, 20, 220], 6), "Grün ist ausgestanzt, der Hintergrund scheint durch: {:?}", px(&b, 16, 8, 8));
+        // ohne Schlüssel deckt das Grün
+        p.tracks[1].clips[0].fx.chroma = None;
+        assert!(near(px(&r.render(&p, 0.5, 16, 16), 16, 8, 8), [25, 190, 50], 3));
+        // LUT: Umkehrung
+        let mut inv = String::from("LUT_3D_SIZE 2\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for rr in 0..2 {
+                    inv += &format!("{} {} {}\n", 1 - rr, 1 - g, 1 - b);
+                }
+            }
+        }
+        let cube = std::env::temp_dir().join("video-superbe-tests").join("inv.cube");
+        std::fs::write(&cube, inv).unwrap();
+        let mut q = Project::default();
+        let orange = solid_png("lut_orange.png", 16, 16, [204, 102, 26]);
+        let oa = image_asset(&mut q, &orange, 16.0, 16.0);
+        let mut c = clip(oa, 0.0, 2.0);
+        c.fx.lut_path = Some(cube.to_string_lossy().into_owned());
+        q.tracks[0].clips.push(c);
+        assert!(near(px(&r.render(&q, 0.5, 16, 16), 16, 8, 8), [51, 153, 229], 4), "Umkehr-LUT: {:?}", px(&r.render(&q, 0.5, 16, 16), 16, 8, 8));
+        q.tracks[0].clips[0].fx.lut_amount = Some(0.5);
+        assert!(near(px(&r.render(&q, 0.5, 16, 16), 16, 8, 8), [128, 128, 128], 6), "Stärke 50 % mischt");
+    }
+
+    fn title_style(text: &str) -> TitleStyle {
+        TitleStyle { text: text.into(), font_size: 0.12, ..Default::default() }
+    }
+
+    #[test]
+    fn title_typeface_features_change_the_image() {
+        let mut r = Renderer::new();
+        if !r.has_fonts() {
+            return;
+        }
+        let sum = |i: &Img| i.px.chunks(4).map(|p| p[3] as u64).sum::<u64>();
+        let base = r.render_title(&title_style("Hallo Welt"), 640, 360, None).unwrap();
+        // Schatten: Standard ohne Hintergrund an
+        let no_shadow = r.render_title(&TitleStyle { shadow: Some(false), ..title_style("Hallo Welt") }, 640, 360, None).unwrap();
+        assert!(sum(&base) > sum(&no_shadow), "Schatten ist da");
+        // Schatten mit Hintergrund nur auf Wunsch
+        let bg = TitleStyle { background: true, ..title_style("Hallo Welt") };
+        let bg_no = r.render_title(&bg, 640, 360, None).unwrap();
+        let bg_sh = r.render_title(&TitleStyle { shadow: Some(true), ..bg.clone() }, 640, 360, None).unwrap();
+        let dark = |i: &Img| i.px.chunks(4).filter(|p| p[0] < 10 && p[1] < 20 && p[3] > 200).count();
+        assert!(dark(&bg_sh) > dark(&bg_no), "ausdrücklicher Schatten auch mit Hintergrund");
+        // Kursiv, unterstrichen, fett aus: verändern das Bild
+        let diff = |a: &Img, b: &Img| a.w != b.w || a.h != b.h || a.px != b.px;
+        for st in [TitleStyle { italic: Some(true), ..title_style("Hallo Welt") }, TitleStyle { underline: Some(true), ..title_style("Hallo Welt") }, TitleStyle { bold: Some(false), ..title_style("Hallo Welt") }] {
+            let img = r.render_title(&st, 640, 360, None).unwrap();
+            assert!(diff(&img, &base), "{st:?} ändert das Bild");
+        }
+        let underlined = r.render_title(&TitleStyle { underline: Some(true), shadow: Some(false), ..title_style("Hallo Welt") }, 640, 360, None).unwrap();
+        assert!(sum(&underlined) > sum(&no_shadow), "Unterstreichung fügt Pixel hinzu");
+        // Laufweite weitet, Zeilenabstand streckt
+        let wide = r.render_title(&TitleStyle { kerning: Some(0.3), ..title_style("Hallo Welt") }, 640, 360, None).unwrap();
+        assert!(wide.w > base.w + 20, "Laufweite: {} vs {}", wide.w, base.w);
+        let two = r.render_title(&title_style("Eins\nZwei"), 640, 360, None).unwrap();
+        let spaced = r.render_title(&TitleStyle { line_spacing: Some(1.0), ..title_style("Eins\nZwei") }, 640, 360, None).unwrap();
+        assert!(spaced.h > two.h + 20, "Zeilenabstand: {} vs {}", spaced.h, two.h);
+        // Umbruch bei 90 % der Bildbreite; Laufschrift bricht nicht um
+        let long = "Das ist ein ziemlich langer Titel der nicht in eine Zeile passt";
+        let wrapped = r.render_title(&title_style(long), 640, 360, None).unwrap();
+        assert!(wrapped.w <= (640.0 * 0.9) as usize + 40 && wrapped.h > base.h * 3 / 2, "umgebrochen: {}×{}", wrapped.w, wrapped.h);
+        let ticker = r.render_title(&TitleStyle { ticker: Some(true), ..title_style(long) }, 640, 360, None).unwrap();
+        assert!(ticker.w > 640 && ticker.h < wrapped.h, "Laufschrift in einer Zeile: {}×{}", ticker.w, ticker.h);
+    }
+
+    #[test]
+    fn title_alignment_outline_and_typewriter() {
+        let mut r = Renderer::new();
+        if !r.has_fonts() {
+            return;
+        }
+        // Ausrichtung: erste Zeile kurz, zweite lang
+        let range = |img: &Img, y0: usize, y1: usize| {
+            let xs: Vec<usize> = (y0..y1).flat_map(|y| (0..img.w).map(move |x| (x, y))).filter(|&(x, y)| img.px[(y * img.w + x) * 4 + 3] > 120).map(|p| p.0).collect();
+            (*xs.iter().min().unwrap_or(&0), *xs.iter().max().unwrap_or(&0))
+        };
+        let st = |l: bool, rt: bool| TitleStyle { left_aligned: l, right_aligned: rt.then_some(true), shadow: Some(false), bold: Some(false), ..title_style("i\nWWWWWWWW") };
+        let left = r.render_title(&st(true, false), 640, 360, None).unwrap();
+        let right = r.render_title(&st(false, true), 640, 360, None).unwrap();
+        let (h2, hr) = (left.h / 3, right.h / 3);
+        let (lmin, _) = range(&left, 0, h2);
+        let (rmin, rmax) = range(&right, 0, hr);
+        assert!(lmin < left.w / 6, "linksbündig: erste Zeile am linken Rand ({lmin})");
+        assert!(rmax > right.w * 5 / 6 && rmin > right.w / 2, "rechtsbündig: erste Zeile am rechten Rand ({rmin}..{rmax} von {})", right.w);
+        // Umrandung: Standard schwarz um weißen Text; „nur Rahmen“ lässt das Innere leer
+        let big = |o: Option<bool>, h: Option<bool>, w: f64| TitleStyle { outline: o, outline_hollow: h, outline_width: Some(w), shadow: Some(false), font_size: 0.2, ..title_style("HHH") };
+        let plain = r.render_title(&big(None, None, 6.0), 640, 360, None).unwrap();
+        let outlined = r.render_title(&big(Some(true), None, 6.0), 640, 360, None).unwrap();
+        let hollow = r.render_title(&big(Some(true), Some(true), 6.0), 640, 360, None).unwrap();
+        let black = |i: &Img| i.px.chunks(4).filter(|p| p[0] < 30 && p[3] > 200).count();
+        assert!(black(&plain) == 0 && black(&outlined) > 300, "schwarze Umrandung: {}", black(&outlined));
+        // „nur Rahmen“: dort, wo die ausgefüllte Variante weiße Füllung hat, ist der Rahmen innen leer
+        assert_eq!((outlined.w, outlined.h), (hollow.w, hollow.h));
+        let holes = outlined.px.chunks(4).zip(hollow.px.chunks(4)).filter(|(o, h)| o[0] > 225 && o[3] > 225 && h[3] < 40).count();
+        assert!(holes > 100, "nur Rahmen: Inneres der Buchstaben ist leer ({holes} Pixel)");
+        let thin = r.render_title(&big(Some(true), None, 2.0), 640, 360, None).unwrap();
+        assert!(black(&outlined) > black(&thin), "breitere Umrandung hat mehr schwarze Pixel");
+        // Schreibmaschine: nichts sichtbar bei 0, alles bei „alle“, dazwischen weniger; die Größe bleibt gleich
+        let full = r.render_title(&title_style("ABCDEFGH"), 640, 360, None).unwrap();
+        let none = r.render_title(&title_style("ABCDEFGH"), 640, 360, Some(0)).unwrap();
+        let half = r.render_title(&title_style("ABCDEFGH"), 640, 360, Some(4)).unwrap();
+        let alpha = |i: &Img| i.px.chunks(4).map(|p| p[3] as u64).sum::<u64>();
+        assert!(alpha(&none) == 0 && alpha(&half) > 0 && alpha(&half) < alpha(&full), "Schreibmaschine: {} < {} < {}", alpha(&none), alpha(&half), alpha(&full));
+        assert!(none.w == full.w && half.h == full.h, "das Layout bleibt gleich");
+    }
+
+    #[test]
+    fn title_motion_credits_ticker_and_animation_in_the_compositor() {
+        let mut r = Renderer::new();
+        if !r.has_fonts() {
+            return;
+        }
+        let mk = |st: TitleStyle| {
+            let mut p = Project::default();
+            p.render_width = 320;
+            p.render_height = 180;
+            p.tracks[0].clips.push(Clip { content: ClipContent::Title(Wrap { v: TitleStyle { shadow: Some(false), ..st } }), start: 0.0, duration: 4.0, ..Default::default() });
+            p
+        };
+        let (w, h) = (320usize, 180usize);
+        // Abspann: am Anfang unterhalb des Bildes, in der Mitte im Bild, am Ende oberhalb
+        let p = mk(TitleStyle { credits: Some(true), ..title_style("Abspann\nDanke") });
+        assert_eq!(lit(&r.render(&p, 0.0, w, h), 0, w, 0, h, w), 0, "Abspann beginnt außerhalb");
+        assert!(lit(&r.render(&p, 2.0, w, h), 0, w, 0, h, w) > 50, "Abspann in der Mitte sichtbar");
+        let early = r.render(&p, 1.0, w, h);
+        let late = r.render(&p, 3.0, w, h);
+        let rows = |b: &[u8]| (0..h).filter(|&y| lit(b, 0, w, y, y + 1, w) > 0).map(|y| y as i32).sum::<i32>() / (0..h).filter(|&y| lit(b, 0, w, y, y + 1, w) > 0).count().max(1) as i32;
+        assert!(rows(&early) > rows(&late), "Abspann läuft nach oben ({} > {})", rows(&early), rows(&late));
+        // Laufschrift: von rechts nach links
+        let p = mk(TitleStyle { ticker: Some(true), ..title_style("Laufschrift") });
+        assert_eq!(lit(&r.render(&p, 0.0, w, h), 0, w, 0, h, w), 0, "Laufschrift beginnt rechts außerhalb");
+        let t1 = r.render(&p, 1.0, w, h);
+        let t3 = r.render(&p, 3.0, w, h);
+        let cols = |b: &[u8]| { let xs: Vec<usize> = (0..w).filter(|&x| lit(b, x, x + 1, 0, h, w) > 0).collect(); xs.iter().sum::<usize>() / xs.len().max(1) };
+        assert!(cols(&t1) > cols(&t3), "Laufschrift wandert nach links ({} > {})", cols(&t1), cols(&t3));
+        // Einlaufen von unten: am Anfang unsichtbar, danach an Ort und Stelle; Auslaufen am Ende
+        let p = mk(TitleStyle { anim_in: Some("flyUp".into()), anim_out: Some("zoom".into()), anim_dur: Some(1.0), ..title_style("Hallo") });
+        assert_eq!(lit(&r.render(&p, 0.0, w, h), 0, w, 0, h, w), 0, "Einlaufen: Anfang unsichtbar");
+        let mid = lit(&r.render(&p, 2.0, w, h), 0, w, 0, h, w);
+        assert!(mid > 40, "Titel steht");
+        let fading = lit(&r.render(&p, 3.9, w, h), 0, w, 0, h, w);
+        assert!(fading < mid / 2, "Auslaufen: schrumpft und blendet aus ({fading} < {mid})");
+        // Schreibmaschine im Compositor: der Anfang zeigt noch keine Zeichen, später alle
+        let p = mk(TitleStyle { anim_in: Some("typewriter".into()), anim_dur: Some(1.0), ..title_style("ABCDEFGH") });
+        let t0 = lit(&r.render(&p, 0.0, w, h), 0, w, 0, h, w);
+        let t_half = lit(&r.render(&p, 0.5, w, h), 0, w, 0, h, w);
+        let t_full = lit(&r.render(&p, 2.0, w, h), 0, w, 0, h, w);
+        assert!(t0 == 0 && t_half > 0 && t_half < t_full, "Schreibmaschine {t0} < {t_half} < {t_full}");
+        // Platzhalter: Timecode ändert sich mit der Zeit
+        let p = mk(TitleStyle { credits: None, ..title_style("{timecode}") });
+        assert_ne!(r.render(&p, 0.0, w, h), r.render(&p, 1.0, w, h), "Timecode zählt");
     }
 }

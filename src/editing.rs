@@ -6,12 +6,6 @@ use crate::model::*;
 use std::collections::HashSet;
 use uuid::Uuid;
 
-pub enum TitlePreset {
-    Title,
-    LowerThird,
-    Subtitle,
-}
-
 impl App {
     // ---------- Auswahl ----------
 
@@ -89,44 +83,6 @@ impl App {
 
     pub(crate) fn add_asset_clip(&mut self, aid: Uuid) {
         self.add_to_timeline(aid, None, None, None);
-    }
-
-    pub(crate) fn add_title(&mut self, preset: TitlePreset) {
-        let mut clip = Clip { start: self.playhead, duration: 4.0, fade_in: 0.3, fade_out: 0.3, ..Default::default() };
-        if let TitlePreset::LowerThird = preset {
-            clip.content = ClipContent::Title(Wrap {
-                v: TitleStyle { text: "Name\nFunktion".into(), font_size: 0.06, background: true, left_aligned: true, ..Default::default() },
-            });
-            clip.transform = Transform2D { x: -0.2, y: 0.3, ..Default::default() };
-        }
-        if let TitlePreset::Subtitle = preset {
-            // wie die erzeugten Untertitel der Mac-Version: unten im Bild, halbtransparenter dunkler Hintergrund
-            let portrait = self.project.render_height > self.project.render_width;
-            clip.content = ClipContent::Title(Wrap {
-                v: TitleStyle {
-                    text: "Untertitel".into(),
-                    font_size: if portrait { 0.032 } else { 0.05 },
-                    background: true,
-                    background_color: Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.55 },
-                    subtitle: Some(true),
-                    ..Default::default()
-                },
-            });
-            clip.transform = Transform2D { x: 0.0, y: if portrait { 0.30 } else { 0.38 }, ..Default::default() };
-            clip.duration = 3.0;
-            clip.fade_in = 0.0;
-            clip.fade_out = 0.0;
-        }
-        let id = clip.id;
-        if let Some(t) = self.project.first_free_track(&clip) {
-            self.project.add_clip(clip, t);
-            self.select(id, false);
-        } else {
-            self.add_track();
-            let t = self.project.tracks.len() - 1;
-            self.project.add_clip(clip, t);
-            self.select(id, false);
-        }
     }
 
     pub(crate) fn add_track(&mut self) {

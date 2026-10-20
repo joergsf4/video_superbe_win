@@ -5,6 +5,8 @@ mod app;
 mod app_ui;
 mod editing;
 mod export;
+mod fx_edit;
+mod fxlib;
 mod features;
 mod hevc;
 mod hevc_gpu;
@@ -20,6 +22,7 @@ mod player;
 mod record;
 mod render;
 mod source;
+mod stabilize;
 mod ui;
 mod video;
 

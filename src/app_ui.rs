@@ -336,6 +336,12 @@ impl App {
         if ch(Key::R, true, false, true) {
             self.toggle_recording();
         }
+        if ch(Key::C, true, false, true) {
+            self.copy_effects();
+        }
+        if ch(Key::V, true, false, true) {
+            self.paste_effects();
+        }
     }
 }
 
@@ -367,6 +373,7 @@ impl App {
 
         // Hintergrundergebnisse (Taktraster, Ducking), Autosave, Fenster schließen, Pegelanzeige
         self.poll_features(&ctx);
+        self.poll_stabilizer(&ctx);
         self.autosave_tick();
         self.guard_close(&ctx);
         let rec = self.feat.recorder.is_some();
@@ -440,6 +447,7 @@ impl App {
         self.settings_window(&ctx);
         self.marker_window(&ctx);
         self.timecode_window(&ctx);
+        self.template_prompt_window(&ctx);
         self.import_error_window(&ctx);
         self.export_window(&ctx);
         self.feature_windows(&ctx);

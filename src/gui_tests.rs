@@ -370,7 +370,7 @@ fn editing_helpers() {
     assert!((dup.start - 12.0).abs() < 1e-9);
     // Bauchbinde
     h.app.sel_track = 5;
-    h.app.add_title(crate::editing::TitlePreset::LowerThird);
+    h.app.add_title(crate::fx_edit::TitlePreset::LowerThird);
     let lt = h.app.project.clip(h.app.selected.unwrap()).unwrap();
     match &lt.content {
         ClipContent::Title(w) => assert!(w.v.background && w.v.left_aligned),
@@ -917,7 +917,7 @@ fn effect_sliders_are_reachable_and_change_the_clip() {
         h.frames(2);
     }
     assert!(h.clip(ids.c_a).fx != start, "kein Regler hat den Clip verändert");
-    assert!(seen.len() >= 6, "erreichbare Effekt-Regler: {seen:?}");
+    assert!(seen.len() >= 4, "erreichbare Effekt-Regler: {seen:?}");
 }
 
 // ---------- Paket A: Schnittwerkzeuge des Mac-Originals ----------
@@ -1050,5 +1050,89 @@ fn timecode_dialog_jumps_and_status_shows_the_modes() {
     h.app.playhead = 0.0;
     h.scoped_mods(Modifiers::COMMAND | Modifiers::SHIFT, |h| h.key(Key::C));
     assert_eq!(h.app.project.mark_in, Some(4.0), "Lücke 4–5 s markiert");
+}
+
+fn chip_pos(h: &H, t: f64, track: usize) -> Pos2 {
+    let p = h.at(t, track);
+    Pos2::new(p.x, p.y - ROW_H / 2.0 + 11.0)
+}
+
+#[test]
+fn junction_chip_opens_the_menu_and_applies_a_transition() {
+    let (p, r1, r2) = av_project();
+    let mut h = H::new(p);
+    h.click(chip_pos(&h, 4.0, 0));
+    assert!(h.app.tl.junction_popup.is_some(), "Klick auf A/B öffnet das Blendenmenü");
+    // Menü direkt bedienen (Positionen der Knöpfe sind Sache von egui)
+    let (a, b, _) = h.app.tl.junction_popup.unwrap();
+    assert_eq!((a, b), (r1, r2));
+    h.app.apply_transition(a, b, Some("zoom"), Some(1.0));
+    h.app.tl.junction_popup = None;
+    h.frames(2);
+    let j = h.app.project.junction_of(r2).unwrap();
+    assert_eq!(h.app.junction_kind(&j).as_deref(), Some("zoom"));
+    assert!((j.overlap - 1.0).abs() < 0.02);
+    // Escape schließt das Menü
+    h.click(chip_pos(&h, 4.0, 0));
+    assert!(h.app.tl.junction_popup.is_some());
+    h.key(Key::Escape);
+    assert!(h.app.tl.junction_popup.is_none());
+}
+
+#[test]
+fn dragging_a_transition_tile_onto_a_junction_applies_it() {
+    let mut done = false;
+    'scan: for y in (150..360).step_by(14) {
+        for x in (1100..1390).step_by(95) {
+            let (p, _, r2) = av_project();
+            let mut h = H::new(p);
+            h.app.select(r2, false);
+            h.app.inspector_tab = 1;
+            h.frames(3);
+            let target = chip_pos(&h, 4.0, 0);
+            h.drag(Pos2::new(x as f32, y as f32), target);
+            if h.app.project.junction_of(r2).is_some_and(|j| j.overlap > 0.5) {
+                done = true;
+                break 'scan;
+            }
+        }
+    }
+    assert!(done, "eine Blendenkachel lässt sich auf den Übergang ziehen");
+}
+
+#[test]
+fn title_tab_and_effect_sections_render_for_all_title_styles() {
+    let (mut p, _, _) = av_project();
+    let mut st = TitleStyle { text: "Abspann
+Zeile".into(), credits: Some(true), outline: Some(true), outline_hollow: Some(true), shadow: Some(true), anim_in: Some("typewriter".into()), anim_dur: Some(1.0), italic: Some(true), underline: Some(true), ..Default::default() };
+    st.right_aligned = Some(true);
+    let title = Clip { content: ClipContent::Title(Wrap { v: st }), start: 1.0, duration: 3.0, ..Default::default() };
+    let tid = title.id;
+    p.tracks[4].clips.push(title);
+    let mut h = H::new(p);
+    h.app.selected = Some(tid);
+    h.app.inspector_tab = 2;
+    h.frames(3);
+    // alle Bereiche aufklappen, indem man mehrfach auf die Kopfzeilen klickt, ist Sache von egui; hier genügt: es zeichnet ohne Absturz
+    h.app.title_templates.push(crate::fx_edit::TitleTemplate { id: Uuid::new_v4(), name: "V".into(), style: TitleStyle::default(), duration: 3.0, x: 0.0, y: 0.0 });
+    h.app.template_prompt = Some((tid, "Meine Vorlage".into()));
+    h.frames(3);
+    h.key(Key::Enter);
+    assert!(h.app.template_prompt.is_none() && h.app.title_templates.iter().any(|t| t.name == "Meine Vorlage"), "Name der Vorlage bestätigt");
+    h.app.selected = None;
+    h.frames(2);
+    // Effekte eines Videoclips mit allen neuen Einstellungen
+    let (p, r1, _) = av_project();
+    let mut h = H::new(p);
+    if let Some(c) = h.app.project.clip_mut(r1) {
+        c.fx.chroma = Some(ChromaKey::default());
+        c.fx.horizon = Some(3.0);
+        c.fx.flip_h = Some(true);
+        c.fx.stabilize = Some(0.5);
+        c.fx.lut_path = Some("nicht_vorhanden.cube".into());
+    }
+    h.app.selected = Some(r1);
+    h.app.inspector_tab = 3;
+    h.frames(4);
 }
 

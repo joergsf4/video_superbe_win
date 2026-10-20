@@ -64,6 +64,8 @@ pub struct TlState {
     pub vol: Option<VolDrag>,
     pub scrubbing: bool,
     pub edge: Option<EdgePreview>,
+    /// geöffnetes Blendenmenü: (Clip A, Clip B, Position)
+    pub junction_popup: Option<(Uuid, Uuid, Pos2)>,
 }
 
 fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -123,7 +125,7 @@ impl App {
                     self.split_at_playhead();
                 }
                 if icon_button(ui, I_TEXT, "Titel einfügen", false).clicked() {
-                    self.add_title(crate::editing::TitlePreset::Title);
+                    self.add_title(crate::fx_edit::TitlePreset::Title);
                 }
                 if icon_button(ui, I_FIT, "Zoom: ganzen Film zeigen (\\)", false).clicked() {
                     self.zoom_fit();
@@ -351,9 +353,33 @@ impl App {
             if xin > 0.0 {
                 let cw = (xin * self.zoom) as f32;
                 let r = Rect::from_min_size(rect.min, Vec2::new(cw, CLIP_H));
+                let line = Stroke::new(1.0, Color32::from_white_alpha(200));
                 cp.rect_filled(r, 0.0, Color32::from_white_alpha(46));
-                cp.line_segment([r.left_top(), r.right_bottom()], Stroke::new(1.0, Color32::from_white_alpha(200)));
-                cp.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.0, Color32::from_white_alpha(200)));
+                // Zeichen je Art: Kreuz = Überblenden, V = Schwarz-/Weißblende, Pfeil = Wischen/Schieben, Rahmen = Zoom/Iris
+                match c.transition.as_str() {
+                    "dip" | "flash" => {
+                        cp.line_segment([r.left_top(), Pos2::new(r.center().x, r.bottom())], line);
+                        cp.line_segment([r.right_top(), Pos2::new(r.center().x, r.bottom())], line);
+                    }
+                    "wipe" | "wipeDown" | "slide" => {
+                        let (a, b) = if c.transition == "wipeDown" { (Pos2::new(r.center().x, r.top() + 6.0), Pos2::new(r.center().x, r.bottom() - 6.0)) } else { (Pos2::new(r.left() + 5.0, r.center().y), Pos2::new(r.right() - 5.0, r.center().y)) };
+                        cp.line_segment([a, b], line);
+                        let dir = (b - a).normalized();
+                        let n = Vec2::new(-dir.y, dir.x);
+                        cp.line_segment([b, b - dir * 6.0 + n * 4.0], line);
+                        cp.line_segment([b, b - dir * 6.0 - n * 4.0], line);
+                    }
+                    "zoom" | "iris" => {
+                        cp.rect_stroke(r.shrink2(Vec2::new((cw * 0.25).min(20.0), CLIP_H * 0.25)), 2.0, line, StrokeKind::Inside);
+                    }
+                    _ => {
+                        cp.line_segment([r.left_top(), r.right_bottom()], line);
+                        cp.line_segment([r.left_bottom(), r.right_top()], line);
+                    }
+                }
+                if cw >= 54.0 {
+                    cp.text(Pos2::new(r.center().x, r.bottom() - 9.0), Align2::CENTER_CENTER, crate::ops::transition_label(&c.transition), FontId::proportional(9.0), Color32::WHITE);
+                }
             }
             // Pegellinie
             let has_line = volume::has_line(c);
@@ -647,6 +673,10 @@ impl App {
                     });
                     ui.separator();
                 }
+                if !cc.is_audio() && !cc.is_title() && ui.button("Datum als Titel einblenden").clicked() {
+                    self.add_date_title(cc.id);
+                    ui.close();
+                }
                 if cc.group.is_some() && ui.button("Gruppe auflösen").clicked() {
                     self.select(cc.id, false);
                     self.ungroup_selection();
@@ -683,6 +713,83 @@ impl App {
             }
             self.tl.snap_guide = None;
             self.tl.edge = None;
+        }
+
+        // ---------- Übergänge: A/B-Symbol, Ablage von Blendenvorlagen, Auswahlmenü ----------
+        // Nur abholen, wenn wirklich eine Blendenvorlage gezogen wird (das Abholen verbraucht jede Ablage, auch Medien)
+        let dragging_transition = egui::DragAndDrop::payload::<crate::fx_edit::TransitionDrag>(ui.ctx()).is_some();
+        let trans_hover = if dragging_transition { bg.dnd_hover_payload::<crate::fx_edit::TransitionDrag>() } else { None };
+        let trans_drop = if dragging_transition { bg.dnd_release_payload::<crate::fx_edit::TransitionDrag>() } else { None };
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        let drag_target: Option<crate::ops::Junction> = match pointer {
+            Some(pos) if (trans_hover.is_some() || trans_drop.is_some()) && pos.x >= x0 && pos.y >= top && ntr > 0 => {
+                let row = (((pos.y - top + self.scroll_y) / ROW_H).floor().max(0.0) as usize).min(ntr - 1);
+                self.junction_near(self.x2t(x0, pos.x), row)
+            }
+            _ => None,
+        };
+        if let (Some(d), Some(j)) = (&trans_drop, drag_target) {
+            self.apply_transition(j.a, j.b, Some(&d.0), None);
+        }
+        for tr in 0..ntr {
+            let y = top + tr as f32 * ROW_H - self.scroll_y;
+            if y + ROW_H < top || y > full.bottom() {
+                continue;
+            }
+            for j in self.project.junctions(tr) {
+                let (Some(a), Some(b)) = (self.project.clip(j.a).cloned(), self.project.clip(j.b).cloned()) else { continue };
+                let cut = if j.overlap > 0.0 { (a.end() + b.start) / 2.0 } else { a.end() };
+                let x = self.t2x(x0, cut);
+                if x < x0 + 12.0 || x > full.right() - 12.0 {
+                    continue;
+                }
+                let chip = Rect::from_center_size(Pos2::new(x, y + 2.0 + 9.0), Vec2::new(22.0, 14.0));
+                let target = drag_target.is_some_and(|d| d.b == j.b);
+                rows.rect_filled(chip, 3.0, if target { ACCENT } else { Color32::from_black_alpha(if j.overlap > 0.001 { 200 } else { 140 }) });
+                rows.text(chip.center(), Align2::CENTER_CENTER, "A/B", FontId::proportional(8.5), if j.overlap > 0.001 && !target { Color32::from_rgb(255, 214, 10) } else { Color32::WHITE });
+                let resp = ui.interact(chip, ui.id().with(("junction", j.b)), Sense::click());
+                if resp.clicked() {
+                    self.tl.junction_popup = Some((j.a, j.b, chip.left_bottom() + Vec2::new(0.0, 2.0)));
+                }
+                let kind = self.junction_kind(&j);
+                resp.on_hover_text(match kind {
+                    Some(k) => format!("{} · {:.1} s\nKlick: Blende ändern", crate::ops::transition_label(&k), j.overlap),
+                    None => "Harter Schnitt\nKlick: Blende einfügen".to_string(),
+                });
+            }
+        }
+        if let Some((pa, pb, pos)) = self.tl.junction_popup {
+            let mut close = false;
+            let area = egui::Area::new(ui.id().with("junction_popup")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(170.0);
+                    ui.label(RichText::new("Blende").strong());
+                    for k in crate::ops::TRANSITION_TEMPLATES {
+                        if ui.button(crate::ops::transition_label(k)).clicked() {
+                            self.apply_transition(pa, pb, Some(k), None);
+                            close = true;
+                        }
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        for d in [0.5, 1.0, 1.5, 2.0] {
+                            if ui.small_button(format!("{d} s")).clicked() {
+                                let kind = self.project.junction_of(pb).and_then(|j| self.junction_kind(&j));
+                                self.apply_transition(pa, pb, Some(kind.as_deref().unwrap_or("crossfade")), Some(d));
+                                close = true;
+                            }
+                        }
+                    });
+                    if ui.button("Harter Schnitt").clicked() {
+                        self.apply_transition(pa, pb, None, None);
+                        close = true;
+                    }
+                });
+            });
+            let outside = ui.input(|i| i.pointer.primary_pressed() && i.pointer.latest_pos().is_some_and(|p| !area.response.rect.contains(p)));
+            if close || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.tl.junction_popup = None;
+            }
         }
 
         // Ziel-Anzeige beim Verschieben: Kopien der Clips am Zielplatz

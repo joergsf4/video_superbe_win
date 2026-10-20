@@ -151,11 +151,12 @@ impl App {
             return;
         };
         let canvas_h = self.project.render_height.max(1) as usize;
+        let canvas_w = self.project.render_width.max(1) as usize;
         let size0 = {
             let proj = &self.project;
             let r = &mut self.preview.renderer;
             intrinsic_size(&clip, proj, || match &clip.content {
-                ClipContent::Title(s) => r.title_size(&s.v, canvas_h),
+                ClipContent::Title(s) => r.title_size(&s.v, canvas_w, canvas_h),
                 _ => None,
             })
         };
