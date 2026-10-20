@@ -135,8 +135,12 @@ impl App {
                     self.snapping = !self.snapping;
                 }
                 sep(ui);
-                if icon_button(ui, I_ADD, "Spur hinzufügen", false).clicked() {
-                    self.add_track();
+                if ui.add(egui::Button::new(RichText::new("+ Spur").size(12.0))).on_hover_text("Spur unter der gewählten Spur einfügen").clicked() {
+                    self.insert_track_at(self.sel_track + 1);
+                }
+                let can_remove = self.project.tracks.len() > 1;
+                if ui.add_enabled(can_remove, egui::Button::new(RichText::new("− Spur").size(12.0))).on_hover_text("Gewählte Spur samt Clips löschen (Strg+Z macht es rückgängig). Auch: Rechtsklick auf den Spurkopf.").clicked() {
+                    self.remove_track(self.sel_track);
                 }
                 let rec = self.feat.recorder.is_some();
                 if icon_button_sized(ui, I_MIC, if rec { "Aufnahme beenden" } else { "Sprecher aufnehmen (ab der Abspielposition)" }, rec, 15.0, Vec2::new(28.0, 24.0), true).clicked() {
@@ -202,6 +206,7 @@ impl App {
     }
 
     fn timeline_body(&mut self, ui: &mut Ui) {
+        const BAR_W: f32 = 11.0;
         let full = ui.available_rect_before_wrap();
         self.tl_rect = full;
         let bg = ui.allocate_rect(full, Sense::click_and_drag());
@@ -211,7 +216,7 @@ impl App {
         let top = full.top() + RULER_H;
         let ntr = self.project.tracks.len();
         let content_h = ntr as f32 * ROW_H;
-        let view_h = (full.height() - RULER_H).max(1.0);
+        let view_h = (full.height() - RULER_H - BAR_W).max(1.0);
         self.view_w = (full.width() - HEADER_W).max(100.0);
         let max_scroll = (content_h - view_h).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
@@ -869,6 +874,7 @@ impl App {
 
         // Spurköpfe (stehen beim waagerechten Scrollen still)
         let head_clip = ui.painter_at(Rect::from_min_max(Pos2::new(full.left(), top), Pos2::new(x0, full.bottom())));
+        let mut track_action: Option<(usize, u8)> = None;
         for i in 0..ntr {
             let y = top + i as f32 * ROW_H - self.scroll_y;
             if y + ROW_H < top || y > full.bottom() {
@@ -885,6 +891,24 @@ impl App {
             };
             let mut x = r.left() + 30.0;
             let cy = r.center().y;
+            let hs = ui.interact(r.intersect(head_clip.clip_rect()), ui.id().with(("trkhead", i)), Sense::click());
+            if hs.clicked() {
+                self.sel_track = i;
+            }
+            hs.context_menu(|ui| {
+                if ui.button("Spur darüber einfügen").clicked() {
+                    track_action = Some((i, 0));
+                    ui.close();
+                }
+                if ui.button("Spur darunter einfügen").clicked() {
+                    track_action = Some((i, 1));
+                    ui.close();
+                }
+                if ui.add_enabled(ntr > 1, egui::Button::new("Spur löschen")).clicked() {
+                    track_action = Some((i, 2));
+                    ui.close();
+                }
+            });
             let mut flag = |ui: &mut Ui, id: &str, w: f32, tip: &str, draw: &dyn Fn(&egui::Painter, Rect, bool)| -> bool {
                 let rr = Rect::from_center_size(Pos2::new(x + w / 2.0, cy), Vec2::new(w + 4.0, 22.0));
                 x += w + 5.0;
@@ -927,6 +951,14 @@ impl App {
                     2 => t.hidden = !t.hidden,
                     _ => t.locked = !t.locked,
                 }
+            }
+        }
+
+        if let Some((i, k)) = track_action {
+            match k {
+                0 => self.insert_track_at(i),
+                1 => self.insert_track_at(i + 1),
+                _ => self.remove_track(i),
             }
         }
 
@@ -1053,10 +1085,58 @@ impl App {
             }
         }
 
+        // ---------- Bildlaufleisten ----------
+        let view_secs = self.view_w as f64 / self.zoom;
+        let total_secs = (self.project.duration() + view_secs * 0.5).max(self.scroll + view_secs).max(1.0);
+        let v_on = max_scroll > 0.0;
+        let hbar = Rect::from_min_max(Pos2::new(x0, full.bottom() - BAR_W), Pos2::new(full.right() - if v_on { BAR_W } else { 0.0 }, full.bottom()));
+        let vbar = Rect::from_min_max(Pos2::new(full.right() - BAR_W, top), Pos2::new(full.right(), full.bottom() - BAR_W));
+        {
+            let draw = |ui: &Ui, rs: &egui::Response, track: Rect, thumb: Rect| {
+                let p = ui.painter_at(track);
+                p.rect_filled(track, 0.0, Color32::from_black_alpha(90));
+                let col = if rs.dragged() { 150 } else if rs.hovered() { 110 } else { 70 };
+                p.rect_filled(thumb.shrink(2.0), 3.0, Color32::from_white_alpha(col));
+            };
+            // waagerecht (Zeit)
+            let tw = hbar.width();
+            let thumb_w = (view_secs / total_secs * tw as f64).clamp(28.0, tw as f64) as f32;
+            let thumb_x = hbar.left() + (self.scroll / total_secs * tw as f64) as f32;
+            let thumb = Rect::from_min_size(Pos2::new(thumb_x.min(hbar.right() - thumb_w), hbar.top()), Vec2::new(thumb_w, BAR_W));
+            let rs = ui.interact(hbar, ui.id().with("hscroll"), Sense::click_and_drag());
+            if rs.dragged() {
+                self.scroll = (self.scroll + rs.drag_delta().x as f64 / tw as f64 * total_secs).clamp(0.0, (total_secs - view_secs).max(0.0));
+            } else if rs.clicked() {
+                if let Some(p) = rs.interact_pointer_pos().filter(|p| !thumb.contains(*p)) {
+                    self.scroll = ((p.x - hbar.left()) as f64 / tw as f64 * total_secs - view_secs / 2.0).clamp(0.0, (total_secs - view_secs).max(0.0));
+                }
+            }
+            let rs = rs.on_hover_text("Zeitleiste scrollen (auch Umschalt+Mausrad)");
+            draw(ui, &rs, hbar, thumb);
+            // senkrecht (Spuren)
+            if v_on {
+                let th = vbar.height();
+                let thumb_h = (view_h / content_h * th).clamp(28.0, th);
+                let thumb_y = vbar.top() + self.scroll_y / content_h * th;
+                let thumb = Rect::from_min_size(Pos2::new(vbar.left(), thumb_y.min(vbar.bottom() - thumb_h)), Vec2::new(BAR_W, thumb_h));
+                let rs = ui.interact(vbar, ui.id().with("vscroll"), Sense::click_and_drag());
+                if rs.dragged() {
+                    self.scroll_y = (self.scroll_y + rs.drag_delta().y / th * content_h).clamp(0.0, max_scroll);
+                } else if rs.clicked() {
+                    if let Some(p) = rs.interact_pointer_pos().filter(|p| !thumb.contains(*p)) {
+                        self.scroll_y = ((p.y - vbar.top()) / th * content_h - view_h / 2.0).clamp(0.0, max_scroll);
+                    }
+                }
+                let rs = rs.on_hover_text("Spuren scrollen (Mausrad)");
+                draw(ui, &rs, vbar, thumb);
+            }
+        }
+        let on_bar = |p: Pos2| hbar.contains(p) || (v_on && vbar.contains(p));
+
         // ---------- Hintergrund: Lineal, Marquee, Auswahl aufheben ----------
         let press = ui.input(|i| i.pointer.press_origin());
         if bg.drag_started() {
-            if let Some(p) = press {
+            if let Some(p) = press.filter(|p| !on_bar(*p)) {
                 if p.x >= x0 && p.y < top {
                     self.tl.scrubbing = true;
                 } else if p.x >= x0 && p.y >= top {
@@ -1090,7 +1170,7 @@ impl App {
             self.tl.snap_guide = None;
         }
         if bg.clicked() {
-            if let Some(p) = bg.interact_pointer_pos() {
+            if let Some(p) = bg.interact_pointer_pos().filter(|p| !on_bar(*p)) {
                 if p.y < top {
                     if p.x >= x0 {
                         self.seek_snapped(ui, x0, p.x);

@@ -90,6 +90,36 @@ impl App {
         self.project.tracks.push(Track { name: format!("Spur {n}"), ..Default::default() });
     }
 
+    /// Fügt eine leere Spur an Position `idx` ein und wählt sie.
+    pub(crate) fn insert_track_at(&mut self, idx: usize) {
+        let idx = idx.min(self.project.tracks.len());
+        let n = self.project.tracks.len() + 1;
+        self.project.tracks.insert(idx, Track { name: format!("Spur {n}"), ..Default::default() });
+        self.sel_track = idx;
+        self.status = format!("Spur {} eingefügt.", idx + 1);
+    }
+
+    /// Löscht Spur `idx` samt ihrer Clips; mindestens eine Spur bleibt.
+    pub(crate) fn remove_track(&mut self, idx: usize) {
+        if self.project.tracks.len() <= 1 || idx >= self.project.tracks.len() {
+            self.status = "Die letzte Spur kann nicht gelöscht werden.".into();
+            return;
+        }
+        let ids: Vec<Uuid> = self.project.tracks[idx].clips.iter().map(|c| c.id).collect();
+        self.project.tracks.remove(idx);
+        // Verknüpfungen zu gelöschten Clips auflösen
+        for c in self.project.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+            if c.link.is_some_and(|l| ids.contains(&l)) {
+                c.link = None;
+            }
+        }
+        if self.selected.is_some_and(|s| ids.contains(&s)) {
+            self.clear_selection();
+        }
+        self.sel_track = self.sel_track.min(self.project.tracks.len() - 1);
+        self.status = if ids.is_empty() { format!("Spur {} gelöscht.", idx + 1) } else { format!("Spur {} samt {} Clip(s) gelöscht – Strg+Z macht es rückgängig.", idx + 1, ids.len()) };
+    }
+
     // ---------- Schneiden, Löschen, Zwischenablage ----------
 
     /// Teilt an der Abspielposition: die Auswahl, ohne Auswahl alle Clips unter dem Marker.

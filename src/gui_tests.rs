@@ -173,9 +173,9 @@ fn click_selects_and_deselects_clips() {
     h.click(h.at(6.0, 1));
     assert_eq!(h.app.selected, Some(ids.c_b));
     assert_eq!(h.app.sel_track, 1);
-    h.click(h.at(9.0, 4));
+    h.click(h.at(9.0, 3));
     assert_eq!(h.app.selected, None, "Klick ins Leere hebt die Auswahl auf");
-    assert_eq!(h.app.sel_track, 4);
+    assert_eq!(h.app.sel_track, 3);
 }
 
 #[test]
@@ -597,7 +597,7 @@ fn marquee_and_shift_click_build_multi_selection() {
     let set = h.app.selected_set();
     assert!(set.contains(&ids.c_a) && set.contains(&ids.c_title) && set.contains(&ids.c_b), "alle drei: {}", set.len());
     // Klick ins Leere hebt auf
-    h.click(h.at(9.0, 4));
+    h.click(h.at(9.0, 3));
     assert!(h.app.selected_set().is_empty());
     // Umschalt+Klick erweitert
     h.click(h.at(1.0, 0));
@@ -1205,4 +1205,50 @@ fn preview_is_recomposed_only_when_the_picture_can_change() {
     h.app.playhead = 3.4;
     h.frames(2);
     assert_eq!(h.app.preview.renders, n, "nach der Einblendung wieder stabil");
+}
+
+#[test]
+fn tracks_can_be_inserted_and_deleted_and_the_bars_scroll() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    let n = h.app.project.tracks.len();
+    // Spur einfügen (unter der gewählten) und löschen
+    h.app.sel_track = 0;
+    h.app.insert_track_at(1);
+    assert_eq!(h.app.project.tracks.len(), n + 1);
+    assert!(h.app.project.tracks[1].clips.is_empty());
+    assert_eq!(h.app.sel_track, 1);
+    h.app.remove_track(1);
+    assert_eq!(h.app.project.tracks.len(), n);
+    // Spur mit Clip löschen: Clips weg, Auswahl aufgehoben, Undo-Schritt über die Oberfläche
+    h.app.select(ids.c_b, false);
+    let track_of_b = h.app.project.find_clip(ids.c_b).unwrap().0;
+    h.app.remove_track(track_of_b);
+    assert!(h.app.project.clip(ids.c_b).is_none() && h.app.selected.is_none());
+    // letzte Spur bleibt
+    while h.app.project.tracks.len() > 1 {
+        h.app.remove_track(0);
+    }
+    h.app.remove_track(0);
+    assert_eq!(h.app.project.tracks.len(), 1);
+    // Schaltfläche „− Spur“ und „+ Spur“ sind in der Werkzeugleiste: Rechtsklick-Menü ist über die Spurköpfe erreichbar
+    h.frames(2);
+    // viele Spuren → senkrechte Leiste, Ziehen scrollt
+    for _ in 0..12 {
+        h.app.insert_track_at(h.app.project.tracks.len());
+    }
+    h.frames(3);
+    let r = h.app.tl_rect;
+    let vbar_x = r.right() - 5.0;
+    let top = r.top() + RULER_H + 20.0;
+    assert_eq!(h.app.scroll_y, 0.0);
+    h.drag(Pos2::new(vbar_x, top), Pos2::new(vbar_x, top + 60.0));
+    assert!(h.app.scroll_y > 0.0, "senkrechte Leiste scrollt: {}", h.app.scroll_y);
+    // waagerechte Leiste: Klick rechts im Streifen springt vorwärts
+    h.app.project.tracks[0].clips.push(clip(ids.asset_a, 0.0, 20.0));
+    h.app.zoom = 200.0;
+    h.frames(3);
+    let hy = r.bottom() - 4.0;
+    h.click(Pos2::new(r.right() - 40.0, hy));
+    assert!(h.app.scroll > 0.0, "waagerechte Leiste scrollt: {}", h.app.scroll);
 }

@@ -189,7 +189,11 @@ impl App {
                     ui.close();
                 }
                 if ui.button("Spur hinzufügen").clicked() {
-                    self.add_track();
+                    self.insert_track_at(self.sel_track + 1);
+                    ui.close();
+                }
+                if ui.add_enabled(self.project.tracks.len() > 1, egui::Button::new("Gewählte Spur löschen")).clicked() {
+                    self.remove_track(self.sel_track);
                     ui.close();
                 }
                 ui.separator();
