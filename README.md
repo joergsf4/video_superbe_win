@@ -6,6 +6,14 @@ Schneiden, überblenden, animieren, vertonen und als MP4 exportieren, auch mit i
 HDR). Video superbe ist die Windows-Version des macOS-Programms *MacVideo Deluxe*; Projektdateien (`*.mvd.json`) lassen sich
 zwischen beiden austauschen.
 
+> ## ⚠️ Wichtiger Hinweis – bitte lesen
+>
+> **Video superbe ist ein privates Hobbyprojekt, keine Software für den produktiven Einsatz.**
+>
+> - **Verwende niemals die einzigen Kopien deiner Videos.** Arbeite immer mit Kopien und behalte die Originale an einem sicheren Ort.
+> - Das Programm greift **nicht destruktiv** auf deine Daten zu: Originaldateien werden nur gelesen, nie verändert oder gelöscht. Projekte und Exporte werden in neue Dateien geschrieben.
+> - **Es gibt keine Garantie** – weder für Fehlerfreiheit noch für Datensicherheit noch für Eignung für einen bestimmten Zweck. Die Nutzung erfolgt auf eigenes Risiko.
+
 ![Übersicht](docs/uebersicht.png)
 
 ## Download
