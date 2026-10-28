@@ -25,20 +25,24 @@ Standbilder), liegt im Ordner `VideoSuperbe-Daten` neben der EXE.
 
 | | |
 |---|---|
-| **Timeline** | beliebig viele Spuren, Schneiden, Verschieben, Kürzen mit Kantenvorschau, Mehrfachauswahl, Zwischenablage, magnetisches Einrasten (Clips, Marken, Beat-Linien), Gruppen, Projektmarker 1–10, Rückgängig/Wiederholen |
-| **Schnittlogik** | Einfügemodi (automatisch, Ripple, Überschreiben), Mausmodi (Auswahl, Ripple-Trim, Rolle), J-/L-Schnitt (Alt-Ziehen), Rollschnitt (Strg-Ziehen), Lückensuche und -schließen, Drei-/Vierpunktschnitt aus dem Quellmonitor, Zeitcode eintippen, Taktschnitt (Schnitte auf Beats) |
-| **Medienpool** | Videos, Bilder und Ton per Dialog oder Drag & Drop; Doppelklick hängt ans Ende an; doppelte Dateien werden erkannt; das erste Video legt Format (auch 9:16) und Bildrate fest |
+| **Timeline** | beliebig viele Spuren, Schneiden, Verschieben (mit Positionsanzeige), Kürzen mit Kantenvorschau, Mehrfachauswahl, Zwischenablage, magnetisches Einrasten (Clips, Marken, Beat-Linien), Gruppen, Projektmarker 1–10, Bereichsleiste im Lineal, Abspielbereich als Schleife, Rückgängig/Wiederholen mit Liste der letzten Schritte (Rechtsklick), Kontextmenü mit allen Schnittbefehlen |
+| **Spurkopf** | Zielspur für das Einfügen (Klick), Name (Doppelklick), Spurfarbe, Spurhöhe, Lautstärke und Deckkraft der ganzen Spur, Spur einfügen/löschen (Rechtsklick) |
+| **Storyboard** | alle Szenen der Hauptspur als Raster, Umsortieren per Ziehen (Blenden bleiben an ihrer Stelle), Anzeigedauer der Fotos (Strg+Alt+B) |
+| **Schnittlogik** | Einfügemodi (automatisch, Ripple, Austauschen, Überschreiben), Mausmodi (Auswahl, Ripple-Trim, Rolle, Stretchen, Objektinhalt verschieben, Schneiden), J-/L-Schnitt (Alt-Ziehen), Rollschnitt (Strg-Ziehen), Lückensuche und -schließen, Drei-/Vierpunktschnitt aus dem Quellmonitor, Zeitcode eintippen, Taktschnitt (Schnitte und Blendenmitten auf Beats), Tempo ändern rückt Nachfolger nach |
+| **Medienpool** | Videos, Bilder und Ton per Dialog oder Drag & Drop; Ansichten (große/kleine Symbole, Liste, Details), Sortierung, Filter, Suche; Auswahl wie im Explorer (Strg/Umschalt, Auswahlrahmen, Pfeiltasten, Strg+A), mehrere Medien auf einmal ziehen; Doppelklick hängt ans Ende an; doppelte Dateien werden erkannt; das erste Video legt Format (auch 9:16) und Bildrate fest; Quellmaterial lokal sichern (Bearbeiten ▸ Medien lokal sammeln) |
 | **Quellmonitor** | Medium ansehen, Anfang/Ende wählen (I/O), Auswahl auf die Timeline ziehen oder einfügen |
 | **Blenden** | Überblendung, Abblenden, Blitz, Wischen (seitlich/von oben), Schieben, Zoom, Iris; Kacheln per Drag & Drop auf die Überlappung, Dauer 0,5–2 s |
-| **Bild** | Position, Größe, Drehung, Beschnitt, Spiegeln, 90°-Drehung, Horizont-Ausrichtung mit Hilfslinien, Look (Helligkeit, Kontrast, Sättigung, Wärme, Schärfe, Weichzeichner, Vignette), 3D-LUT (`.cube`), Greenscreen (Chroma-Key), **Stabilisierung** (eigene Bewegungsmessung), Effekte kopieren/einfügen |
-| **Animator** | Keyframes für alle Kanäle mit Interpolation (linear, Bézier, Halten), Objektrahmen direkt im Monitor |
+| **Bild** | Position, Größe, Drehung, Beschnitt, Spiegeln, 90°-Drehung, Horizont-Ausrichtung mit Hilfslinien, Look (Helligkeit, Kontrast, Sättigung, Wärme, Schärfe, Weichzeichner, Vignette), 3D-LUT (`.cube`), Greenscreen (Chroma-Key), **Stabilisierung** (eigene Bewegungsmessung), Effekte kopieren/einfügen, jeder Abschnitt einzeln zurücksetzbar |
+| **Masken** | neun Formen (Rechteck, abgerundet, Ellipse, Dreieck, Raute, Sechseck, Stern, Herz, Rahmen) und drei Verläufe (linear, Spiegel, radial) mit weicher Kante, Größe, Lage, Drehung, Invertieren; auch für Titel |
+| **Fotos** | Anzeigedauer (einzeln oder für alle; Titel, Musik und Kamerafahrten rücken mit), Auto-Verbessern (Tonwerte, Farbstich), Rauschentfernung |
+| **Animator** | Keyframes für alle Kanäle mit Interpolation (linear, Bézier, Halten), Objektrahmen direkt im Monitor, **Zoom auf Bereich** (Rahmen im Monitor aufziehen), Bewegungs-Voreinstellungen auch für mehrere Clips; der Animator erscheint nur auf Wunsch |
 | **Titel** | Schrift (fett, kursiv, unterstrichen, Laufweite, Zeilenabstand), Schatten, Umrandung, Hintergrund, Bauchbinde, Ein-/Auslaufen (Fliegen, Zoom, Schreibmaschine), Abspann, Laufschrift, Platzhalter (`{datum}`, `{timecode}` …), Vorlagen, Untertitel-Clips, SRT-Export |
 | **Ton** | Wellenform, Lautstärkekurve im Clip, Ein-/Ausblenden, Geschwindigkeit, Windfilter, Rauschminderung, Pegelanzeige |
 | **Automatik** | Musik bei Sprache abdunkeln (Ducking), Beat-Erkennung, **Ton-Synchronisation** zweier Aufnahmen, **Szenenerkennung** (Clip an Schnitten teilen), Sprecher aufnehmen |
 | **Messinstrumente** | Histogramm und RGB-Parade (Ansicht ▸ Messinstrumente) |
 | **Ansicht** | Vollbildvorschau (Doppelklick auf den Monitor oder Alt+Enter) |
-| **Sonstiges** | Standbild einfügen und exportieren, Kapitelmarken für YouTube, Autosave mit Wiederherstellung, fehlende Medien neu verknüpfen |
-| **Export** | MP4 (H.264 + AAC), Qualität mit Größenanzeige, nur der Bereich zwischen den Marken, Lautheit normalisieren (−14 / −16 / −23 LUFS, ITU-R BS.1770) |
+| **Sonstiges** | Standbild einfügen und exportieren, Kapitelmarken für YouTube, Autosave mit Wiederherstellung, fehlende Medien neu verknüpfen, Zwischenspeicher-Übersicht (Datei ▸ Zwischenspeicher) |
+| **Export** | MP4 (H.264 + AAC) mit Voreinstellungen (auch eigene), Auflösung (kurze Seite, auch Hochformat), Bildrate, Qualität oder feste Bitrate, CBR/VBR, Schlüsselbildabstand, Profil High/Main, AAC 96–192 kbit/s, Mono, Fast Start, Titel/Autor, YouTube-Kapitelliste; nur der Bereich zwischen den Marken; Lautheit normalisieren (−14 / −16 / −23 LUFS, ITU-R BS.1770) mit Limiter (−1 dBFS) und Nachmessen |
 
 Die Vorschau benutzt denselben Renderer wie der Export: Was man sieht, kommt auch in die Datei. Der Renderer rechnet in parallelen Bildbändern auf allen Prozessorkernen und setzt das Vorschaubild nur neu zusammen, wenn sich etwas ändert. Mit `VSB_PERF=1` schreibt das Programm ein Leistungsprotokoll (`perf.log` im Datenordner).
 
@@ -66,8 +70,8 @@ Wie in der Mac-Version, mit Strg statt ⌘ und Alt statt ⌥.
 | Leertaste, K, L, J | Wiedergabe/Pause, anhalten, abspielen, 1 s zurück |
 | S oder T | Teilen an der Abspielposition |
 | Z / U | Clip-Anfang / -Ende auf die Abspielposition kürzen |
-| 1 / 2 / 3 / 5 | Einfügemodus: automatisch, Einspur-Ripple, Mehrspur-Ripple, Überschreiben |
-| 6 / 7 / 8 | Mausmodus: Auswahl, Ripple-Trim, Rolle |
+| 1 / 2 / 3 / 4 / 5 | Einfügemodus: automatisch, Einspur-Ripple, Mehrspur-Ripple, Austauschen, Überschreiben |
+| 6 / 7 / 8 / 0, Esc | Mausmodus: Auswahl, Ripple-Trim, Rolle, Stretchen; Esc zurück zum Standard |
 | Umschalt+Ziffer / Strg+Ziffer | Projektmarker 1–10 setzen / dorthin springen |
 | `<` / `>`, X, Strg+Umschalt+C | Lücke davor/danach, Lücke markieren, nächste Lücke suchen |
 | W / Q | zum nächsten / vorigen Marker (Alt: Schnittpunkt, Umschalt: gewählter Clip) |
@@ -77,10 +81,13 @@ Wie in der Mac-Version, mit Strg statt ⌘ und Alt statt ⌥.
 | Strg+Alt+C / V | Effekte kopieren / einfügen |
 | Umschalt+Z | Szenen erkennen und teilen |
 | Strg+Umschalt+M | Schnitte auf Beats legen |
+| Strg+Alt+B / F / L | Storyboard, Zoom auf die gewählten Objekte, Abspielbereich als Schleife |
 | Alt+Enter | Vollbildvorschau |
 
-Nicht enthalten: Person freistellen, Webcam- und Bildschirmaufnahme, rückwärts abspielen, HEVC-Export und automatische
-Untertitel per Spracherkennung.
+Nicht enthalten (sie brauchen Apples Frameworks): Person freistellen, KI-Verbesserung (Rauschfilter und Hochskalieren mit
+VideoToolbox), Hintergrund-Effekte hinter dem Motiv und Smart-Kamerafahrt (Motiv- und Gesichtserkennung mit Vision);
+außerdem Webcam- und Bildschirmaufnahme, rückwärts abspielen, HEVC-Export und automatische Untertitel per Spracherkennung.
+Projekte mit diesen Einstellungen lassen sich trotzdem öffnen und bearbeiten; die Einstellungen bleiben in der Datei erhalten.
 
 ## HEVC / H.265 (iPhone, GoPro) und HDR
 
@@ -106,6 +113,9 @@ nach `%USERPROFILE%\.cargo\bin`).
 ```powershell
 cargo build --release     # target\x86_64-pc-windows-gnu\release\video-superbe.exe
 ```
+
+Scheitern die Build-Skripte der Abhängigkeiten mit `unable to find library -lgcc`, hilft
+`$env:LIBRARY_PATH = "<Repo>\shim64"` (die Linker-Einstellung `-L shim64` gilt nur für das Programm selbst).
 
 ## Tests
 

@@ -1441,6 +1441,21 @@ fn storyboard_shows_scenes_reorders_and_sets_photo_durations() {
     }
     h.frames(2);
     let sc = h.app.project.storyboard_scenes();
+    assert_eq!(h.app.scene_cards.len(), 3, "drei Karten");
+    // dritte Karte per Ziehen vor die erste
+    let card = |h: &H, id: Uuid| h.app.scene_cards.iter().find(|(i, _)| *i == id).unwrap().1.center();
+    h.drag(card(&h, sc[2]), card(&h, sc[0]));
+    assert_eq!(h.app.project.storyboard_scenes(), vec![sc[2], sc[0], sc[1]], "umsortiert");
+    // Klick wählt, Doppelklick springt hin
+    h.frames(30);
+    h.click(card(&h, sc[1]));
+    assert_eq!(h.app.selected, Some(sc[1]));
+    h.click(card(&h, sc[1]));
+    assert!((h.app.playhead - h.clip(sc[1]).start).abs() < 1e-9, "Doppelklick springt zur Szene");
+    // per Befehl zurück
+    h.app.move_scene(sc[0], Some(sc[2]));
+    h.app.move_scene(sc[2], None);
+    assert_eq!(h.app.project.storyboard_scenes(), vec![sc[0], sc[1], sc[2]]);
     h.app.move_scene(sc[2], Some(sc[0]));
     assert_eq!(h.app.project.storyboard_scenes()[0], sc[2]);
     h.app.set_all_photo_duration(3.0);

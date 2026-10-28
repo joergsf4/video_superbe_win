@@ -58,6 +58,7 @@ impl App {
             let rows = scenes.len().div_ceil(cols);
             let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), rows as f32 * (card_h + gap) + 32.0), Sense::hover());
             let sel = self.selected_set();
+            self.scene_cards.clear();
             for (i, id) in scenes.iter().enumerate() {
                 let Some(c) = self.project.clip(*id).cloned() else { continue };
                 let (col, row) = (i % cols, i / cols);
@@ -93,6 +94,7 @@ impl App {
                 let name = asset.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "Szene".into());
                 p.text(Pos2::new(r.left() + 2.0, thumb_r.bottom() + 10.0), Align2::LEFT_CENTER, name, FontId::proportional(11.0), SECONDARY);
                 let resp = ui.interact(r, ui.id().with(("scene", *id)), Sense::click_and_drag());
+                self.scene_cards.push((*id, r));
                 let target = dragging.is_some_and(|d| d != *id) && resp.contains_pointer();
                 let selected = sel.contains(id);
                 let stroke = if selected { Stroke::new(2.5, Color32::from_rgb(255, 214, 10)) } else if target { Stroke::new(2.5, ACCENT) } else { Stroke::new(1.0, Color32::from_white_alpha(25)) };

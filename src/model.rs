@@ -361,12 +361,6 @@ impl Clip {
 }
 
 impl Effects {
-    /// true, wenn kein Look (Helligkeit … Weichzeichner) eingestellt ist; Ausschnitt und „Füllen“ zählen nicht.
-    pub fn is_default_look(&self) -> bool {
-        let d = Effects::default();
-        Effects { fill: d.fill, crop_l: d.crop_l, crop_t: d.crop_t, crop_r: d.crop_r, crop_b: d.crop_b, ..self.clone() } == d
-    }
-
     /// Voreinstellungen („Looks“) wie in der Mac-Version.
     pub fn looks() -> Vec<(&'static str, Effects)> {
         let e = Effects::default;

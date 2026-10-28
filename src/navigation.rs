@@ -3,7 +3,7 @@
 
 use crate::app::App;
 use crate::model::*;
-use crate::ops::{InsertMode, MouseMode, RippleScope, TrimOptions};
+use crate::ops::{InsertMode, MouseMode, TrimOptions};
 use std::collections::HashSet;
 use uuid::Uuid;
 

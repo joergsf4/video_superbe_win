@@ -165,8 +165,9 @@ pub struct App {
     pub(crate) show_cache: bool,
     pub(crate) effects_sub: usize,
     pub(crate) section_open: HashMap<&'static str, bool>,
-    /// Vorschaubilder der Masken-Kacheln
+    /// Vorschaubilder der Masken-Kacheln; Karten des Storyboards der letzten Darstellung (für Tests)
     pub(crate) mask_thumbs: HashMap<crate::masks::MaskKind, egui::TextureHandle>,
+    pub(crate) scene_cards: Vec<(Uuid, Rect)>,
 }
 
 impl App {
@@ -263,6 +264,7 @@ impl App {
             effects_sub: 0,
             section_open: HashMap::new(),
             mask_thumbs: HashMap::new(),
+            scene_cards: vec![],
         };
         a.prefs = crate::media::Prefs::load(&a.feat.data_dir);
         a.pool.view = a.prefs.pool_view;

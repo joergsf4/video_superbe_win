@@ -230,7 +230,6 @@ pub fn local_copy(data: &Path, src: &Path, enabled: bool, forced: bool) -> Resul
 /// Kategorie im Datenordner. Zwischendateien lassen sich gefahrlos löschen (die App rechnet sie bei Bedarf neu);
 /// Aufnahmen, importierte Standbilder und lokal gesicherte Medien sind Originale der Projekte und werden nur angezeigt.
 pub struct CacheCategory {
-    pub id: &'static str,
     pub title: &'static str,
     pub detail: &'static str,
     pub folder: &'static str,
@@ -238,10 +237,10 @@ pub struct CacheCategory {
 }
 
 pub const CACHE_CATEGORIES: [CacheCategory; 4] = [
-    CacheCategory { id: "stab", title: "Stabilisierung", detail: "gespeicherte Bewegungsdaten; neu berechnen dauert etwa so lange wie das Video", folder: "Stabilisierung", deletable: true },
-    CacheCategory { id: "rec", title: "Aufnahmen", detail: "Sprecher – Originale deiner Projekte, werden nicht gelöscht", folder: "Aufnahmen", deletable: false },
-    CacheCategory { id: "imp", title: "Importierte Bilder und Standbilder", detail: "gehören zu Projekten, werden nicht gelöscht", folder: "Imported", deletable: false },
-    CacheCategory { id: "media", title: "Lokal gesicherte Medien", detail: "Kopien des Quellmaterials – werden nicht gelöscht", folder: "Medien", deletable: false },
+    CacheCategory { title: "Stabilisierung", detail: "gespeicherte Bewegungsdaten; neu berechnen dauert etwa so lange wie das Video", folder: "Stabilisierung", deletable: true },
+    CacheCategory { title: "Aufnahmen", detail: "Sprecher – Originale deiner Projekte, werden nicht gelöscht", folder: "Aufnahmen", deletable: false },
+    CacheCategory { title: "Importierte Bilder und Standbilder", detail: "gehören zu Projekten, werden nicht gelöscht", folder: "Imported", deletable: false },
+    CacheCategory { title: "Lokal gesicherte Medien", detail: "Kopien des Quellmaterials – werden nicht gelöscht", folder: "Medien", deletable: false },
 ];
 
 /// Größe eines Ordners in Bytes (rekursiv).

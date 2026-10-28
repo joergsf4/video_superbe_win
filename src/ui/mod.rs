@@ -6,7 +6,6 @@ mod dialogs;
 mod inspector;
 mod inspector3;
 mod storyboard;
-pub use storyboard::SceneDrag;
 mod inspector2;
 mod monitor;
 mod overlay;
