@@ -9,23 +9,25 @@ use uuid::Uuid;
 pub const MIN_CLIP: f64 = 0.1;
 const EPS: f64 = 1e-6;
 
-/// Einfügemodus beim Platzieren (Handbuch: 1 Automatisch, 2 Einspur-Ripple, 3 Mehrspur-Ripple, 5 Überschreiben).
+/// Einfügemodus beim Platzieren (Handbuch: 1 Automatisch, 2 Einspur-Ripple, 3 Mehrspur-Ripple, 4 Austauschen, 5 Überschreiben).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InsertMode {
     #[default]
     Auto,
     Ripple,
     RippleAll,
+    Replace,
     Overwrite,
 }
 
 impl InsertMode {
-    pub const ALL: [InsertMode; 4] = [InsertMode::Auto, InsertMode::Ripple, InsertMode::RippleAll, InsertMode::Overwrite];
+    pub const ALL: [InsertMode; 5] = [InsertMode::Auto, InsertMode::Ripple, InsertMode::RippleAll, InsertMode::Replace, InsertMode::Overwrite];
     pub fn label(self) -> &'static str {
         match self {
             InsertMode::Auto => "Automatisch",
             InsertMode::Ripple => "Einspur-Ripple",
             InsertMode::RippleAll => "Mehrspur-Ripple",
+            InsertMode::Replace => "Austauschen",
             InsertMode::Overwrite => "Überschreiben",
         }
     }
@@ -34,9 +36,19 @@ impl InsertMode {
             InsertMode::Auto => "1",
             InsertMode::Ripple => "2",
             InsertMode::RippleAll => "3",
+            InsertMode::Replace => "4",
             InsertMode::Overwrite => "5",
         }
     }
+}
+
+/// Ergebnis der musikalischen Schnittanpassung.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeatSnapResult {
+    pub moved: usize,
+    pub on_beat: usize,
+    pub no_material: usize,
+    pub gaps: usize,
 }
 
 /// Wirkungsbereich von Ripple (Nachrücken beim Kürzen/Verschieben).
@@ -64,22 +76,29 @@ impl Default for TrimOptions {
     }
 }
 
-/// Mausmodus (Handbuch: 6 einzelne Objekte, 7 alle Spuren, 8 eine Spur). In 7/8 rückt alles hinter dem Objekt mit.
+/// Mausmodus (Handbuch: 6 einzelne Objekte, 7 alle Spuren, 8 eine Spur, 0 Stretchen; dazu Objektinhalt verschieben und
+/// Schneiden). In 7/8 rückt alles hinter dem Objekt mit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MouseMode {
     #[default]
     Single,
     AllTracks,
     OneTrack,
+    Stretch,
+    Slip,
+    Razor,
 }
 
 impl MouseMode {
-    pub const ALL: [MouseMode; 3] = [MouseMode::Single, MouseMode::AllTracks, MouseMode::OneTrack];
+    pub const ALL: [MouseMode; 6] = [MouseMode::Single, MouseMode::AllTracks, MouseMode::OneTrack, MouseMode::Stretch, MouseMode::Slip, MouseMode::Razor];
     pub fn label(self) -> &'static str {
         match self {
             MouseMode::Single => "Einzelne Objekte",
             MouseMode::AllTracks => "Alle Spuren",
             MouseMode::OneTrack => "Eine Spur",
+            MouseMode::Stretch => "Stretchen",
+            MouseMode::Slip => "Objektinhalt verschieben",
+            MouseMode::Razor => "Schneiden und Trimmen",
         }
     }
     pub fn key(self) -> &'static str {
@@ -87,6 +106,20 @@ impl MouseMode {
             MouseMode::Single => "6",
             MouseMode::AllTracks => "7",
             MouseMode::OneTrack => "8",
+            MouseMode::Stretch => "0",
+            MouseMode::Slip | MouseMode::Razor => "–",
+        }
+    }
+    /// Modi, in denen Clips frei zwischen den Spuren verschoben werden (ohne Mitnahme der Nachfolger).
+    pub fn moves_freely(self) -> bool {
+        matches!(self, MouseMode::Single | MouseMode::Stretch)
+    }
+    /// Ripple beim Kürzen (Mausmodus 7/8).
+    pub fn ripple(self) -> RippleScope {
+        match self {
+            MouseMode::OneTrack => RippleScope::Track,
+            MouseMode::AllTracks => RippleScope::All,
+            _ => RippleScope::None,
         }
     }
 }
@@ -230,6 +263,15 @@ impl Project {
     /// Wie `insert_media`, mit Einfügemodus und Tempo (Vierpunktschnitt: Quellausschnitt wird auf den Zielbereich gedehnt).
     /// Bei einem Modus ungleich Automatisch ist die Spur fest (`preferred` oder 0).
     pub fn insert_media_with(&mut self, asset: &MediaAsset, start: f64, preferred: Option<usize>, range: Option<(f64, f64)>, mode: InsertMode, speed: f64) -> Option<Uuid> {
+        self.insert_media_replacing(asset, start, preferred, range, mode, speed, None)
+    }
+
+    /// Wie `insert_media_with`; im Modus „Austauschen“ wird `replacing` (das gewählte Objekt) ersetzt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_media_replacing(&mut self, asset: &MediaAsset, start: f64, preferred: Option<usize>, range: Option<(f64, f64)>, mode: InsertMode, speed: f64, replacing: Option<Uuid>) -> Option<Uuid> {
+        if mode == InsertMode::Replace {
+            return self.replace_clip(replacing?, asset, range, speed);
+        }
         if mode != InsertMode::Auto {
             return self.insert_media_fixed(asset, start, preferred.unwrap_or(0), range, mode, speed);
         }
@@ -244,6 +286,65 @@ impl Project {
             }
         }
         None
+    }
+
+    /// „Austauschen“: Das Objekt (samt Partner) wird durch das Medium ersetzt; ist die neue Länge anders, rücken die
+    /// nachfolgenden Objekte auf den betroffenen Spuren nach (Handbuch S. 51). Ganz oder gar nicht.
+    pub fn replace_clip(&mut self, id: Uuid, asset: &MediaAsset, range: Option<(f64, f64)>, speed: f64) -> Option<Uuid> {
+        let (lt, lc) = self.find_clip(id)?;
+        let c = self.tracks[lt].clips[lc].clone();
+        // Bildspur des Paares: bei einem Tonclip mit Partner dessen Spur
+        let mut t = lt;
+        if c.part == ClipPart::Audio {
+            if let Some((pt, _)) = self.partner_id(id).and_then(|p| self.find_clip(p)) {
+                t = pt;
+            }
+        }
+        let mut s = self.clone();
+        let olds: Vec<Clip> = s.with_partners(&HashSet::from([id])).iter().filter_map(|i| s.clip(*i).cloned()).collect();
+        let old_start = olds.iter().map(|o| o.start).fold(c.start, f64::min);
+        let old_end = olds.iter().map(Clip::end).fold(c.end(), f64::max);
+        let affected: HashSet<usize> = olds.iter().filter_map(|o| s.find_clip(o.id).map(|l| l.0)).collect();
+        if affected.iter().any(|&tr| s.tracks[tr].locked) {
+            return None;
+        }
+        for o in &olds {
+            s.remove_clip_raw(o.id);
+        }
+        let new_dur = s.placed_duration(asset, range, speed);
+        let delta = new_dur - (old_end - old_start);
+        // Nachfolger nur auf den Spuren des ersetzten Objekts verschieben (Musik oder Titel auf anderen Spuren bleiben, wo sie sind)
+        let mut tracks: HashSet<usize> = affected.clone();
+        tracks.insert(t);
+        for &tr in &tracks {
+            if tr >= s.tracks.len() {
+                continue;
+            }
+            for cl in &mut s.tracks[tr].clips {
+                if cl.start >= old_end - EPS {
+                    cl.start = (cl.start + delta).max(0.0);
+                }
+            }
+        }
+        s.ensure_tracks(t + 1);
+        if s.tracks[t].locked {
+            return None;
+        }
+        if asset.has_video && asset.has_audio && !asset.is_image {
+            // Der Ton kommt auf die Spur darunter. Liegt dort im Bereich etwas anderes (z. B. Musik), wird eine neue Spur
+            // eingeschoben, statt es zu beschneiden.
+            let end = old_start + new_dur;
+            let busy = s.tracks.get(t + 1).is_some_and(|tr| tr.locked || tr.clips.iter().any(|o| o.end() > old_start + EPS && o.start < end - EPS));
+            if busy || s.tracks.len() < t + 2 {
+                let name = format!("Spur {}", s.tracks.len() + 1);
+                s.tracks.insert(t + 1, Track { name, ..Default::default() });
+            }
+        }
+        let mut links = HashMap::new();
+        s.clear_range(t, old_start, old_start + new_dur, &mut links);
+        let nid = s.place_media(asset, old_start, t, range, speed)?;
+        *self = s;
+        Some(nid)
     }
 
     /// Länge, die das Medium (bzw. der Ausschnitt) auf der Timeline belegt.
@@ -269,7 +370,7 @@ impl Project {
             return None;
         }
         match mode {
-            InsertMode::Auto => {}
+            InsertMode::Auto | InsertMode::Replace => {}
             InsertMode::Overwrite => {
                 let mut links = HashMap::new();
                 for &tr in &pair {
@@ -551,9 +652,17 @@ impl Project {
     /// Ändert die Geschwindigkeit (samt Partner); die verbrauchte Quellspanne bleibt gleich, die Dauer auf der
     /// Timeline ändert sich. Passt der Clip dann nicht mehr an seine Stelle, bleibt alles unverändert.
     pub fn set_speed(&mut self, id: Uuid, new_speed: f64) -> bool {
+        self.set_speed_opt(id, new_speed, false)
+    }
+
+    /// Wie `set_speed`; `ripple`: Nachfolgende Clips auf den Spuren des Clips (und seines Partners) rücken um die
+    /// Längenänderung nach, statt eine Lücke zu lassen bzw. das Ändern zu verhindern.
+    pub fn set_speed_opt(&mut self, id: Uuid, new_speed: f64, ripple: bool) -> bool {
         let s = new_speed.clamp(0.1, 16.0);
         let backup = self.clone();
         let targets: Vec<Uuid> = std::iter::once(id).chain(self.partner_id(id)).collect();
+        // alte Enden je Spur merken (für das Nachrücken)
+        let old_ends: Vec<(usize, Uuid, f64)> = if ripple { targets.iter().filter_map(|&x| self.find_clip(x).map(|(t, c)| (t, x, self.tracks[t].clips[c].end()))).collect() } else { vec![] };
         for &target in &targets {
             let Some((t, ci)) = self.find_clip(target) else {
                 *self = backup;
@@ -578,6 +687,17 @@ impl Project {
             c.fade_out = c.fade_out.min(c.duration / 2.0);
             c.speed = s;
         }
+        for &(t, oid, old_end) in &old_ends {
+            let Some(delta) = self.clip(oid).map(|c| c.end() - old_end) else { continue };
+            if self.tracks[t].locked {
+                continue;
+            }
+            for c in &mut self.tracks[t].clips {
+                if c.id != oid && c.start >= old_end - EPS {
+                    c.start = (c.start + delta).max(0.0);
+                }
+            }
+        }
         for &target in &targets {
             let Some((t, ci)) = self.find_clip(target) else { continue };
             let c = self.tracks[t].clips[ci].clone();
@@ -585,6 +705,171 @@ impl Project {
                 *self = backup;
                 return false;
             }
+        }
+        true
+    }
+
+    /// Stretchen (Mausmodus „Stretchen“): Der ganze benutzte Ausschnitt wird auf die neue Länge gedehnt/gestaucht; die Kante
+    /// `left` bzw. rechts wandert nach `t`, die andere bleibt. Bei Standbildern und Titeln wird nur die Dauer geändert.
+    pub fn stretch(&mut self, id: Uuid, left: bool, t: f64) -> bool {
+        let Some((lt, lc)) = self.find_clip(id) else { return false };
+        if self.tracks[lt].locked {
+            return false;
+        }
+        let c = self.tracks[lt].clips[lc].clone();
+        let new_dur = if left { c.end() - t } else { t - c.start };
+        if new_dur < MIN_CLIP {
+            return false;
+        }
+        if self.is_still(&c) {
+            return if left { self.trim_start(id, t) } else { self.trim_end(id, t) };
+        }
+        let backup = self.clone();
+        if !self.set_speed(id, c.speed * c.duration / new_dur) {
+            *self = backup;
+            return false;
+        }
+        if left {
+            let targets: Vec<Uuid> = std::iter::once(id).chain(self.partner_id(id)).collect();
+            for &x in &targets {
+                if let Some(e) = self.clip_mut(x) {
+                    e.start = (c.end() - e.duration).max(0.0);
+                }
+            }
+            if !self.is_consistent(&targets.iter().copied().collect()) {
+                *self = backup;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Setzt die Anzeigedauer von Standbildern (keine Titel); nachfolgende Objekte der Spur rücken mit (Überlappungen bleiben
+    /// erhalten). Titel, Bauchbinden und Musik auf anderen Spuren folgen der Hauptspur; Kamerafahrten dehnen sich mit.
+    pub fn set_still_duration(&mut self, ids: &HashSet<Uuid>, d: f64) -> bool {
+        let d = d.max(MIN_CLIP);
+        let targets: HashSet<Uuid> = ids.iter().copied().filter(|i| self.clip(*i).is_some_and(|c| self.is_still(c) && !c.is_title())).collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let backup = self.clone();
+        let main = self.storyboard_track();
+        let mut target_tracks: HashSet<usize> = HashSet::new();
+        // Verschiebungen der Hauptspur: ab dem alten Ende eines Fotos rückt alles um dessen Längenänderung
+        let mut main_shifts: Vec<(f64, f64)> = vec![];
+        for t in 0..self.tracks.len() {
+            if self.tracks[t].locked {
+                continue;
+            }
+            let mut order: Vec<usize> = (0..self.tracks[t].clips.len()).collect();
+            order.sort_by(|&a, &b| self.tracks[t].clips[a].start.total_cmp(&self.tracks[t].clips[b].start));
+            let mut shift = 0.0;
+            let mut local: Vec<(f64, f64)> = vec![];
+            for ci in order {
+                let c = &mut self.tracks[t].clips[ci];
+                let (old_start, old_end, old_dur) = (c.start, c.end(), c.duration);
+                c.start = (old_start + shift).max(0.0);
+                if targets.contains(&c.id) {
+                    let ratio = if old_dur > 0.0 { d / old_dur } else { 1.0 };
+                    for ks in c.keys.0.values_mut() {
+                        for k in ks {
+                            k.t *= ratio;
+                        }
+                    }
+                    for p in &mut c.volume_points {
+                        p.t *= ratio;
+                    }
+                    c.fade_in = c.fade_in.min(d / 2.0);
+                    c.fade_out = c.fade_out.min(d / 2.0);
+                    local.push((old_end, d - old_dur));
+                    shift += d - old_dur;
+                    c.duration = d;
+                }
+            }
+            if !local.is_empty() {
+                target_tracks.insert(t);
+                if main_shifts.is_empty() || Some(t) == main {
+                    main_shifts = local;
+                }
+            }
+        }
+        if !main_shifts.is_empty() {
+            for t in 0..self.tracks.len() {
+                if self.tracks[t].locked || target_tracks.contains(&t) {
+                    continue;
+                }
+                for c in &mut self.tracks[t].clips {
+                    let sh: f64 = main_shifts.iter().filter(|(at, _)| *at <= c.start + EPS).map(|(_, dl)| dl).sum();
+                    if sh.abs() > 1e-9 {
+                        c.start = (c.start + sh).max(0.0);
+                    }
+                }
+            }
+        }
+        for t in &mut self.tracks {
+            t.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+        }
+        let all: HashSet<Uuid> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
+        if !self.is_consistent(&all) {
+            *self = backup;
+            return false;
+        }
+        true
+    }
+
+    /// Hauptspur des Storyboards: die erste Spur mit Bild-/Videoclips (ohne Titel).
+    pub fn storyboard_track(&self) -> Option<usize> {
+        self.tracks.iter().position(|t| t.clips.iter().any(|c| c.part == ClipPart::Video && !c.is_title()))
+    }
+
+    /// Szenen des Storyboards (Bild-/Videoclips der Hauptspur) in zeitlicher Reihenfolge.
+    pub fn storyboard_scenes(&self) -> Vec<Uuid> {
+        let Some(t) = self.storyboard_track() else { return vec![] };
+        let mut v: Vec<&Clip> = self.tracks[t].clips.iter().filter(|c| c.part == ClipPart::Video && !c.is_title()).collect();
+        v.sort_by(|a, b| a.start.total_cmp(&b.start));
+        v.iter().map(|c| c.id).collect()
+    }
+
+    /// Storyboard: Clips der Hauptspur in neuer Reihenfolge hintereinander. Blenden gehören zur Stelle im Film: Länge und Art
+    /// der n-ten Blende bleiben an der n-ten Stelle. Verknüpfte Tonclips ziehen mit; alle anderen Spuren bleiben unberührt.
+    pub fn reorder_storyboard(&mut self, order: &[Uuid]) -> bool {
+        let Some(t) = self.storyboard_track() else { return false };
+        if self.tracks[t].locked {
+            return false;
+        }
+        let current: Vec<Clip> = self.storyboard_scenes().iter().filter_map(|i| self.clip(*i).cloned()).collect();
+        let cur_ids: HashSet<Uuid> = current.iter().map(|c| c.id).collect();
+        if order.len() != current.len() || order.iter().copied().collect::<HashSet<_>>() != cur_ids {
+            return false;
+        }
+        let overlaps_at: Vec<f64> = current.windows(2).map(|w| (w[0].end() - w[1].start).max(0.0)).collect();
+        let kinds_at: Vec<String> = current.iter().map(|c| c.transition.clone()).collect();
+        let backup = self.clone();
+        let (mut prev_end, mut prev_dur) = (current.first().map_or(0.0, |c| c.start), 0.0);
+        for (i, &id) in order.iter().enumerate() {
+            let Some(c) = self.clip(id).cloned() else { continue };
+            let ov = if i == 0 { 0.0 } else { overlaps_at[i - 1].min(c.duration / 2.0).min(prev_dur / 2.0) };
+            let start = prev_end - ov;
+            let delta = start - c.start;
+            if let Some(cm) = self.clip_mut(id) {
+                cm.start = start;
+                if i > 0 {
+                    cm.transition = kinds_at[i].clone();
+                }
+            }
+            if let Some(p) = self.partner_id(id).and_then(|p| self.clip_mut(p)) {
+                p.start += delta;
+            }
+            prev_end = start + c.duration;
+            prev_dur = c.duration;
+        }
+        for tr in &mut self.tracks {
+            tr.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+        }
+        let check: HashSet<Uuid> = order.iter().flat_map(|&i| std::iter::once(i).chain(self.partner_id(i))).collect();
+        if !self.is_consistent(&check) {
+            *self = backup;
+            return false;
         }
         true
     }
@@ -788,7 +1073,7 @@ impl Project {
 
     /// Alles, was hinter den bewegten Clips liegt (Mausmodus „Eine Spur“: auf deren Spuren, „Alle Spuren“: überall).
     pub fn followers(&self, moving: &HashSet<Uuid>, scope: MouseMode) -> HashSet<Uuid> {
-        if scope == MouseMode::Single {
+        if !matches!(scope, MouseMode::AllTracks | MouseMode::OneTrack) {
             return HashSet::new();
         }
         let locs: Vec<(usize, usize)> = moving.iter().filter_map(|i| self.find_clip(*i)).collect();
@@ -877,29 +1162,27 @@ impl Project {
     }
 
     /// Musikalische Schnittanpassung: Schnitte zwischen aufeinanderfolgenden Bildclips einer Spur rasten auf den nächsten
-    /// Schlag ein. Beide Seiten werden gekürzt bzw. verlängert (soweit Quellmaterial da ist). Rückgabe: (angepasst, unverändert).
-    pub fn snap_cuts_to_beats(&mut self, t: usize, beats: &[f64]) -> (usize, usize) {
+    /// Schlag ein. Beide Seiten werden gekürzt bzw. verlängert (soweit Quellmaterial da ist). Bei Blenden (Überlappung) kommt
+    /// die Mitte der Blende auf den Schlag, die Blendenlänge bleibt. Lücken werden ausgelassen.
+    pub fn snap_cuts_to_beats(&mut self, t: usize, beats: &[f64]) -> BeatSnapResult {
+        let mut r = BeatSnapResult::default();
         if t >= self.tracks.len() || beats.len() < 2 {
-            return (0, 0);
+            return r;
         }
         let mut clips: Vec<Clip> = self.tracks[t].clips.iter().filter(|c| c.part == ClipPart::Video || c.is_title()).cloned().collect();
         clips.sort_by(|a, b| a.start.total_cmp(&b.start));
         if clips.len() < 2 {
-            return (0, 0);
+            return r;
         }
-        let (mut moved, mut kept) = (0, 0);
         let mut last_beat = f64::NEG_INFINITY;
         for w in clips.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            let (Some(ca), Some(cb)) = (self.clip(a.id).cloned(), self.clip(b.id).cloned()) else {
-                kept += 1;
-                continue;
-            };
-            if (ca.end() - cb.start).abs() >= 0.05 {
-                kept += 1; // Überblendungen und Lücken auslassen
+            let (Some(ca), Some(cb)) = (self.clip(w[0].id).cloned(), self.clip(w[1].id).cloned()) else { continue };
+            let overlap = ca.end() - cb.start;
+            if overlap < -0.05 {
+                r.gaps += 1; // Lücke: nicht anfassen
                 continue;
             }
-            let cut = (ca.end() + cb.start) / 2.0;
+            let cut = (ca.end() + cb.start) / 2.0; // harter Schnitt bzw. Mitte der Blende
             // die beiden nächsten Schläge; der erste, für den Quellmaterial da ist, gewinnt
             let mut sorted = beats.to_vec();
             sorted.sort_by(|x, y| (x - cut).abs().total_cmp(&(y - cut).abs()));
@@ -907,19 +1190,24 @@ impl Project {
             if let Some(first) = cands.first() {
                 if (first - cut).abs() < 0.01 {
                     last_beat = *first;
-                    kept += 1;
+                    r.on_beat += 1;
                     continue;
                 }
             }
             let mut done = false;
             for target in cands {
+                let d = target - cut;
                 let backup = self.clone();
-                if self.trim_end(ca.id, target)
-                    && self.clip(ca.id).is_some_and(|c| (c.end() - target).abs() < 1e-3)
-                    && self.trim_start(cb.id, target)
-                    && self.clip(cb.id).is_some_and(|c| (c.start - target).abs() < 1e-3)
-                {
-                    moved += 1;
+                // Ende des ersten und Anfang des zweiten Clips um dieselbe Strecke verschieben (die Blendenlänge bleibt);
+                // zuerst die Seite, die Platz macht
+                let (want_end, want_start) = (ca.end() + d, cb.start + d);
+                let ok = if d > 0.0 {
+                    self.trim_end(ca.id, want_end) && self.trim_start(cb.id, want_start)
+                } else {
+                    self.trim_start(cb.id, want_start) && self.trim_end(ca.id, want_end)
+                };
+                if ok && self.clip(ca.id).is_some_and(|c| (c.end() - want_end).abs() < 1e-3) && self.clip(cb.id).is_some_and(|c| (c.start - want_start).abs() < 1e-3) {
+                    r.moved += 1;
                     last_beat = target;
                     done = true;
                     break;
@@ -927,10 +1215,10 @@ impl Project {
                 *self = backup;
             }
             if !done {
-                kept += 1;
+                r.no_material += 1;
             }
         }
-        (moved, kept)
+        r
     }
 
     // ---------- Übergänge (Blenden) zwischen aneinanderstoßenden Bild-/Fotoclips ----------
@@ -1597,11 +1885,172 @@ mod edit_tests {
         let beats = p.beat_times(&song, 1);
         assert!(beats.len() == 21 && near(beats[1], 0.5), "Schlagzeiten aus dem Taktraster");
         assert_eq!(p.beat_times(&song, 4).len(), 6, "Taktanfänge");
-        let (moved, _) = p.snap_cuts_to_beats(0, &beats);
-        assert_eq!(moved, 2, "zwei Schnitte angepasst");
+        let r = p.snap_cuts_to_beats(0, &beats);
+        assert_eq!(r.moved, 2, "zwei Schnitte angepasst");
         assert!(near(p.clip(c1).unwrap().end(), 3.5) && near(p.clip(c2).unwrap().start, 3.5), "Schnitt 1 bei 3,5 s");
         assert!(near(p.clip(c2).unwrap().end(), 8.0) && near(p.clip(c3).unwrap().start, 8.0), "Schnitt 2 bei 8,0 s");
         assert!(near(p.clip(c2).unwrap().source_in, 0.8) && near(p.clip(c3).unwrap().source_in, 0.8), "Inhalt bleibt an seiner Stelle");
+    }
+
+    #[test]
+    fn snap_cuts_puts_blend_centres_on_beats_and_reports_gaps() {
+        let (mut p, a) = make_project();
+        let c1 = p.insert_media(&a, 0.0, Some(0), Some((1.0, 4.9))).unwrap(); // 0 … 3,9
+        let c2 = p.insert_media(&a, 3.0, Some(0), Some((1.0, 5.0))).unwrap(); // 3,0 … 7,0 (Blende 0,9 s, Mitte 3,45)
+        let _c3 = p.insert_media(&a, 8.0, Some(0), Some((1.0, 3.0))).unwrap(); // Lücke 7 … 8
+        assert!(p.overlaps(c2).0 > 0.85, "Überblendung angelegt");
+        let beats: Vec<f64> = (0..40).map(|k| k as f64 * 0.5).collect();
+        let r = p.snap_cuts_to_beats(0, &beats);
+        assert_eq!((r.moved, r.gaps), (1, 1), "{r:?}");
+        let (e, s) = (p.clip(c1).unwrap().end(), p.clip(c2).unwrap().start);
+        assert!(near((e + s) / 2.0, 3.5), "Mitte der Blende auf dem Schlag: {e} {s}");
+        assert!(near(e - s, 0.9), "Blendenlänge bleibt");
+        assert!(crate::navigation::beat_snap_message(&r).contains("1 Lücken ausgelassen"));
+    }
+
+    #[test]
+    fn replace_swaps_the_clip_and_ripples_its_tracks_only() {
+        let (mut p, a, r1, r2) = editing_project(); // Bild+Ton 0…4 und 4…8 auf Spur 0/1
+        let short = MediaAsset { path: "y".into(), name: "y".into(), duration: 2.0, has_video: true, has_audio: true, width: 100.0, height: 50.0, fps: 30.0, ..Default::default() };
+        p.assets.push(short.clone());
+        // Musik auf Spur 3 ab 5 s bleibt, wo sie ist
+        let music = MediaAsset { path: "m".into(), name: "m".into(), duration: 20.0, has_audio: true, ..Default::default() };
+        p.assets.push(music.clone());
+        let m = p.insert_media(&music, 5.0, Some(3), None).unwrap();
+        let nid = p.insert_media_replacing(&short, 0.0, None, None, InsertMode::Replace, 1.0, Some(r1)).unwrap();
+        assert!(p.clip(r1).is_none(), "altes Objekt entfernt");
+        let n = p.clip(nid).unwrap();
+        assert_eq!((p.find_clip(nid).unwrap().0, n.start, n.duration), (0, 0.0, 2.0));
+        assert!(near(p.clip(r2).unwrap().start, 2.0), "Nachfolger rückt um −2 s nach");
+        assert!(near(p.clip(m).unwrap().start, 5.0), "Musik auf anderer Spur bleibt");
+        assert_eq!(p.tracks[1].clips.len(), 2, "Ton des neuen Mediums liegt unter dem Bild");
+        // Austauschen über den Tonclip ersetzt das ganze Paar
+        let au = p.partner_id(r2).unwrap();
+        let long = p.insert_media_replacing(&a, 0.0, None, None, InsertMode::Replace, 1.0, Some(au)).unwrap();
+        assert_eq!(p.find_clip(long).unwrap().0, 0);
+        assert!(near(p.clip(long).unwrap().start, 2.0) && near(p.clip(long).unwrap().duration, 10.0));
+        // ohne gewähltes Objekt geht es nicht
+        assert!(p.insert_media_replacing(&a, 0.0, None, None, InsertMode::Replace, 1.0, None).is_none());
+        // gesperrte Spur: nichts passiert
+        let before = p.clone();
+        p.tracks[0].locked = true;
+        assert!(p.replace_clip(nid, &a, None, 1.0).is_none());
+        p.tracks[0].locked = false;
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn replace_inserts_a_track_instead_of_cutting_music_below() {
+        let (mut p, a) = make_project();
+        let img = MediaAsset { path: "i".into(), name: "i".into(), duration: 5.0, has_video: true, is_image: true, ..Default::default() };
+        let music = MediaAsset { path: "m".into(), name: "m".into(), duration: 20.0, has_audio: true, ..Default::default() };
+        p.assets.extend([img.clone(), music.clone()]);
+        let photo = p.insert_media(&img, 0.0, Some(0), None).unwrap();
+        let m = p.insert_media(&music, 0.0, Some(1), None).unwrap();
+        let v = p.replace_clip(photo, &a, None, 1.0).unwrap();
+        assert_eq!(p.find_clip(v).unwrap().0, 0);
+        assert!(near(p.clip(m).unwrap().duration, 20.0), "Musik nicht beschnitten");
+        let au = p.partner_id(v).unwrap();
+        assert_ne!(p.find_clip(au).unwrap().0, p.find_clip(m).unwrap().0, "Ton auf eingeschobener Spur");
+    }
+
+    #[test]
+    fn set_speed_ripple_moves_followers_instead_of_blocking() {
+        let (mut p, _a, r1, r2) = editing_project();
+        // ohne Ripple: langsamer geht nicht (Nachbar im Weg)
+        assert!(!p.set_speed(r1, 0.5));
+        assert!(p.set_speed_opt(r1, 0.5, true));
+        assert!(near(p.clip(r1).unwrap().duration, 8.0) && near(p.clip(r2).unwrap().start, 8.0), "Nachfolger rückt nach");
+        assert!(near(p.clip(p.partner_id(r2).unwrap()).unwrap().start, 8.0), "auch auf der Tonspur");
+        // schneller: Lücke wird geschlossen
+        assert!(p.set_speed_opt(r1, 2.0, true));
+        assert!(near(p.clip(r1).unwrap().duration, 2.0) && near(p.clip(r2).unwrap().start, 2.0));
+    }
+
+    #[test]
+    fn stretch_changes_speed_and_keeps_the_other_edge() {
+        let (mut p, _a, r1, r2) = editing_project();
+        p.ripple_delete(&ids(&[r2]));
+        // rechte Kante auf 8 s: doppelte Länge, halbes Tempo
+        assert!(p.stretch(r1, false, 8.0));
+        let c = p.clip(r1).unwrap();
+        assert!(near(c.duration, 8.0) && near(c.speed, 0.5) && near(c.start, 0.0));
+        // linke Kante auf 6 s: Ende bleibt bei 8 s, Länge 2 s
+        assert!(p.stretch(r1, true, 6.0));
+        let c = p.clip(r1).unwrap().clone();
+        assert!(near(c.start, 6.0) && near(c.end(), 8.0) && near(c.speed, 2.0), "{c:?}");
+        let au = p.clip(p.partner_id(r1).unwrap()).unwrap();
+        assert!(near(au.start, 6.0) && near(au.speed, 2.0), "Ton zieht mit");
+        // zu kurz geht nicht
+        assert!(!p.stretch(r1, false, 6.05));
+        // Titel: nur die Dauer ändert sich
+        let mut t = title_at(10.0, 3.0);
+        t.speed = 1.0;
+        let tid = t.id;
+        p.tracks[3].clips.push(t);
+        assert!(p.stretch(tid, false, 15.0));
+        assert!(near(p.clip(tid).unwrap().duration, 5.0) && near(p.clip(tid).unwrap().speed, 1.0));
+    }
+
+    #[test]
+    fn still_duration_moves_followers_titles_and_scales_keys() {
+        let mut p = Project::default();
+        let img = MediaAsset { path: "i".into(), name: "i".into(), duration: 5.0, has_video: true, is_image: true, ..Default::default() };
+        p.assets.push(img.clone());
+        let f1 = p.insert_media(&img, 0.0, Some(0), None).unwrap();
+        let f2 = p.insert_media(&img, 5.0, Some(0), None).unwrap();
+        let f3 = p.insert_media(&img, 10.0, Some(0), None).unwrap();
+        p.clip_mut(f1).unwrap().keys.0.insert(crate::anim::Channel::Scale, vec![crate::anim::Keyframe::new(0.0, 1.0), crate::anim::Keyframe::new(5.0, 1.2)]);
+        // Titel über dem zweiten Foto, Musik ab 0
+        let mut t = title_at(5.5, 2.0);
+        t.id = Uuid::new_v4();
+        let tid = t.id;
+        p.tracks[2].clips.push(t);
+        let music = MediaAsset { path: "m".into(), name: "m".into(), duration: 30.0, has_audio: true, ..Default::default() };
+        p.assets.push(music.clone());
+        let m = p.insert_media(&music, 0.0, Some(3), None).unwrap();
+        assert!(p.set_still_duration(&ids(&[f1, f2, f3]), 3.0));
+        let s: Vec<f64> = [f1, f2, f3].iter().map(|i| p.clip(*i).unwrap().start).collect();
+        assert!(near(s[0], 0.0) && near(s[1], 3.0) && near(s[2], 6.0), "{s:?}");
+        assert!(near(p.clip(tid).unwrap().start, 3.5), "Titel folgt seinem Foto");
+        assert!(near(p.clip(m).unwrap().start, 0.0), "Musik ab 0 bleibt");
+        assert!(near(p.clip(f1).unwrap().keys.0[&crate::anim::Channel::Scale][1].t, 3.0), "Kamerafahrt dehnt sich mit");
+        // Titel allein werden nicht verändert
+        assert!(!p.set_still_duration(&ids(&[tid]), 9.0));
+    }
+
+    #[test]
+    fn storyboard_reorders_scenes_and_keeps_transitions_in_place() {
+        let mut p = Project::default();
+        let img = MediaAsset { path: "i".into(), name: "i".into(), duration: 4.0, has_video: true, is_image: true, ..Default::default() };
+        p.assets.push(img.clone());
+        let a = p.insert_media(&img, 0.0, Some(0), None).unwrap();
+        let b = p.insert_media(&img, 4.0, Some(0), None).unwrap();
+        let c = p.insert_media(&img, 8.0, Some(0), None).unwrap();
+        // Blende zwischen a und b (1 s, Zoom)
+        assert!(p.set_transition(a, b, Some("zoom"), 1.0));
+        assert_eq!(p.storyboard_scenes(), vec![a, b, c]);
+        assert!(p.reorder_storyboard(&[c, a, b]));
+        assert_eq!(p.storyboard_scenes(), vec![c, a, b]);
+        let (cc, ca, cb) = (p.clip(c).unwrap().clone(), p.clip(a).unwrap().clone(), p.clip(b).unwrap().clone());
+        assert!(near(cc.start, 0.0));
+        assert!(near(cc.end() - ca.start, 1.0), "Blende bleibt an der ersten Stelle");
+        assert_eq!(ca.transition, "zoom");
+        assert!(near(ca.end(), cb.start), "zweite Stelle: harter Schnitt");
+        // falsche Reihenfolge (fehlende Szene) wird abgelehnt
+        assert!(!p.reorder_storyboard(&[a, b]));
+    }
+
+    #[test]
+    fn new_mouse_modes_do_not_pull_followers() {
+        let (p, _a, r1, _r2) = editing_project();
+        for m in [MouseMode::Single, MouseMode::Stretch, MouseMode::Slip, MouseMode::Razor] {
+            assert!(p.followers(&ids(&[r1]), m).is_empty(), "{m:?}");
+        }
+        assert!(!p.followers(&ids(&[r1]), MouseMode::OneTrack).is_empty());
+        assert!(MouseMode::Stretch.moves_freely() && !MouseMode::Slip.moves_freely());
+        assert_eq!(MouseMode::AllTracks.ripple(), RippleScope::All);
+        assert_eq!(InsertMode::Replace.key(), "4");
     }
 
     #[test]

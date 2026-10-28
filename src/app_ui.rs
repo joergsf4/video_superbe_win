@@ -2,7 +2,7 @@
 
 use crate::app::App;
 use crate::ui::{BAR, BG, PANEL, SECONDARY};
-use eframe::egui::{self, Frame, Key, Margin, RichText};
+use eframe::egui::{self, Color32, Frame, Key, Margin, RichText};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -91,13 +91,51 @@ impl App {
                     1 => self.set_insert_mode(I::Auto),
                     2 => self.set_insert_mode(I::Ripple),
                     3 => self.set_insert_mode(I::RippleAll),
+                    4 => self.set_insert_mode(I::Replace),
                     5 => self.set_insert_mode(I::Overwrite),
                     6 => self.set_mouse_mode(M::Single),
                     7 => self.set_mouse_mode(M::AllTracks),
                     8 => self.set_mouse_mode(M::OneTrack),
+                    0 => self.set_mouse_mode(M::Stretch),
                     _ => {}
                 }
             }
+        }
+
+        // Esc: Zoom-Rahmen abbrechen, sonst zurück zum Standard-Mausmodus
+        if plain(Key::Escape) && !self.pool.hover {
+            if self.zoom_pick.is_some() {
+                self.zoom_pick = None;
+                self.status = "Zoom auf Bereich abgebrochen".into();
+                return;
+            }
+            if self.mouse_mode != crate::ops::MouseMode::Single {
+                self.set_mouse_mode(crate::ops::MouseMode::Single);
+                return;
+            }
+        }
+        // Medienpool unter der Maus: Pfeile, Eingabe, Entf, Esc und Strg+A gelten dem Pool (wie im Explorer)
+        if self.pool.hover && self.source.is_none() {
+            for key in [Key::ArrowLeft, Key::ArrowRight, Key::ArrowUp, Key::ArrowDown, Key::Enter, Key::Delete, Key::Escape] {
+                if pressed(key) && !m.command && !m.alt && self.pool_key(key, m.shift) {
+                    return;
+                }
+            }
+            if ctrl(Key::A) {
+                self.select_all_assets();
+                return;
+            }
+        }
+        // Ansicht: Storyboard, Objekt-Zoom, Schleife
+        if ch(Key::B, true, false, true) {
+            self.storyboard = !self.storyboard;
+        }
+        if ch(Key::F, true, false, true) {
+            self.zoom_to_selection();
+        }
+        if ch(Key::L, true, false, true) {
+            self.loop_range = !self.loop_range;
+            self.status = if self.loop_range { "Abspielbereich wird als Schleife wiederholt".into() } else { "Schleife aus".into() };
         }
 
         // Bild↑/↓: seitenweise scrollen; mit Strg+Umschalt Projektmarker, mit Alt Kapitelmarken
@@ -138,6 +176,7 @@ impl App {
         // Effekte und Animator (Handbuch: Alt+Umschalt+H, O, G, F, C, B; Animation I, P, R)
         if m.shift && m.alt && !m.command && [Key::H, Key::O, Key::G, Key::F, Key::C, Key::B, Key::I, Key::P, Key::R].iter().any(|k| pressed(*k)) {
             self.inspector_tab = 3;
+            self.show_animator = true;
             self.status = "Effekte (Bild & Look, Animator)".into();
         }
 
@@ -368,9 +407,16 @@ impl App {
         // Wiedergabe
         if self.playing {
             self.tick_playback();
-            if self.play_until.is_some_and(|u| self.playhead >= u) {
-                self.playhead = self.play_until.unwrap_or(self.playhead);
-                self.set_playing(false);
+            if let Some(u) = self.play_until.filter(|u| self.playhead >= *u) {
+                if self.loop_range {
+                    // Schleife: zurück zum Anfang des Bereichs und weiter abspielen
+                    self.playhead = self.project.mark_in.unwrap_or(0.0);
+                    self.start_player();
+                    self.play_until = Some(u);
+                } else {
+                    self.playhead = u;
+                    self.set_playing(false);
+                }
             }
             if self.playhead >= self.project.duration() {
                 self.playhead = self.project.duration();
@@ -460,15 +506,38 @@ impl App {
                     self.pool_panel(ui);
                 }
             });
-            // Keyframe-Animator nur unter dem Monitor (nach den Seitenleisten, damit diese die volle Höhe behalten), solange der Reiter „Effekte“ offen ist
-            if let Some(clip) = self.animator_clip() {
-                egui::Panel::bottom("animator").frame(Frame::new().fill(PANEL)).resizable(false).exact_size(self.animator_height(&clip)).show_inside(ui, |ui| self.animator_panel(ui, clip));
+            // Keyframe-Animator nur unter dem Monitor (nach den Seitenleisten, damit diese die volle Höhe behalten), solange der
+            // Reiter „Effekte“ offen ist und er eingeschaltet wurde. Die Höhe wächst, schrumpft aber nicht, solange der Reiter offen
+            // ist (sonst springt die Zeitleiste beim Wählen von Clips); ohne passenden Clip steht ein Hinweis in gleicher Höhe da.
+            if self.inspector_tab != 3 {
+                self.animator_h = 0.0;
+            }
+            if self.inspector_tab == 3 && self.show_animator {
+                let clip = self.animator_clip();
+                let want = clip.as_ref().map_or(110.0, |c| self.animator_height(c));
+                self.animator_h = self.animator_h.max(want);
+                let h = self.animator_h;
+                egui::Panel::bottom("animator").frame(Frame::new().fill(PANEL)).resizable(false).exact_size(h).show_inside(ui, |ui| match clip {
+                    Some(c) => self.animator_panel(ui, c),
+                    None => {
+                        let r = ui.available_rect_before_wrap();
+                        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(51, 54, 59));
+                        let text = if self.selected.is_none() { "Objekt wählen, um Effekte zu animieren" } else { "Ton lässt sich über den Lautstärkeverlauf im Clip animieren" };
+                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(12.0), SECONDARY);
+                    }
+                });
             }
             egui::CentralPanel::default().frame(Frame::new().fill(PANEL)).show_inside(ui, |ui| self.preview_pane(ui));
 
         }
 
+        // Absicherung: Endet eine Geste, ohne dass das Loslassen ankommt (Fenster verloren, Menü), bleiben Clips sonst „im Zug“
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.release_stuck_gestures();
+        }
         self.settings_window(&ctx);
+        self.track_rename_window(&ctx);
+        self.cache_window(&ctx);
         self.marker_window(&ctx);
         self.timecode_window(&ctx);
         self.template_prompt_window(&ctx);

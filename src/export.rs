@@ -15,15 +15,133 @@ pub struct ExportOpts {
     pub video_kbps: u32,
     /// Nur diesen Zeitbereich (Sekunden) exportieren; `None` = ganzer Film
     pub range: Option<(f64, f64)>,
-    /// Lineare Verstärkung des Tons (Lautheits-Normalisierung)
+    /// Lineare Verstärkung des Tons (Lautheits-Normalisierung); über 1 bzw. bei `limiter` hält ein Limiter die Spitzen
     pub audio_gain: f32,
+    pub limiter: bool,
+    /// Konstante statt variabler Bitrate; Abstand der Schlüsselbilder (Sekunden); H.264-Profil High (sonst Main)
+    pub constant_bitrate: bool,
+    pub gop: f64,
+    pub profile_high: bool,
+    /// AAC-Bitrate (kbit/s: 96, 128, 160, 192) und Mono
+    pub audio_kbps: u32,
+    pub mono: bool,
+    /// Index vor die Daten („Fast Start“) und Metadaten
+    pub fast_start: bool,
+    pub title: String,
+    pub author: String,
+}
+
+/// Grund-Bitrate (kbit/s) für Bildgröße und Bildrate: 12 Mbit/s bei Full HD und 30 Bildern/s.
+pub fn base_kbps(w: usize, h: usize, fps: u32) -> u32 {
+    let k = if fps > 30 { 1.5 } else { 1.0 };
+    ((w * h) as f64 / (1920.0 * 1080.0) * 12000.0 * k).clamp(1000.0, 60000.0) as u32
 }
 
 impl ExportOpts {
     pub fn from_project(p: &Project) -> Self {
         let (w, h) = (p.render_width.max(16) as usize, p.render_height.max(16) as usize);
         let kbps = ((w * h) as f64 / (1920.0 * 1080.0) * 12000.0).clamp(1000.0, 40000.0) as u32;
-        Self { width: w & !1, height: h & !1, fps: p.fps.clamp(1, 120) as u32, video_kbps: kbps, range: None, audio_gain: 1.0 }
+        Self {
+            width: w & !1,
+            height: h & !1,
+            fps: p.fps.clamp(1, 120) as u32,
+            video_kbps: kbps,
+            range: None,
+            audio_gain: 1.0,
+            limiter: false,
+            constant_bitrate: false,
+            gop: 2.0,
+            profile_high: true,
+            audio_kbps: 192,
+            mono: false,
+            fast_start: true,
+            title: String::new(),
+            author: String::new(),
+        }
+    }
+}
+
+/// Gespeicherte Exporteinstellungen (Voreinstellung im Export-Dialog; Port von ExportPresets.swift ohne HEVC).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExportSettings {
+    /// Ausgabe: kurze Seite in Pixeln (`None` = Filmformat) und Bildrate (`None` = Filmformat)
+    pub height: Option<i64>,
+    pub fps: Option<i64>,
+    /// Faktor auf die automatische Bitrate; `kbps` überschreibt sie
+    pub quality: f64,
+    pub kbps: Option<u32>,
+    pub constant_bitrate: bool,
+    pub gop: f64,
+    pub profile_high: bool,
+    pub audio_kbps: u32,
+    pub mono: bool,
+    pub fast_start: bool,
+    /// Ziel-Lautheit (`None` = Ton unverändert)
+    pub lufs: Option<f64>,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        ExportSettings { height: None, fps: None, quality: 1.0, kbps: None, constant_bitrate: false, gop: 2.0, profile_high: true, audio_kbps: 192, mono: false, fast_start: true, lufs: Some(-14.0) }
+    }
+}
+
+/// AAC-Bitraten, die der Windows-Encoder kann.
+pub const AAC_KBPS: [u32; 4] = [96, 128, 160, 192];
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExportPresetItem {
+    pub name: String,
+    pub settings: ExportSettings,
+}
+
+pub fn builtin_presets() -> Vec<ExportPresetItem> {
+    let s = ExportSettings::default;
+    let item = |name: &str, settings| ExportPresetItem { name: name.into(), settings };
+    vec![
+        item("YouTube Full HD", ExportSettings { height: Some(1080), ..s() }),
+        item("YouTube 4K", ExportSettings { height: Some(2160), ..s() }),
+        item("Handy (klein)", ExportSettings { height: Some(1080), quality: 0.6, audio_kbps: 128, ..s() }),
+        item("Messenger / E-Mail (klein)", ExportSettings { height: Some(720), quality: 0.6, audio_kbps: 128, lufs: None, ..s() }),
+        item("Beste Qualität (Archiv)", ExportSettings { quality: 1.6, audio_kbps: 192, lufs: None, ..s() }),
+    ]
+}
+
+/// Ausgabegröße bei gewählter Auflösung: „1080p“ meint die kurze Seite (Querformat 1920×1080, Hochformat 1080×1920);
+/// das Seitenverhältnis des Films bleibt, beide Seiten werden auf gerade Pixelzahlen gerundet.
+pub fn output_size(w: i64, h: i64, height: Option<i64>) -> (usize, usize) {
+    let even = |v: f64| ((v / 2.0).round() as usize * 2).max(2);
+    match height {
+        Some(t) if w > 0 && h > 0 => {
+            let k = t as f64 / w.min(h) as f64;
+            (even(w as f64 * k), even(h as f64 * k))
+        }
+        _ => (even(w.max(2) as f64), even(h.max(2) as f64)),
+    }
+}
+
+impl ExportSettings {
+    pub fn opts(&self, p: &Project, range: Option<(f64, f64)>, title: &str, author: &str) -> ExportOpts {
+        let (w, h) = output_size(p.render_width, p.render_height, self.height);
+        let fps = self.fps.unwrap_or(p.fps).clamp(1, 120) as u32;
+        ExportOpts {
+            width: w,
+            height: h,
+            fps,
+            video_kbps: self.kbps.unwrap_or_else(|| (base_kbps(w, h, fps) as f64 * self.quality) as u32).clamp(300, 150_000),
+            range,
+            audio_gain: 1.0,
+            limiter: false,
+            constant_bitrate: self.constant_bitrate,
+            gop: self.gop.max(0.5),
+            profile_high: self.profile_high,
+            audio_kbps: *AAC_KBPS.iter().min_by_key(|k| (**k as i64 - self.audio_kbps as i64).abs()).unwrap(),
+            mono: self.mono,
+            fast_start: self.fast_start,
+            title: title.trim().to_string(),
+            author: author.trim().to_string(),
+        }
     }
 }
 
@@ -116,7 +234,7 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
         vout.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32)).map_err(e)?;
         vout.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)).map_err(e)?;
         vout.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).map_err(e)?;
-        vout.SetUINT32(&MF_MT_MPEG2_PROFILE, 100).map_err(e)?; // High
+        vout.SetUINT32(&MF_MT_MPEG2_PROFILE, if o.profile_high { 100 } else { 77 }).map_err(e)?; // High bzw. Main
         let vi = writer.AddStream(&vout).map_err(e)?;
         let vin = MFCreateMediaType().map_err(e)?;
         vin.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(e)?;
@@ -125,23 +243,37 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
         vin.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32)).map_err(e)?;
         vin.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)).map_err(e)?;
         vin.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).map_err(e)?;
-        // Keine B-Bilder: sonst beginnt das Bild um ein Bild später als der Ton (Zeitversatz im Container)
-        let mut enc: Option<IMFAttributes> = None;
-        MFCreateAttributes(&mut enc, 1).map_err(e)?;
-        let enc = enc.ok_or("Attribute")?;
-        enc.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0).map_err(e)?;
-        writer.SetInputMediaType(vi, &vin, Some(&enc)).map_err(|er| format!("Videoformat: {er}"))?;
+        // Keine B-Bilder: sonst beginnt das Bild um ein Bild später als der Ton (Zeitversatz im Container).
+        // Bitratenmodus und Schlüsselbildabstand; lehnt ein Encoder sie ab, geht es mit seinen Standardwerten weiter.
+        let enc_attrs = |full: bool| -> Result<IMFAttributes, String> {
+            let mut enc: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut enc, 3).map_err(e)?;
+            let enc = enc.ok_or("Attribute")?;
+            enc.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0).map_err(e)?;
+            if full {
+                // eAVEncCommonRateControlMode: 0 = CBR, 2 = variabel (Durchschnitt)
+                enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, if o.constant_bitrate { 0 } else { 2 }).map_err(e)?;
+                enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, ((o.gop.max(0.5) * fps as f64).round() as u32).max(1)).map_err(e)?;
+            }
+            Ok(enc)
+        };
+        if writer.SetInputMediaType(vi, &vin, Some(&enc_attrs(true)?)).is_err() {
+            writer.SetInputMediaType(vi, &vin, Some(&enc_attrs(false)?)).map_err(|er| format!("Videoformat: {er}"))?;
+        }
 
         // Audio
         let mut ai = 0;
+        let chans: u32 = if o.mono { 1 } else { 2 };
         if audio {
             let aout = MFCreateMediaType().map_err(e)?;
             aout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(e)?;
             aout.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).map_err(e)?;
             aout.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(e)?;
             aout.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE as u32).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000).map_err(e)?;
+            aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, chans).map_err(e)?;
+            // der Windows-AAC-Encoder kennt 96/128/160/192 kbit/s (bei Mono halbiert)
+            let kbps = if AAC_KBPS.contains(&o.audio_kbps) { o.audio_kbps } else { 192 };
+            aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, if o.mono { (kbps / 2).max(96) * 125 } else { kbps * 125 }).map_err(e)?;
             aout.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 1).map_err(e)?;
             aout.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29).map_err(e)?;
             aout.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0).map_err(e)?;
@@ -151,15 +283,17 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
             ain.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).map_err(e)?;
             ain.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(e)?;
             ain.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE as u32).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, (RATE * 4) as u32).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, chans).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * chans).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE as u32 * 2 * chans).map_err(e)?;
             writer.SetInputMediaType(ai, &ain, None).map_err(|er| format!("Tonformat: {er}"))?;
         }
         writer.BeginWriting().map_err(|er| format!("Start: {er}"))?;
 
         let mut renderer = Renderer::new();
         let mut mixer = Mixer::new();
+        // Verstärkung über den Limiter (Zustand über alle Tonpuffer hinweg); ohne Normalisierung bleibt es beim harten Begrenzen
+        let mut limiter = (o.limiter || o.audio_gain > 1.0).then(crate::loudness::PeakLimiter::new);
         let frames = (dur * fps as f64).ceil() as i64;
         let frame_dur = 10_000_000 / fps as i64;
         let mut a_done: i64 = 0;
@@ -177,10 +311,24 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
                 let target = ((i + 1) * RATE / fps as i64).min((dur * RATE as f64).ceil() as i64);
                 if target > a_done {
                     let n = (target - a_done) as usize;
-                    let f = mixer.mix(p, a0 + a_done, n);
-                    let mut pcm = Vec::with_capacity(n * 4);
-                    for v in &f {
-                        pcm.extend((((v * o.audio_gain).clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+                    let mut f = mixer.mix(p, a0 + a_done, n);
+                    let g = match limiter.as_mut() {
+                        Some(l) => {
+                            l.process(&mut f, 2, o.audio_gain as f64);
+                            1.0
+                        }
+                        None => o.audio_gain,
+                    };
+                    let mut pcm = Vec::with_capacity(n * 2 * chans as usize);
+                    let mut put = |v: f32| pcm.extend((((v * g).clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+                    if o.mono {
+                        for fr in f.chunks_exact(2) {
+                            put((fr[0] + fr[1]) * 0.5);
+                        }
+                    } else {
+                        for v in &f {
+                            put(*v);
+                        }
                     }
                     let s = sample_from(&pcm, a_done * 10_000_000 / RATE, n as i64 * 10_000_000 / RATE)?;
                     writer.WriteSample(ai, &s).map_err(|er| format!("Ton schreiben: {er}"))?;
@@ -189,6 +337,9 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
             }
         }
         writer.Finalize().map_err(|er| format!("Abschluss: {er}"))?;
+    }
+    if o.fast_start || !o.title.is_empty() || !o.author.is_empty() {
+        crate::mp4post::finish(path, o.fast_start, &o.title, &o.author).map_err(|er| format!("Nachbearbeitung (Fast Start/Metadaten): {er}"))?;
     }
     progress(1.0);
     Ok(())
@@ -377,6 +528,87 @@ mod tests {
         assert!(f.iter().sum::<f64>() / 3.0 > 20.0 && f.iter().sum::<f64>() / 3.0 < 250.0, "Bild vorhanden: {f:?}");
         let g = mean_rgb(d.frame_at(0.05).unwrap());
         assert!((f[0] - g[0]).abs() < 60.0, "ähnliche Bilder im Abstand von 0,45 s");
+    }
+
+    #[test]
+    fn output_size_uses_the_short_side_and_presets_are_sane() {
+        assert_eq!(output_size(1920, 1080, Some(720)), (1280, 720));
+        assert_eq!(output_size(1080, 1920, Some(1080)), (1080, 1920), "Hochformat: 1080p = kurze Seite");
+        assert_eq!(output_size(1080, 1920, Some(2160)), (2160, 3840));
+        assert_eq!(output_size(1920, 1080, None), (1920, 1080));
+        assert_eq!(output_size(1000, 563, Some(480)), (852, 480), "gerade Pixelzahlen");
+        let p = Project { render_width: 1080, render_height: 1920, fps: 30, ..Default::default() };
+        let all = builtin_presets();
+        assert_eq!(all[0].name, "YouTube Full HD");
+        let o = all[0].settings.opts(&p, None, " T ", "");
+        assert_eq!((o.width, o.height, o.fps, o.title.as_str()), (1080, 1920, 30, "T"));
+        let s = ExportSettings { fps: Some(60), kbps: Some(5000), audio_kbps: 320, ..Default::default() };
+        let o = s.opts(&p, Some((1.0, 2.0)), "", "");
+        assert_eq!((o.fps, o.video_kbps, o.audio_kbps, o.range), (60, 5000, 192, Some((1.0, 2.0))), "320 kbit/s gibt es unter Windows nicht → 192");
+        assert!(base_kbps(1920, 1080, 60) > base_kbps(1920, 1080, 30));
+        // Voreinstellungen überleben JSON (eigene werden im Datenordner gespeichert)
+        let j = serde_json::to_string(&all).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<ExportPresetItem>>(&j).unwrap(), all);
+    }
+
+    #[test]
+    fn exports_portrait_mono_main_cbr_with_fast_start_and_metadata() {
+        let mut p = test_project();
+        (p.render_width, p.render_height) = (180, 320);
+        let wav = write_sine_wav("exp_mono_tone.wav", 440.0, 2.0, 48000, 0.3);
+        let a = MediaAsset { path: wav.to_string_lossy().into_owned(), name: "tone".into(), duration: 2.0, has_audio: true, ..Default::default() };
+        let aid = a.id;
+        p.assets.push(a);
+        p.tracks[1].clips.push(Clip { part: ClipPart::Audio, ..clip(aid, 0.0, 2.0) });
+        let s = ExportSettings { height: Some(240), fps: Some(25), mono: true, audio_kbps: 128, constant_bitrate: true, profile_high: false, gop: 1.0, ..Default::default() };
+        let o = s.opts(&p, None, "Mein Film", "Jörg");
+        let out = std::env::temp_dir().join("video-superbe-tests").join("export_settings.mp4");
+        export(&p, &out, &o, &mut |_| true).expect("export");
+        let info = crate::video::probe(&out).expect("probe");
+        assert_eq!((info.width, info.height), (240, 426), "{info:?}");
+        assert!((info.fps - 25.0).abs() < 0.5, "Bildrate {}", info.fps);
+        assert!(info.has_audio);
+        let kinds = crate::mp4post::top_level_kinds(&out).unwrap();
+        let (m, d) = (kinds.iter().position(|k| k == "moov").unwrap(), kinds.iter().position(|k| k == "mdat").unwrap());
+        assert!(m < d, "Fast Start: {kinds:?}");
+        assert_eq!(crate::mp4post::read_metadata(&out).unwrap(), ("Mein Film".to_string(), "Jörg".to_string()));
+        // die Datei spielt nach dem Umbau noch: Bild und Ton lesbar
+        let mut dec = Decoder::open(&out).unwrap();
+        let fr = dec.frame_at(0.4).unwrap();
+        // Querformat-Bild im Hochformat: Mitte rot, oben und unten schwarze Balken
+        let at = |x: usize, y: usize| { let o = (y * fr.width + x) * 4; [fr.rgba[o], fr.rgba[o + 1], fr.rgba[o + 2]] };
+        let (mid, top) = (at(120, 213), at(120, 10));
+        assert!(mid[0] > 150 && mid[2] < 90, "Mitte rot: {mid:?}");
+        assert!(top.iter().all(|v| *v < 40), "Balken schwarz: {top:?}");
+        let mut ad = AudioDecoder::open(&out).unwrap();
+        let r = rms(&ad.read(RATE / 2, RATE as usize / 2));
+        assert!(r > 0.12 && r < 0.3, "Mono-Ton vorhanden (beide Kanäle gleich), rms={r}");
+        // ohne Fast Start und ohne Metadaten bleibt die Datei, wie Media Foundation sie schreibt
+        let mut o2 = o.clone();
+        (o2.fast_start, o2.title, o2.author) = (false, String::new(), String::new());
+        export(&p, &out, &o2, &mut |_| true).expect("export");
+        assert!(crate::video::probe(&out).is_ok());
+    }
+
+    #[test]
+    fn normalized_export_uses_the_limiter() {
+        let mut p = test_project();
+        let wav = write_sine_wav("exp_lim_tone.wav", 440.0, 2.0, 48000, 0.8);
+        let a = MediaAsset { path: wav.to_string_lossy().into_owned(), name: "tone".into(), duration: 2.0, has_audio: true, ..Default::default() };
+        let aid = a.id;
+        p.assets.push(a);
+        p.tracks[1].clips.push(Clip { part: ClipPart::Audio, ..clip(aid, 0.0, 2.0) });
+        let mut o = ExportOpts::from_project(&p);
+        (o.audio_gain, o.limiter) = (3.0, true);
+        let out = std::env::temp_dir().join("video-superbe-tests").join("export_limiter.mp4");
+        export(&p, &out, &o, &mut |_| true).expect("export");
+        let mut ad = AudioDecoder::open(&out).unwrap();
+        let s = ad.read(RATE / 2, RATE as usize);
+        let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // −1 dBFS = 0,891; AAC schwingt beim Decodieren etwas darüber (True Peak), übersteuert aber nicht
+        assert!(peak < 0.99 && peak > 0.7, "Spitzen auf etwa −1 dBFS gehalten: {peak}");
+        let r = rms(&s);
+        assert!(r > 0.55 && r < 0.68, "Sinus bleibt Sinus (rms ≈ 0,89/√2), kein Rechteck: {r}");
     }
 
     #[test]

@@ -508,6 +508,55 @@ impl AnimPreset {
             AnimPreset::PanLeft => "Schwenk nach links",
         }
     }
+
+    /// Kurzname für die Kacheln im Inspektor.
+    pub fn short(self) -> &'static str {
+        match self {
+            AnimPreset::SlideInLeft => "Von links",
+            AnimPreset::SlideInBottom => "Von unten",
+            AnimPreset::PopIn => "Aufpoppen",
+            AnimPreset::ZoomIn => "Hineinzoomen",
+            AnimPreset::ZoomOut => "Herauszoomen",
+            AnimPreset::PanRight => "Schwenk rechts",
+            AnimPreset::PanLeft => "Schwenk links",
+        }
+    }
+
+    /// Symbol der Kachel (Segoe Fluent Icons).
+    pub fn glyph(self) -> &'static str {
+        match self {
+            AnimPreset::SlideInLeft => "\u{E72A}",
+            AnimPreset::SlideInBottom => "\u{E74A}",
+            AnimPreset::PopIn => "\u{E734}",
+            AnimPreset::ZoomIn => "\u{E8A3}",
+            AnimPreset::ZoomOut => "\u{E71F}",
+            AnimPreset::PanRight => "\u{E76C}",
+            AnimPreset::PanLeft => "\u{E76B}",
+        }
+    }
+}
+
+impl Clip {
+    /// Zoom auf einen im Monitor aufgezogenen Bereich (Mitte `cx`/`cy` und Breite `w` als Anteile des Filmbilds, y nach unten).
+    /// Start = jetzige Lage und Größe (`base`, sonst die festen Werte), Ende = der Bereich füllt das Bild
+    /// (bei `reverse` umgekehrt: Zoom heraus). Die Skalierung ist auf den Wertebereich des Kanals (4×) begrenzt.
+    pub fn apply_zoom_region(&mut self, cx: f64, cy: f64, w: f64, reverse: bool, base: Option<Transform2D>) {
+        let b0 = base.unwrap_or_else(|| self.transform.clone());
+        let (x0, y0, s0) = (b0.x, b0.y, b0.scale);
+        let k = zoom_region_factor(w, s0);
+        let (s1, x1, y1) = (s0 * k, k * (x0 - (cx - 0.5)), k * (y0 - (cy - 0.5)));
+        let kf = |t: f64, v: f64| Keyframe::with_kind(t, v, InterpKind::EaseInOut);
+        let d = self.duration;
+        let (a, b) = if reverse { ((s1, x1, y1), (s0, x0, y0)) } else { ((s0, x0, y0), (s1, x1, y1)) };
+        self.keys.0.insert(Channel::Scale, vec![kf(0.0, a.0), kf(d, b.0)]);
+        self.keys.0.insert(Channel::PosX, vec![kf(0.0, a.1), kf(d, b.1)]);
+        self.keys.0.insert(Channel::PosY, vec![kf(0.0, a.2), kf(d, b.2)]);
+    }
+}
+
+/// Vergrößerung beim Zoom auf einen Bereich der Breite `w` (Anteil des Bildes), ausgehend von der Größe `s0`.
+pub fn zoom_region_factor(w: f64, s0: f64) -> f64 {
+    (1.0 / w.max(0.05)).min(Channel::Scale.range().1 / s0.max(0.05))
 }
 
 impl Clip {
@@ -534,14 +583,13 @@ impl Clip {
             AnimPreset::ZoomOut => {
                 self.keys.0.insert(Channel::Scale, vec![k(0.0, s0 * 1.2, Linear), k(d, s0, EaseInOut)]);
             }
+            // Die feste Größe bleibt unberührt (sonst wüchse sie bei jedem Anwenden um 12 %); der nötige Spielraum kommt als Keyframes
             AnimPreset::PanRight => {
-                self.transform.scale = s0 * 1.12;
-                self.keys.0.remove(&Channel::Scale);
+                self.keys.0.insert(Channel::Scale, vec![k(0.0, s0 * 1.12, Linear), k(d, s0 * 1.12, Linear)]);
                 self.keys.0.insert(Channel::PosX, vec![k(0.0, x0 - 0.04, Linear), k(d, x0 + 0.04, EaseInOut)]);
             }
             AnimPreset::PanLeft => {
-                self.transform.scale = s0 * 1.12;
-                self.keys.0.remove(&Channel::Scale);
+                self.keys.0.insert(Channel::Scale, vec![k(0.0, s0 * 1.12, Linear), k(d, s0 * 1.12, Linear)]);
                 self.keys.0.insert(Channel::PosX, vec![k(0.0, x0 + 0.04, Linear), k(d, x0 - 0.04, EaseInOut)]);
             }
         }
@@ -650,8 +698,28 @@ mod tests {
         assert_eq!(c.value(Channel::Scale, 0.0), 1.0);
         assert!((c.value(Channel::Scale, 5.0) - 1.2).abs() < 1e-9);
         c.apply_preset(AnimPreset::PanRight);
-        assert!((c.transform.scale - 1.12).abs() < 1e-9 && !c.is_keyed(Channel::Scale));
         assert!(c.value(Channel::PosX, 0.0) < 0.0 && c.value(Channel::PosX, 5.0) > 0.0);
+        // Der Schwenk wächst nicht bei jedem Anwenden: die feste Größe bleibt, der Spielraum steckt in Keyframes
+        c.apply_preset(AnimPreset::PanLeft);
+        c.apply_preset(AnimPreset::PanRight);
+        assert_eq!(c.transform.scale, 1.0);
+        assert!((c.value(Channel::Scale, 0.0) - 1.12).abs() < 1e-9 && (c.value(Channel::Scale, 5.0) - 1.12).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_region_targets_the_picked_area_and_caps_at_4x() {
+        let mut c = Clip { duration: 4.0, ..Default::default() };
+        // Viertel des Bildes oben links: Mitte (0,25|0,25), Breite 0,5 → 2×, Bildmitte wandert dorthin
+        c.apply_zoom_region(0.25, 0.25, 0.5, false, None);
+        assert_eq!(c.value(Channel::Scale, 0.0), 1.0);
+        assert!((c.value(Channel::Scale, 4.0) - 2.0).abs() < 1e-9);
+        assert!((c.value(Channel::PosX, 4.0) - 0.5).abs() < 1e-9 && (c.value(Channel::PosY, 4.0) - 0.5).abs() < 1e-9);
+        // heraus: umgekehrt
+        c.apply_zoom_region(0.25, 0.25, 0.5, true, None);
+        assert!((c.value(Channel::Scale, 0.0) - 2.0).abs() < 1e-9 && (c.value(Channel::Scale, 4.0) - 1.0).abs() < 1e-9);
+        // winziger Bereich: höchstens 4× (Wertebereich des Kanals), auch ausgehend von einer Vergrößerung
+        c.apply_zoom_region(0.5, 0.5, 0.01, false, Some(Transform2D { scale: 2.0, ..Default::default() }));
+        assert!((c.value(Channel::Scale, 4.0) - 4.0).abs() < 1e-9);
     }
 
     #[test]

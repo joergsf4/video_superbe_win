@@ -272,10 +272,162 @@ pub fn title_motion(kind: &str, rest: f64, w: f64, h: f64) -> (f64, f64, f64, f6
     }
 }
 
+/// Foto-Effekte (Mac: „Foto KI“ ohne Motiverkennung): `denoise` 0…1 glättet Rauschen kantenerhaltend (Sigma-Filter),
+/// `enhance` 0…1 blendet eine automatische Korrektur ein: Tonwerte spreizen (0,5 %/99,5 %), Farbstich zur Hälfte
+/// ausgleichen (Grauwelt), Mitten auf mittlere Helligkeit ziehen, Sättigung leicht anheben. RGBA, Alpha bleibt.
+pub fn photo_fx(px: &mut [u8], w: usize, h: usize, enhance: f64, denoise: f64) {
+    let n = w * h;
+    if n == 0 || px.len() < n * 4 {
+        return;
+    }
+    if denoise > 0.001 {
+        let sigma = ((0.6 + 1.6 * denoise) * w.max(h) as f64 / 1000.0).max(0.6) as f32;
+        let mut blurred: Vec<f32> = px.iter().map(|v| *v as f32).collect();
+        // drei Kastenfilter je Richtung ≈ Gauß, Kanal für Kanal
+        let r = ((((12.0 * sigma * sigma / 3.0 + 1.0).sqrt() - 1.0) / 2.0).round() as usize).max(1);
+        for c in 0..4 {
+            let mut ch: Vec<f32> = (0..n).map(|i| blurred[i * 4 + c]).collect();
+            box3(&mut ch, w, h, r);
+            for i in 0..n {
+                blurred[i * 4 + c] = ch[i];
+            }
+        }
+        let sr = (6.0 + 22.0 * denoise as f32).powi(2) * 2.0;
+        let k = denoise as f32;
+        for i in 0..n {
+            let o = i * 4;
+            let d2: f32 = (0..3).map(|c| (px[o + c] as f32 - blurred[o + c]).powi(2)).sum::<f32>() / 3.0;
+            // Abweichungen in Größe des Rauschens werden geglättet, Kanten (große Abweichung) bleiben
+            let wgt = (-d2 / sr).exp() * k.min(1.0);
+            for c in 0..3 {
+                px[o + c] = (px[o + c] as f32 * (1.0 - wgt) + blurred[o + c] * wgt).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    if enhance > 0.001 {
+        let mut hist = [0u32; 256];
+        let mut sum = [0f64; 3];
+        for p in px.chunks_exact(4) {
+            let l = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) as usize;
+            hist[l.min(255)] += 1;
+            for c in 0..3 {
+                sum[c] += p[c] as f64;
+            }
+        }
+        let pct = |q: f64| {
+            let target = (n as f64 * q) as u32;
+            let mut acc = 0u32;
+            for (i, v) in hist.iter().enumerate() {
+                acc += v;
+                if acc > target {
+                    return i as f32;
+                }
+            }
+            255.0
+        };
+        // Spreizung der Helligkeit, höchstens 2,2fach (flache oder einfarbige Bilder werden nicht verzerrt)
+        let (p_lo, p_hi) = (pct(0.005), pct(0.995));
+        let range = (p_hi - p_lo).max(255.0 / 2.2);
+        let lo = ((p_lo + p_hi) / 2.0 - range / 2.0).clamp(0.0, 255.0 - range);
+        let mean = [sum[0] / n as f64, sum[1] / n as f64, sum[2] / n as f64];
+        let gray = (mean[0] + mean[1] + mean[2]) / 3.0;
+        // halber Grauwelt-Abgleich, begrenzt (bunte Motive bleiben bunt)
+        let wb: Vec<f32> = mean.iter().map(|m| (1.0 + 0.5 * (gray / m.max(1.0) - 1.0)).clamp(0.85, 1.15) as f32).collect();
+        // Mittlere Helligkeit nach dem Spreizen → Gamma, das sie Richtung 0,46 zieht (höchstens moderat)
+        let mid = ((gray as f32 - lo) / range).clamp(0.05, 0.95);
+        let gamma = ((0.46f32).ln() / mid.ln()).clamp(0.7, 1.4);
+        let k = enhance as f32;
+        for p in px.chunks_exact_mut(4) {
+            let c = [p[0] as f32 * wb[0], p[1] as f32 * wb[1], p[2] as f32 * wb[2]];
+            let l = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).max(0.5);
+            let l2 = ((l - lo) / range).clamp(0.0, 1.0).powf(gamma) * 255.0;
+            let s = l2 / l;
+            for i in 0..3 {
+                // Farben gemeinsam skalieren (Farbton bleibt), Sättigung leicht anheben
+                let v = (l2 + (c[i] * s - l2) * 1.12).clamp(0.0, 255.0);
+                p[i] = (p[i] as f32 * (1.0 - k) + v * k).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// Drei Kastenfilter (Radius `r`) waagerecht und senkrecht, Rand wiederholt.
+fn box3(v: &mut [f32], w: usize, h: usize, r: usize) {
+    let mut line = vec![0f32; w.max(h)];
+    let mut tmp = vec![0f32; w.max(h)];
+    let pass = |src: &[f32], dst: &mut [f32], len: usize| {
+        let at = |i: isize| src[i.clamp(0, len as isize - 1) as usize];
+        let mut s: f32 = (-(r as isize)..=r as isize).map(at).sum();
+        let k = 1.0 / (2 * r + 1) as f32;
+        for i in 0..len {
+            dst[i] = s * k;
+            s += at(i as isize + r as isize + 1) - at(i as isize - r as isize);
+        }
+    };
+    for _ in 0..3 {
+        for y in 0..h {
+            line[..w].copy_from_slice(&v[y * w..(y + 1) * w]);
+            pass(&line[..w], &mut tmp[..w], w);
+            v[y * w..(y + 1) * w].copy_from_slice(&tmp[..w]);
+        }
+        for x in 0..w {
+            for y in 0..h {
+                line[y] = v[y * w + x];
+            }
+            pass(&line[..h], &mut tmp[..h], h);
+            for y in 0..h {
+                v[y * w + x] = tmp[y];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Rgba;
+
+    #[test]
+    fn photo_enhance_stretches_dull_pictures_and_denoise_smooths_noise() {
+        // flaues, bläuliches Bild: Werte 90…150
+        let (w, h) = (64usize, 48usize);
+        let mut px: Vec<u8> = (0..w * h).flat_map(|i| {
+            let v = (90 + (i % w) * 60 / w) as u8;
+            [v, v, v.saturating_add(20), 255]
+        }).collect();
+        let range = |p: &[u8]| {
+            let l: Vec<u8> = p.chunks(4).map(|c| c[1]).collect();
+            (*l.iter().max().unwrap() as i32) - (*l.iter().min().unwrap() as i32)
+        };
+        let before = range(&px);
+        let orig = px.clone();
+        photo_fx(&mut px, w, h, 1.0, 0.0);
+        assert!(range(&px) > before + 40, "Kontrast gespreizt: {} → {}", before, range(&px));
+        let blue_cast = |p: &[u8]| p.chunks(4).map(|c| c[2] as f64 - c[0] as f64).sum::<f64>() / (w * h) as f64;
+        assert!(blue_cast(&px) < blue_cast(&orig), "Farbstich gemindert");
+        assert!(px.chunks(4).all(|c| c[3] == 255), "Alpha bleibt");
+        // halbe Stärke liegt dazwischen
+        let mut half = orig.clone();
+        photo_fx(&mut half, w, h, 0.5, 0.0);
+        assert!(range(&half) > before && range(&half) < range(&px));
+        // Rauschen auf grauer Fläche wird kleiner, eine harte Kante bleibt
+        let mut noisy: Vec<u8> = (0..w * h).flat_map(|i| {
+            let n = ((i * 7919) % 23) as i32 - 11;
+            let base = if i % w < w / 2 { 60 } else { 200 };
+            let v = (base + n).clamp(0, 255) as u8;
+            [v, v, v, 255]
+        }).collect();
+        let var = |p: &[u8], x0: usize, x1: usize| {
+            let v: Vec<f64> = (0..h).flat_map(|y| (x0..x1).map(move |x| (y, x))).map(|(y, x)| p[(y * w + x) * 4] as f64).collect();
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64
+        };
+        let v0 = var(&noisy, 4, 26);
+        photo_fx(&mut noisy, w, h, 0.0, 1.0);
+        assert!(var(&noisy, 4, 26) < v0 * 0.6, "Rauschen gemindert: {v0} → {}", var(&noisy, 4, 26));
+        let (l, r) = (noisy[(10 * w + w / 2 - 3) * 4] as i32, noisy[(10 * w + w / 2 + 2) * 4] as i32);
+        assert!(r - l > 100, "Kante bleibt: {l} {r}");
+    }
 
     #[test]
     fn greenscreen_keys_green_and_keeps_skin_red_and_grey() {

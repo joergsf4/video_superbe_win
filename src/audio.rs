@@ -316,9 +316,10 @@ impl Mixer {
                 };
                 apply_fx(st, &c.audio_fx, &mut data);
                 let (xin, xout) = p.overlaps(c.id);
+                let track_gain = tr.gain().clamp(0.0, 4.0);
                 for i in 0..m {
                     let t = (f_from + i as i64) as f64 / RATE as f64 - c.start;
-                    let g = c.gain(t, xin, xout) as f32;
+                    let g = (c.gain(t, xin, xout) * track_gain) as f32;
                     let o = ((f_from - start) as usize + i) * 2;
                     out[o] += data[i * 2] * g;
                     out[o + 1] += data[i * 2 + 1] * g;
@@ -473,6 +474,13 @@ pub mod tests {
         p.tracks[1].solo = Some(true);
         let mut m5 = Mixer::new();
         assert!(rms(&m5.mix(&p, 48000, 24000)) < 1e-6);
+        // Lautstärke der ganzen Spur (Spurmenü): 25 %
+        p.tracks[1].solo = None;
+        p.clip_mut(cid).unwrap().fade_in = 0.0;
+        p.tracks[0].volume = Some(0.25);
+        let mut m6 = Mixer::new();
+        let quarter = rms(&m6.mix(&p, 48000, 24000));
+        assert!((quarter - loud / 4.0).abs() < 0.02, "{quarter} vs {loud}");
     }
 
     #[test]

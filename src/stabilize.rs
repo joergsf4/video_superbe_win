@@ -256,6 +256,13 @@ pub fn remove(asset: Uuid) {
     }
 }
 
+/// Vergisst alle im Speicher gehaltenen Bewegungsdaten (nach dem Löschen der Dateien).
+pub fn forget_all() {
+    if let Ok(mut r) = registry().lock() {
+        r.clear();
+    }
+}
+
 fn file_for(dir: &Path, asset: Uuid) -> PathBuf {
     dir.join("Stabilisierung").join(format!("{asset}.stab.json"))
 }

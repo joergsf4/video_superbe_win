@@ -206,6 +206,12 @@ pub struct Effects {
     pub stabilize: Option<f64>,
     #[serde(skip_serializing_if = "is_none")]
     pub stab_no_scale: Option<bool>,
+    /// Maske (Form oder Verlauf) über dem Bild des Clips
+    #[serde(skip_serializing_if = "is_none")]
+    pub mask: Option<crate::masks::MaskSpec>,
+    /// Foto-Effekte (Auto-Verbessern, Rauschen); der Hintergrund-Effekt der Mac-Version bleibt erhalten, wird hier aber nicht gerechnet
+    #[serde(skip_serializing_if = "is_none")]
+    pub photo: Option<PhotoFx>,
     /// Unbekannte Felder (z. B. `cutoutPick` der Mac-Version) bleiben erhalten
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -256,8 +262,101 @@ impl Default for Effects {
             lut_amount: None,
             stabilize: None,
             stab_no_scale: None,
+            mask: None,
+            photo: None,
             extra: Map::new(),
         }
+    }
+}
+
+/// Foto-Effekte. `bg`, `bgAmount` und `bgColor` werden immer geschrieben (die Mac-Version verlangt sie).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PhotoFx {
+    /// Auto-Verbessern (Belichtung, Farbe), 0…1
+    #[serde(skip_serializing_if = "is_none")]
+    pub enhance: Option<f64>,
+    /// Rauschentfernung bei schlechtem Licht, 0…1
+    #[serde(skip_serializing_if = "is_none")]
+    pub denoise: Option<f64>,
+    /// Hintergrund hinter dem Motiv (Mac: Motiverkennung mit Vision): none, blur, mono, dim, color
+    pub bg: String,
+    pub bg_amount: f64,
+    pub bg_color: Vec<f64>,
+}
+
+impl Default for PhotoFx {
+    fn default() -> Self {
+        PhotoFx { enhance: None, denoise: None, bg: "none".into(), bg_amount: 0.7, bg_color: vec![0.08, 0.10, 0.16] }
+    }
+}
+
+impl PhotoFx {
+    pub fn is_empty(&self) -> bool {
+        self.enhance.unwrap_or(0.0) <= 0.001 && self.denoise.unwrap_or(0.0) <= 0.001 && self.bg == "none"
+    }
+}
+
+/// Gruppen von Effekten, die einzeln auf die Standardwerte zurückgesetzt werden können (ein Abschnitt im Inspektor je Gruppe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxGroup {
+    Color,
+    Sharp,
+    Lut,
+    Chroma,
+    Crop,
+    Stab,
+    Orient,
+    Motion,
+    PhotoEnhance,
+    Mask,
+}
+
+impl Clip {
+    /// Setzt die Gruppe auf die Standardwerte zurück (samt zugehöriger Keyframes).
+    pub fn reset_fx(&mut self, g: FxGroup) {
+        use crate::anim::Channel as Ch;
+        let d = Effects::default();
+        let mut clear = |chs: &[Ch]| {
+            for c in chs {
+                self.keys.0.remove(c);
+            }
+        };
+        match g {
+            FxGroup::Color => {
+                clear(&[Ch::Brightness, Ch::Contrast, Ch::Saturation, Ch::Temperature]);
+                (self.fx.brightness, self.fx.contrast, self.fx.saturation, self.fx.temperature) = (d.brightness, d.contrast, d.saturation, d.temperature);
+            }
+            FxGroup::Sharp => {
+                clear(&[Ch::Sharpness, Ch::Blur, Ch::Vignette]);
+                (self.fx.sharpness, self.fx.blur, self.fx.vignette) = (d.sharpness, d.blur, d.vignette);
+            }
+            FxGroup::Lut => (self.fx.lut_path, self.fx.lut_amount) = (None, None),
+            FxGroup::Chroma => self.fx.chroma = None,
+            FxGroup::Crop => (self.fx.fill, self.fx.crop_l, self.fx.crop_t, self.fx.crop_r, self.fx.crop_b) = (d.fill, 0.0, 0.0, 0.0, 0.0),
+            FxGroup::Stab => (self.fx.stabilize, self.fx.stab_no_scale) = (None, None),
+            FxGroup::Orient => (self.fx.flip_h, self.fx.flip_v, self.fx.quarter_turns, self.fx.horizon) = (None, None, None, None),
+            FxGroup::Motion => {
+                clear(&Ch::TRANSFORM);
+                self.transform = Transform2D::default();
+            }
+            FxGroup::PhotoEnhance => {
+                if let Some(p) = self.fx.photo.as_mut() {
+                    (p.enhance, p.denoise) = (None, None);
+                }
+            }
+            FxGroup::Mask => self.fx.mask = None,
+        }
+        if self.fx.photo.as_ref().is_some_and(PhotoFx::is_empty) {
+            self.fx.photo = None;
+        }
+    }
+
+    /// Weicht die Gruppe von den Standardwerten ab?
+    pub fn is_modified(&self, g: FxGroup) -> bool {
+        let mut c = self.clone();
+        c.reset_fx(g);
+        c != *self
     }
 }
 
@@ -498,7 +597,16 @@ pub struct Track {
     pub solo: Option<bool>,
     pub hidden: bool,
     pub locked: bool,
+    /// Spurfarbe (Name aus `TRACK_COLORS`), Lautstärke und Deckkraft der ganzen Spur (`None` = 100 %)
+    #[serde(skip_serializing_if = "is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub volume: Option<f64>,
+    #[serde(skip_serializing_if = "is_none")]
+    pub opacity: Option<f64>,
     pub clips: Vec<Clip>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl Default for Track {
@@ -510,8 +618,35 @@ impl Default for Track {
             solo: None,
             hidden: false,
             locked: false,
+            color: None,
+            volume: None,
+            opacity: None,
             clips: vec![],
+            extra: Map::new(),
         }
+    }
+}
+
+/// Auswahl für die Spurfarbe: (Name in der Datei, Beschriftung, Farbe).
+pub const TRACK_COLORS: [(&str, &str, [u8; 3]); 6] = [
+    ("red", "Rot", [235, 77, 61]),
+    ("orange", "Orange", [242, 153, 51]),
+    ("yellow", "Gelb", [245, 204, 51]),
+    ("green", "Grün", [89, 199, 97]),
+    ("blue", "Blau", [64, 140, 245]),
+    ("purple", "Violett", [176, 97, 222]),
+];
+
+impl Track {
+    /// Vom Nutzer vergebener Name (nicht der automatische „Spur N“).
+    pub fn custom_name(&self) -> Option<&str> {
+        (!self.name.is_empty() && !self.name.starts_with("Spur ")).then_some(self.name.as_str())
+    }
+    pub fn gain(&self) -> f64 {
+        self.volume.unwrap_or(1.0)
+    }
+    pub fn alpha(&self) -> f64 {
+        self.opacity.unwrap_or(1.0)
     }
 }
 
@@ -808,6 +943,69 @@ mod tests {
         // Ein neu angelegter Clip schreibt `reverse` immer (sonst scheitert die Mac-Version mit keyNotFound)
         let v = serde_json::to_value(&Clip::default()).unwrap();
         assert_eq!(v["audioFX"]["reverse"], false);
+    }
+
+    /// Felder der Mac-Version 1.2: Masken, Foto-KI, KI-Verbesserung, Spurfarbe/-lautstärke/-deckkraft.
+    #[test]
+    fn mac_12_fields_roundtrip() {
+        let json = r#"{"assets":[],"tracks":[{"name":"Musik","muted":false,"hidden":false,"locked":false,"color":"green","volume":0.5,"opacity":0.75,"zukunft":true,
+          "clips":[{"id":"6F6E1B0A-0000-4000-8000-0000000000A1","content":{"media":{"_0":"6F6E1B0A-0000-4000-8000-0000000000B1"}},"part":"video","start":0,"sourceIn":0,"speed":1,"duration":3,"volume":1,"volumePoints":[],"transform":{"x":0,"y":0,"scale":1,"rotation":0},
+          "fx":{"mask":{"kind":"heart","cx":0.1,"cy":-0.1,"w":0.9,"h":0.8,"rot":12,"feather":0.2,"invert":true,"angle":0,"pos":0.5},"photo":{"enhance":0.6,"bg":"blur","bgAmount":0.7,"bgColor":[0.1,0.2,0.3]},"enhance":{"denoise":0.5,"from":0,"to":3},"enhanceOff":true},
+          "audioFX":{"windFilter":false,"denoise":0,"reverse":false},"transition":"crossfade","keys":[],"fadeIn":0,"fadeOut":0}]}],"renderWidth":1920,"renderHeight":1080,"fps":30}"#;
+        let p: Project = serde_json::from_str(json).unwrap();
+        let t = &p.tracks[0];
+        assert_eq!((t.color.as_deref(), t.volume, t.opacity, t.custom_name()), (Some("green"), Some(0.5), Some(0.75), Some("Musik")));
+        let fx = &t.clips[0].fx;
+        let m = fx.mask.as_ref().unwrap();
+        assert_eq!((m.kind, m.rot, m.invert), (crate::masks::MaskKind::Heart, 12.0, true));
+        let ph = fx.photo.as_ref().unwrap();
+        assert_eq!((ph.enhance, ph.denoise, ph.bg.as_str()), (Some(0.6), None, "blur"));
+        let out: Value = serde_json::to_value(&p).unwrap();
+        let o = &out["tracks"][0];
+        assert_eq!((o["color"].as_str(), o["volume"].as_f64(), o["opacity"].as_f64(), o["zukunft"].as_bool()), (Some("green"), Some(0.5), Some(0.75), Some(true)));
+        let f = &o["clips"][0]["fx"];
+        assert_eq!(f["mask"]["kind"], "heart");
+        assert_eq!(f["photo"]["bgAmount"].as_f64(), Some(0.7));
+        assert_eq!(f["enhance"]["denoise"].as_f64(), Some(0.5), "KI-Verbesserung (nur Mac) bleibt erhalten");
+        assert_eq!(f["enhanceOff"].as_bool(), Some(true));
+        let p2: Project = serde_json::from_value(out).unwrap();
+        assert_eq!(p2, p);
+        // Spuren ohne Angaben schreiben die neuen Felder nicht
+        let v = serde_json::to_value(Track::default()).unwrap();
+        assert!(v.get("color").is_none() && v.get("volume").is_none() && v.get("opacity").is_none());
+        assert_eq!(Track { name: "Spur 3".into(), ..Default::default() }.custom_name(), None);
+        // Foto-Effekte schreiben immer bg, bgAmount, bgColor (die Mac-Version verlangt sie)
+        let v = serde_json::to_value(PhotoFx { enhance: Some(0.5), ..Default::default() }).unwrap();
+        assert_eq!((v["bg"].as_str(), v["bgAmount"].as_f64(), v["bgColor"].as_array().map(|a| a.len())), (Some("none"), Some(0.7), Some(3)));
+    }
+
+    #[test]
+    fn reset_fx_groups_clear_values_and_keys() {
+        use crate::anim::Channel;
+        let mut c = media_clip(0.0, 4.0);
+        c.fx.brightness = 0.3;
+        c.fx.vignette = 0.5;
+        c.keys.0.insert(Channel::Brightness, vec![crate::anim::Keyframe::new(0.0, 0.1), crate::anim::Keyframe::new(2.0, 0.4)]);
+        c.transform.scale = 1.5;
+        c.keys.0.insert(Channel::Scale, vec![crate::anim::Keyframe::new(0.0, 1.0)]);
+        c.fx.mask = Some(crate::masks::MaskKind::Star.defaults());
+        c.fx.photo = Some(PhotoFx { enhance: Some(0.5), ..Default::default() });
+        c.fx.flip_h = Some(true);
+        for g in [FxGroup::Color, FxGroup::Sharp, FxGroup::Motion, FxGroup::Mask, FxGroup::PhotoEnhance, FxGroup::Orient] {
+            assert!(c.is_modified(g), "{g:?}");
+        }
+        assert!(!c.is_modified(FxGroup::Lut) && !c.is_modified(FxGroup::Chroma) && !c.is_modified(FxGroup::Crop));
+        c.reset_fx(FxGroup::Color);
+        assert_eq!(c.fx.brightness, 0.0);
+        assert!(!c.keys.0.contains_key(&Channel::Brightness));
+        assert_eq!(c.fx.vignette, 0.5, "andere Gruppen bleiben");
+        c.reset_fx(FxGroup::Motion);
+        assert_eq!(c.transform, Transform2D::default());
+        assert!(!c.keys.0.contains_key(&Channel::Scale));
+        c.reset_fx(FxGroup::PhotoEnhance);
+        assert!(c.fx.photo.is_none(), "leere Foto-Effekte entfallen");
+        c.reset_fx(FxGroup::Mask);
+        assert!(c.fx.mask.is_none() && c.fx.flip_h == Some(true));
     }
 }
 

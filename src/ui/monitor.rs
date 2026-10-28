@@ -194,8 +194,62 @@ impl App {
                 painter.line_segment([egui::pos2(frame.left(), frame.top() + frame.height() * f), egui::pos2(frame.right(), frame.top() + frame.height() * f)], line);
             }
         }
-        if overlay {
+        if overlay && self.zoom_pick.is_some() {
+            self.zoom_pick_overlay(ui, frame);
+        } else if overlay {
             self.draw_overlay(ui, frame);
+        }
+    }
+
+    /// Zoom auf Bereich: Rahmen im Seitenverhältnis des Films aufziehen (ZoomPickOverlay.swift).
+    fn zoom_pick_overlay(&mut self, ui: &mut egui::Ui, frame: Rect) {
+        let aspect = frame.width() / frame.height().max(1.0);
+        let painter = ui.painter_at(frame.expand(2.0));
+        painter.rect_filled(frame, 0.0, Color32::from_black_alpha(115));
+        let resp = ui.interact(frame, ui.id().with("zoom_pick"), Sense::drag());
+        let reverse = self.zoom_pick.is_some_and(|z| z.1);
+        let pick = match (ui.input(|i| i.pointer.press_origin()), ui.input(|i| i.pointer.latest_pos())) {
+            (Some(o), Some(p)) if resp.dragged() || resp.drag_stopped() => {
+                let o = egui::pos2(o.x.clamp(frame.left(), frame.right()), o.y.clamp(frame.top(), frame.bottom()));
+                let (dx, dy) = (p.x - o.x, p.y - o.y);
+                let (sx, sy) = (if dx >= 0.0 { 1.0 } else { -1.0 }, if dy >= 0.0 { 1.0 } else { -1.0 });
+                // vom Startpunkt in Zugrichtung, nie über den Bildrand hinaus
+                let mut w = dx.abs().max(dy.abs() * aspect);
+                w = w.min(if sx > 0.0 { frame.right() - o.x } else { o.x - frame.left() }).min((if sy > 0.0 { frame.bottom() - o.y } else { o.y - frame.top() }) * aspect);
+                let h = w / aspect;
+                Some(Rect::from_min_size(egui::pos2(if sx > 0.0 { o.x } else { o.x - w }, if sy > 0.0 { o.y } else { o.y - h }), Vec2::new(w, h)))
+            }
+            _ => None,
+        };
+        match pick {
+            Some(f) => {
+                painter.rect_stroke(f, 0.0, Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+                let k = frame.width() / f.width().max(1.0);
+                let g = painter.layout_no_wrap(format!("{:.1}×", k.min(20.0)), FontId::proportional(12.0), Color32::WHITE);
+                let lr = Rect::from_min_size(f.min + Vec2::new(4.0, 4.0), g.size() + Vec2::new(8.0, 4.0));
+                painter.rect_filled(lr, 4.0, ACCENT);
+                painter.galley(lr.min + Vec2::new(4.0, 2.0), g, Color32::WHITE);
+                if resp.drag_stopped() {
+                    if f.width() < frame.width() * 0.06 {
+                        self.status = "Bereich zu klein – bitte größer aufziehen".into();
+                    } else {
+                        let (cx, cy, w) = (((f.center().x - frame.left()) / frame.width()) as f64, ((f.center().y - frame.top()) / frame.height()) as f64, (f.width() / frame.width()) as f64);
+                        self.finish_zoom_pick(cx, cy, w);
+                    }
+                }
+            }
+            None => {
+                let text = if reverse { "Bereich aufziehen: Der Film zoomt aus diesem Bereich heraus" } else { "Bereich aufziehen: Der Film zoomt auf diesen Bereich" };
+                let g = painter.layout_no_wrap(text.to_string(), FontId::proportional(12.5), Color32::WHITE);
+                let lr = Rect::from_center_size(frame.center(), g.size() + Vec2::new(16.0, 10.0));
+                painter.rect_filled(lr, 6.0, Color32::from_black_alpha(180));
+                painter.galley(lr.min + Vec2::new(8.0, 5.0), g, Color32::WHITE);
+            }
+        }
+        // Abbrechen
+        let br = Rect::from_min_size(egui::pos2(frame.right() - 118.0, frame.top() + 8.0), Vec2::new(110.0, 22.0));
+        if ui.put(br, egui::Button::new(RichText::new("Abbrechen (Esc)").size(11.5))).clicked() {
+            self.zoom_pick = None;
         }
     }
 

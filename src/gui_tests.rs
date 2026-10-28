@@ -543,6 +543,7 @@ fn animator_shows_rows_seeks_and_drags_keys() {
     let mut h = H::new(p);
     h.app.selected = Some(ids.c_title);
     h.app.inspector_tab = 3;
+    h.app.show_animator = true;
     {
         let c = h.app.project.clip_mut(ids.c_title).unwrap();
         c.set_animated(Channel::PosX, true, 0.0);

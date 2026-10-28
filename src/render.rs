@@ -93,6 +93,8 @@ pub struct Renderer {
     faces: HashMap<String, (FontVec, FontVec)>,
     /// geladene 3D-LUTs (`.cube`) nach Pfad
     luts: HashMap<String, Option<Arc<Lut>>>,
+    /// Fotos mit Foto-Effekten (Auto-Verbessern, Rauschentfernung), je Medium und Einstellung, in Verkleinerungsstufen
+    photos: HashMap<String, Option<Vec<Arc<Img>>>>,
     blocking: BlockingFrames,
 }
 
@@ -174,11 +176,13 @@ struct Draw<'a> {
     lut: Option<(Arc<Lut>, f32)>,
     /// Stabilisierung: Verschiebung (Anteile von Breite/Höhe) und Skalierung um die Bildmitte
     stab: Option<(f32, f32, f32)>,
+    /// Maske in Leinwandgröße (vor Position, Größe und Drehung des Clips)
+    mask: Option<Arc<Vec<f32>>>,
 }
 
 impl Draw<'_> {
     fn new<'a>(src: &'a Src, native: bool, tr: Transform2D, fx: Effects, alpha: f32, opaque: bool) -> Draw<'a> {
-        Draw { src, native, tr, fx, alpha, dx: 0.0, wipe_x: None, opaque, dy: 0.0, wipe_y: None, zoom: 1.0, iris: None, orient: None, lut: None, stab: None }
+        Draw { src, native, tr, fx, alpha, dx: 0.0, wipe_x: None, opaque, dy: 0.0, wipe_y: None, zoom: 1.0, iris: None, orient: None, lut: None, stab: None, mask: None }
     }
 }
 
@@ -195,6 +199,7 @@ impl Renderer {
             bold: load_font("segoeuib.ttf"),
             faces: HashMap::new(),
             luts: HashMap::new(),
+            photos: HashMap::new(),
             blocking: BlockingFrames::default(),
         }
     }
@@ -262,7 +267,8 @@ impl Renderer {
                 if fo > 0.0 {
                     fade = fade.min((c.duration - rel) / fo);
                 }
-                let mut alpha = (c.curve_gain(rel) * fade.clamp(0.0, 1.0)).clamp(0.0, 1.0) as f32;
+                // … × Deckkraft der ganzen Spur
+                let mut alpha = (c.curve_gain(rel) * fade.clamp(0.0, 1.0) * tr.alpha()).clamp(0.0, 1.0) as f32;
                 if alpha <= 0.0 {
                     continue;
                 }
@@ -365,7 +371,26 @@ impl Renderer {
                     ClipContent::Media(m) => {
                         let Some(asset) = p.asset(m.v) else { continue };
                         if asset.is_image {
-                            let levels = self.images.entry(m.v).or_insert_with(|| load_image(&asset.path).map(|i| vec![Arc::new(i)]));
+                            // Foto-Effekte werden einmal je Foto und Einstellung gerechnet (ein Foto ändert sich nicht)
+                            let photo = c.fx.photo.as_ref().filter(|ph| ph.enhance.unwrap_or(0.0) > 0.001 || ph.denoise.unwrap_or(0.0) > 0.001);
+                            let levels = match photo {
+                                Some(ph) => {
+                                    let (e, dn) = (ph.enhance.unwrap_or(0.0), ph.denoise.unwrap_or(0.0));
+                                    let key = format!("{}|{e:.3}|{dn:.3}", m.v);
+                                    if !self.photos.contains_key(&key) {
+                                        if self.photos.len() > 24 {
+                                            self.photos.clear();
+                                        }
+                                        let img = load_image(&asset.path).map(|mut i| {
+                                            fxlib::photo_fx(&mut i.px, i.w, i.h, e, dn);
+                                            vec![Arc::new(i)]
+                                        });
+                                        self.photos.insert(key.clone(), img);
+                                    }
+                                    self.photos.get_mut(&key).unwrap()
+                                }
+                                None => self.images.entry(m.v).or_insert_with(|| load_image(&asset.path).map(|i| vec![Arc::new(i)])),
+                            };
                             let Some(levels) = levels else { continue };
                             let (ow, oh) = Orient::from_fx(&fx).map(|o| o.dims(levels[0].w as f32, levels[0].h as f32)).map(|d| (d.0 as usize, d.1 as usize)).unwrap_or((levels[0].w, levels[0].h));
                             let k = fit_scale(ow, oh, &fx, w, h, false, tr_now.scale as f32);
@@ -384,6 +409,8 @@ impl Renderer {
                     (ClipContent::Media(m), Some(strength)) if strength > 0.001 => crate::stabilize::get(m.v).and_then(|path| path.transform_at(c.source_in + rel * c.speed, strength, fx.stab_no_scale != Some(true))),
                     _ => None,
                 };
+                // Masken gelten auch für Titel (z. B. Verlauf zum Ausblenden)
+                let mask = c.fx.mask.as_ref().map(|m| crate::masks::mask(m, w, h));
                 let mk = |opaque: bool| {
                     let mut d = Draw::new(&src, native, tr_now.clone(), fx.clone(), if opaque { alpha } else { 1.0 }, opaque);
                     d.dx = dx + title_dx;
@@ -395,6 +422,7 @@ impl Renderer {
                     d.orient = orient;
                     d.lut = lut.clone();
                     d.stab = stab;
+                    d.mask = mask.clone();
                     d
                 };
                 if needs_layer {
@@ -803,6 +831,8 @@ fn blit(dst: &mut [u8], dw: usize, dh: usize, d: &Draw) {
     let y1 = ((center.1 + ey).ceil().min(dh as f32)) as usize;
     let fxn = !fx.is_neutral() || d.lut.is_some();
     let diag = (hw * hw + hh * hh).sqrt().max(1.0);
+    // Umrechnung von der Lage im gezeichneten Bild auf die Leinwand bei Größe 1 (für die Maske)
+    let inv_s = 1.0 / ((d.tr.scale as f32).max(0.01) * d.zoom);
     if x0 >= x1 || y0 >= y1 {
         return;
     }
@@ -833,6 +863,15 @@ fn blit(dst: &mut [u8], dw: usize, dh: usize, d: &Draw) {
                 let (ux, uy) = (rx * cs + ry * sn, -rx * sn + ry * cs);
                 if ux.abs() > hw || uy.abs() > hh {
                     continue;
+                }
+                // Maske: Lage im eingepassten Bild vor Position, Größe und Drehung (Leinwandkoordinaten)
+                if let Some(mk) = &d.mask {
+                    let (mx, my) = (c0.0 + ux * inv_s, c0.1 + uy * inv_s);
+                    let mv = if mx >= 0.0 && my >= 0.0 && (mx as usize) < dw && (my as usize) < dh { mk[my as usize * dw + mx as usize] } else { 0.0 };
+                    mask *= mv;
+                    if mask <= 0.0 {
+                        continue;
+                    }
                 }
                 let px = cl * ow as f32 + (ux + hw) / k;
                 let py = ct * oh as f32 + (uy + hh) / k;
@@ -1345,6 +1384,66 @@ pub mod tests {
         assert_eq!(px(&b1, 64, 16, 32), [0, 0, 0]);
         let b2 = r.render(&p, 1.99, 64, 64);
         assert_eq!(px(&b2, 64, 48, 32), [255, 255, 255]);
+    }
+
+    #[test]
+    fn masks_cut_out_and_follow_the_clip_and_track_opacity_dims() {
+        let mut p = Project::default();
+        let white = solid_png("mask_white.png", 160, 90, [250, 250, 250]);
+        let aid = image_asset(&mut p, &white, 160.0, 90.0);
+        let mut c = clip(aid, 0.0, 2.0);
+        c.fx.mask = Some(crate::masks::MaskSpec { kind: crate::masks::MaskKind::Ellipse, w: 0.5, h: 0.5, feather: 0.0, ..Default::default() });
+        p.tracks[0].clips.push(c);
+        let mut r = Renderer::new();
+        let b = r.render(&p, 0.5, 160, 90);
+        assert!(near(px(&b, 160, 80, 45), [250, 250, 250], 6), "Mitte sichtbar");
+        assert_eq!(px(&b, 160, 80, 10), [0, 0, 0], "außerhalb der Ellipse schwarz");
+        assert_eq!(px(&b, 160, 5, 45), [0, 0, 0]);
+        // Die Maske wandert mit dem Clip (vor Position und Größe): verschoben um ein Viertel der Breite
+        p.tracks[0].clips[0].transform.x = 0.25;
+        let b = r.render(&p, 0.5, 160, 90);
+        assert!(near(px(&b, 160, 120, 45), [250, 250, 250], 6) && px(&b, 160, 80, 45) == [0, 0, 0], "{:?}", px(&b, 160, 80, 45));
+        // und wird mit vergrößert: bei Größe 2 reicht die Ellipse doppelt so weit
+        p.tracks[0].clips[0].transform = Transform2D { scale: 2.0, ..Default::default() };
+        let b = r.render(&p, 0.5, 160, 90);
+        assert!(near(px(&b, 160, 80, 10), [250, 250, 250], 6), "{:?}", px(&b, 160, 80, 10));
+        // Titel lassen sich ebenfalls maskieren (Verlauf blendet die rechte Seite aus)
+        let mut t = Clip { start: 0.0, duration: 2.0, ..Default::default() };
+        if let ClipContent::Title(s) = &mut t.content {
+            s.v.text = "MMMMMMMMMMMM".into();
+            s.v.font_size = 0.3;
+            s.v.background = true;
+            s.v.background_color = Rgba { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
+        }
+        t.fx.mask = Some(crate::masks::MaskSpec { feather: 0.02, ..crate::masks::MaskKind::LinearGradient.defaults() });
+        p.tracks[0].clips.clear();
+        p.tracks[1].clips.push(t);
+        let b = r.render(&p, 0.5, 160, 90);
+        let red = |x: usize| px(&b, 160, x, 45)[0];
+        assert!(red(40) > 150 && red(120) < 30, "links sichtbar, rechts ausgeblendet: {} {}", red(40), red(120));
+        // Deckkraft der ganzen Spur
+        p.tracks[1].clips.clear();
+        p.tracks[0].clips.push(clip(aid, 0.0, 2.0));
+        p.tracks[0].opacity = Some(0.5);
+        let b = r.render(&p, 0.5, 160, 90);
+        assert!(near(px(&b, 160, 80, 45), [125, 125, 125], 6), "{:?}", px(&b, 160, 80, 45));
+    }
+
+    #[test]
+    fn photo_effects_change_the_photo_and_are_cached() {
+        let mut p = Project::default();
+        let dull = solid_png("photo_dull.png", 80, 45, [110, 120, 150]);
+        let aid = image_asset(&mut p, &dull, 80.0, 45.0);
+        let mut c = clip(aid, 0.0, 2.0);
+        c.fx.photo = Some(PhotoFx { enhance: Some(1.0), ..Default::default() });
+        p.tracks[0].clips.push(c);
+        let mut r = Renderer::new();
+        let a = px(&r.render(&p, 0.5, 80, 45), 80, 40, 22);
+        assert!(a != [110, 120, 150], "Auto-Verbessern ändert das Bild: {a:?}");
+        assert!((a[2] as i32 - a[0] as i32) < 40, "Blaustich gemindert: {a:?}");
+        p.tracks[0].clips[0].fx.photo = None;
+        let b = px(&r.render(&p, 0.5, 80, 45), 80, 40, 22);
+        assert!(near(b, [110, 120, 150], 3), "ohne Effekt unverändert: {b:?}");
     }
 
     #[test]

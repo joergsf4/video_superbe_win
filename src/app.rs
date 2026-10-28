@@ -19,16 +19,40 @@ pub(crate) struct ExportJob {
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) result: Arc<Mutex<Option<Result<(), String>>>>,
     pub(crate) path: PathBuf,
+    /// Hinweis zur Lautheit (für die Meldung am Ende); nach dem Export im Explorer zeigen
+    pub(crate) note: Arc<Mutex<Option<String>>>,
+    pub(crate) reveal: bool,
 }
 
 /// Einstellungen im Export-Fenster (vor dem Speichern-Dialog).
 pub(crate) struct ExportCfg {
-    pub(crate) quality: usize,
+    /// gewählte Voreinstellung und die (veränderbaren) Einstellungen
+    pub(crate) preset: String,
+    pub(crate) s: export::ExportSettings,
+    pub(crate) manual_bitrate: bool,
     pub(crate) use_range: bool,
     pub(crate) normalize: bool,
     pub(crate) target: f64,
+    pub(crate) title: String,
+    pub(crate) author: String,
+    /// nach dem Export im Explorer zeigen; erweiterte Videoeinstellungen offen; Eingabe „Voreinstellung speichern“
+    pub(crate) reveal: bool,
+    pub(crate) advanced: bool,
+    pub(crate) save_name: Option<String>,
     pub(crate) measured: Option<Result<crate::loudness::Loudness, String>>,
     pub(crate) measuring: Option<(std::sync::mpsc::Receiver<Option<crate::loudness::Loudness>>, Arc<AtomicU32>)>,
+}
+
+impl ExportCfg {
+    pub(crate) fn apply(&mut self, item: &export::ExportPresetItem) {
+        self.preset = item.name.clone();
+        self.s = item.settings.clone();
+        self.manual_bitrate = item.settings.kbps.is_some();
+        self.normalize = item.settings.lufs.is_some();
+        if let Some(l) = item.settings.lufs {
+            self.target = l;
+        }
+    }
 }
 
 pub struct App {
@@ -121,6 +145,28 @@ pub struct App {
     pub(crate) pool_tiles: Vec<(Uuid, Rect)>,
     /// Fehlgeschlagene Importe (Dateiname, Erklärung); werden in einem Fenster angezeigt.
     pub(crate) import_errors: Vec<(String, String)>,
+    /// Zielspur für das Einfügen (Klick auf den Spurkopf), Spurhöhe, Spur, die gerade umbenannt wird
+    pub(crate) target_track: Option<usize>,
+    pub(crate) row_h: f32,
+    pub(crate) track_rename: Option<(usize, String)>,
+    /// Keyframe-Animator unter dem Monitor (nur auf Wunsch; ein automatisch erscheinendes Feld ließ die Zeitleiste springen)
+    pub(crate) show_animator: bool,
+    pub(crate) animator_h: f32,
+    /// Storyboard-Ansicht statt Zeitleiste; Abspielbereich als Schleife
+    pub(crate) storyboard: bool,
+    pub(crate) loop_range: bool,
+    /// Zoom auf Bereich: Clip und Richtung (heraus), solange im Monitor ein Rahmen aufgezogen wird
+    pub(crate) zoom_pick: Option<(Uuid, bool)>,
+    /// Medienpool: Ansicht, Sortierung, Filter, Suche und Auswahl
+    pub(crate) pool: crate::media::PoolState,
+    /// Einstellungen, die zwischen den Starten erhalten bleiben (Datenordner)
+    pub(crate) prefs: crate::media::Prefs,
+    /// Zwischenspeicher-Dialog; Unterreiter im Reiter Effekte; offene Abschnitte im Inspektor
+    pub(crate) show_cache: bool,
+    pub(crate) effects_sub: usize,
+    pub(crate) section_open: HashMap<&'static str, bool>,
+    /// Vorschaubilder der Masken-Kacheln
+    pub(crate) mask_thumbs: HashMap<crate::masks::MaskKind, egui::TextureHandle>,
 }
 
 impl App {
@@ -203,7 +249,25 @@ impl App {
             tl_rect: Rect::NOTHING,
             pool_tiles: vec![],
             import_errors: vec![],
+            target_track: None,
+            row_h: crate::ui::timeline::ROW_H,
+            track_rename: None,
+            show_animator: false,
+            animator_h: 0.0,
+            storyboard: false,
+            loop_range: false,
+            zoom_pick: None,
+            pool: Default::default(),
+            prefs: Default::default(),
+            show_cache: false,
+            effects_sub: 0,
+            section_open: HashMap::new(),
+            mask_thumbs: HashMap::new(),
         };
+        a.prefs = crate::media::Prefs::load(&a.feat.data_dir);
+        a.pool.view = a.prefs.pool_view;
+        a.pool.sort = a.prefs.pool_sort;
+        a.pool.ascending = a.prefs.pool_ascending;
         if let Some(p) = arg {
             a.open_path(p);
         }
@@ -313,14 +377,34 @@ impl App {
         if self.export_job.is_some() || self.project.duration() <= 0.0 {
             return;
         }
-        self.export_cfg = Some(ExportCfg {
-            quality: 1,
+        let mut cfg = ExportCfg {
+            preset: String::new(),
+            s: export::ExportSettings::default(),
+            manual_bitrate: false,
             use_range: self.export_range().is_some(),
             normalize: false,
             target: crate::loudness::DEFAULT_TARGET,
+            title: String::new(),
+            author: String::new(),
+            reveal: true,
+            advanced: false,
+            save_name: None,
             measured: None,
             measuring: None,
-        });
+        };
+        let all = self.export_presets();
+        let last = self.prefs.last_export_preset.clone();
+        if let Some(item) = all.iter().find(|i| Some(&i.name) == last.as_ref()).or(all.first()) {
+            cfg.apply(item);
+        }
+        self.export_cfg = Some(cfg);
+    }
+
+    /// Eingebaute und eigene Voreinstellungen.
+    pub(crate) fn export_presets(&self) -> Vec<export::ExportPresetItem> {
+        let mut v = export::builtin_presets();
+        v.extend(self.prefs.export_presets.iter().cloned());
+        v
     }
 
     /// Bereich, der laut Einstellungen exportiert wird.
@@ -363,27 +447,39 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             result: Arc::new(Mutex::new(None)),
             path: path.clone(),
+            note: Arc::new(Mutex::new(None)),
+            reveal: cfg.reveal,
         };
+        self.prefs.last_export_preset = Some(cfg.preset.clone());
+        self.save_prefs();
         let known = cfg.measured.clone().and_then(|m| m.ok());
-        let (p, pr, ca, re) = (self.project.clone(), job.progress.clone(), job.cancel.clone(), job.result.clone());
+        let (p, pr, ca, re, note) = (self.project.clone(), job.progress.clone(), job.cancel.clone(), job.result.clone(), job.note.clone());
+        let mut s = cfg.s.clone();
+        if !cfg.manual_bitrate {
+            s.kbps = None;
+        }
+        let mut opts = s.opts(&p, (!whole).then_some(range), &cfg.title, &cfg.author);
         std::thread::spawn(move || {
-            let mut opts = export::ExportOpts::from_project(&p);
-            opts.video_kbps = (opts.video_kbps as f64 * [0.5, 1.0, 1.8][cfg.quality.min(2)]) as u32;
-            if !whole {
-                opts.range = Some(range);
-            }
             let mut base = 0.0;
             if cfg.normalize && export::has_audio(&p) {
-                // fehlt die Messung, wird sie vor dem Export nachgeholt (erste 10 % des Balkens)
-                let m = known.or_else(|| {
-                    base = 0.1;
-                    crate::loudness::measure(&p, range, &mut |f| {
-                        pr.store((f * 100.0) as u32, Ordering::Relaxed);
-                        !ca.load(Ordering::Relaxed)
-                    })
-                });
+                // fehlt die Messung, wird sie vor dem Export nachgeholt; mit Limiter wird nachgemessen (erste 10–30 % des Balkens)
+                let mut prog = |f: f64| {
+                    pr.store((f * 100.0) as u32, Ordering::Relaxed);
+                    !ca.load(Ordering::Relaxed)
+                };
+                let m = known.or_else(|| crate::loudness::measure(&p, range, &mut prog));
                 if let Some(m) = m {
-                    opts.audio_gain = crate::loudness::gain_for(m, cfg.target) as f32;
+                    let (g, limited) = crate::loudness::normalize_gain(&p, range, m, cfg.target, &mut prog);
+                    base = 0.1;
+                    opts.audio_gain = g as f32;
+                    opts.limiter = true;
+                    *note.lock().unwrap() = Some(format!(
+                        "Lautheit {:.1} → {:.1} LUFS ({:+.1} dB){}",
+                        m.lufs,
+                        cfg.target,
+                        20.0 * g.max(1e-9).log10(),
+                        if limited { ", Spitzen per Limiter auf −1 dBFS begrenzt" } else { "" }
+                    ));
                 }
             }
             let r = export::export(&p, &path, &opts, &mut |f| {
@@ -407,70 +503,233 @@ impl App {
         let mark_range = self.export_range();
         let has_audio = export::has_audio(&self.project);
         let (mut go, mut close, mut measure) = (false, false, false);
+        let presets = self.export_presets();
+        let n_builtin = export::builtin_presets().len();
+        let mut save_preset: Option<export::ExportPresetItem> = None;
+        let mut delete_preset: Option<String> = None;
+        let mut copy_chapters = false;
+        let p = &self.project;
+        let (ow, oh) = export::output_size(p.render_width, p.render_height, cfg.s.height);
+        let ofps = cfg.s.fps.unwrap_or(p.fps).clamp(1, 120) as u32;
+        let auto_kbps = (export::base_kbps(ow, oh, ofps) as f64 * cfg.s.quality) as u32;
+        let video_kbps = if cfg.manual_bitrate { cfg.s.kbps.unwrap_or(auto_kbps) } else { auto_kbps };
+        let audio_kbps = if !has_audio { 0 } else if cfg.s.mono { (cfg.s.audio_kbps / 2).max(96) } else { cfg.s.audio_kbps };
+        let secs = match (cfg.use_range, mark_range) {
+            (true, Some((a, b))) => b - a,
+            _ => p.duration(),
+        };
+        let row = |ui: &mut egui::Ui, title: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.horizontal(|ui| {
+                ui.add_sized(Vec2::new(104.0, 18.0), egui::Label::new(egui::RichText::new(title).size(12.0)));
+                add(ui);
+            });
+        };
+        let head = |ui: &mut egui::Ui, t: &str| {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(t).strong());
+        };
         egui::Window::new("Exportieren")
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.set_min_width(380.0);
-                ui.label(format!("{}×{} · {} fps · MP4 (H.264 + AAC)", self.project.render_width, self.project.render_height, self.project.fps));
-                ui.add_space(6.0);
+                ui.set_min_width(500.0);
+                // Voreinstellung
                 ui.horizontal(|ui| {
-                    ui.label("Qualität");
-                    ui.selectable_value(&mut cfg.quality, 0, "Klein");
-                    ui.selectable_value(&mut cfg.quality, 1, "Normal");
-                    ui.selectable_value(&mut cfg.quality, 2, "Hoch");
+                    ui.add_sized(Vec2::new(104.0, 18.0), egui::Label::new(egui::RichText::new("Voreinstellung").size(12.0)));
+                    egui::ComboBox::from_id_salt("export_preset").width(230.0).selected_text(cfg.preset.clone()).show_ui(ui, |ui| {
+                        for (i, item) in presets.iter().enumerate() {
+                            if i == n_builtin {
+                                ui.separator();
+                            }
+                            if ui.selectable_label(cfg.preset == item.name, &item.name).clicked() {
+                                cfg.apply(item);
+                            }
+                        }
+                    });
+                    if ui.small_button("Speichern …").clicked() {
+                        cfg.save_name = Some(String::new());
+                    }
+                    let custom = presets.iter().skip(n_builtin).any(|i| i.name == cfg.preset);
+                    if ui.add_enabled(custom, egui::Button::new("Löschen").small()).clicked() {
+                        delete_preset = Some(cfg.preset.clone());
+                    }
                 });
-                {
-                    let kbps = (export::ExportOpts::from_project(&self.project).video_kbps as f64 * [0.5, 1.0, 1.8][cfg.quality.min(2)]) as u32;
-                    let secs = match (cfg.use_range, mark_range) {
-                        (true, Some((a, b))) => b - a,
-                        _ => self.project.duration(),
-                    };
-                    let mb = (kbps as f64 + 160.0) * secs / 8.0 / 1000.0;
-                    ui.weak(format!("{:.1} Mbit/s · Dauer {}:{:02} · ca. {:.0} MB", kbps as f64 / 1000.0, secs as u64 / 60, secs as u64 % 60, mb));
-                }
-                if let Some((a, b)) = mark_range {
-                    let r = ui.checkbox(&mut cfg.use_range, format!("Nur Bereich zwischen den Marken ({:.1} s – {:.1} s)", a, b));
-                    if r.changed() {
-                        cfg.measured = None;
+                if let Some(name) = cfg.save_name.as_mut() {
+                    let mut done = None;
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(name).hint_text("Name der Voreinstellung").desired_width(260.0));
+                        let n = name.trim().to_string();
+                        let ok = !n.is_empty() && !presets.iter().take(n_builtin).any(|i| i.name == n);
+                        if ui.add_enabled(ok, egui::Button::new("Sichern").small()).clicked() {
+                            done = Some(Some(n));
+                        }
+                        if ui.small_button("Abbrechen").clicked() {
+                            done = Some(None);
+                        }
+                    });
+                    if let Some(r) = done {
+                        if let Some(n) = r {
+                            let mut s = cfg.s.clone();
+                            if !cfg.manual_bitrate {
+                                s.kbps = None;
+                            }
+                            s.lufs = cfg.normalize.then_some(cfg.target);
+                            cfg.preset = n.clone();
+                            save_preset = Some(export::ExportPresetItem { name: n, settings: s });
+                        }
+                        cfg.save_name = None;
                     }
                 }
-                ui.add_space(4.0);
+                ui.separator();
+                head(ui, "Bild");
+                row(ui, "Auflösung", &mut |ui| {
+                    let label = |h: Option<i64>| match h {
+                        None => "Wie der Film".to_string(),
+                        Some(2160) => "4K (2160p)".into(),
+                        Some(1080) => "Full HD (1080p)".into(),
+                        Some(720) => "HD (720p)".into(),
+                        Some(480) => "SD (480p)".into(),
+                        Some(x) => format!("{x}p"),
+                    };
+                    egui::ComboBox::from_id_salt("export_h").width(150.0).selected_text(label(cfg.s.height)).show_ui(ui, |ui| {
+                        for h in [None, Some(2160), Some(1440), Some(1080), Some(720), Some(480)] {
+                            ui.selectable_value(&mut cfg.s.height, h, label(h));
+                        }
+                    });
+                    ui.weak(format!("{ow} × {oh}"));
+                });
+                row(ui, "Bildrate", &mut |ui| {
+                    let label = |f: Option<i64>| f.map_or(format!("Wie der Film ({})", p.fps), |f| format!("{f} Bilder/s"));
+                    egui::ComboBox::from_id_salt("export_fps").width(150.0).selected_text(label(cfg.s.fps)).show_ui(ui, |ui| {
+                        for f in [None, Some(24), Some(25), Some(30), Some(50), Some(60)] {
+                            ui.selectable_value(&mut cfg.s.fps, f, label(f));
+                        }
+                    });
+                });
+                row(ui, "Codec", &mut |ui| {
+                    ui.weak("H.264 (überall abspielbar) + AAC");
+                });
+                head(ui, "Video");
+                row(ui, "Qualität", &mut |ui| {
+                    let cur = if cfg.manual_bitrate { -1.0 } else { cfg.s.quality };
+                    let label = |q: f64| match q {
+                        q if q < 0.0 => "Bitrate selbst festlegen …",
+                        q if q <= 0.61 => "Klein",
+                        q if q <= 0.76 => "Standard",
+                        q if q <= 1.01 => "Hoch (YouTube-Empfehlung)",
+                        _ => "Sehr hoch",
+                    };
+                    egui::ComboBox::from_id_salt("export_q").width(210.0).selected_text(label(cur)).show_ui(ui, |ui| {
+                        for q in [0.6, 0.75, 1.0, 1.6] {
+                            if ui.selectable_label(!cfg.manual_bitrate && (cfg.s.quality - q).abs() < 1e-6, label(q)).clicked() {
+                                cfg.manual_bitrate = false;
+                                cfg.s.kbps = None;
+                                cfg.s.quality = q;
+                            }
+                        }
+                        if ui.selectable_label(cfg.manual_bitrate, label(-1.0)).clicked() {
+                            cfg.manual_bitrate = true;
+                            cfg.s.kbps.get_or_insert(auto_kbps);
+                        }
+                    });
+                });
+                if cfg.manual_bitrate {
+                    row(ui, "Bitrate", &mut |ui| {
+                        let k = cfg.s.kbps.get_or_insert(auto_kbps);
+                        ui.add(egui::DragValue::new(k).range(500..=150_000).speed(50.0).suffix(" kbit/s"));
+                    });
+                }
+                egui::CollapsingHeader::new(egui::RichText::new("Erweitert").size(12.0)).id_salt("export_adv").default_open(cfg.advanced).show(ui, |ui| {
+                    row(ui, "Bitratenmodus", &mut |ui| {
+                        ui.selectable_value(&mut cfg.s.constant_bitrate, false, "Variabel (Durchschnitt)");
+                        ui.selectable_value(&mut cfg.s.constant_bitrate, true, "Konstant");
+                    });
+                    row(ui, "Schlüsselbilder", &mut |ui| {
+                        for (g, t) in [(1.0, "alle 1 s"), (2.0, "alle 2 s"), (5.0, "alle 5 s")] {
+                            ui.selectable_value(&mut cfg.s.gop, g, t);
+                        }
+                    });
+                    row(ui, "Profil", &mut |ui| {
+                        ui.selectable_value(&mut cfg.s.profile_high, true, "High");
+                        ui.selectable_value(&mut cfg.s.profile_high, false, "Main (ältere Geräte)");
+                    });
+                    ui.weak("Farbraum: Rec.709. HDR-Material wird in den Film umgerechnet. Ohne B-Bilder (sonst liegt der Ton um ein Bild versetzt).");
+                });
+                head(ui, "Ton");
                 ui.add_enabled_ui(has_audio, |ui| {
-                    ui.checkbox(&mut cfg.normalize, "Lautheit normalisieren");
-                    if cfg.normalize {
-                        ui.horizontal(|ui| {
-                            ui.label("Ziel");
-                            ui.add(egui::DragValue::new(&mut cfg.target).range(-30.0..=-6.0).speed(0.1).suffix(" LUFS").fixed_decimals(1));
-                            for (t, name) in [(-14.0, "−14 Streaming"), (-16.0, "−16 Podcast"), (-23.0, "−23 Rundfunk")] {
+                    row(ui, "AAC-Bitrate", &mut |ui| {
+                        for k in export::AAC_KBPS {
+                            ui.selectable_value(&mut cfg.s.audio_kbps, k, format!("{k}"));
+                        }
+                        ui.weak("kbit/s");
+                        ui.separator();
+                        ui.selectable_value(&mut cfg.s.mono, false, "Stereo");
+                        ui.selectable_value(&mut cfg.s.mono, true, "Mono");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut cfg.normalize, "Lautheit normalisieren auf");
+                        ui.add_enabled_ui(cfg.normalize, |ui| {
+                            for (t, name) in [(-14.0, "−14 LUFS (YouTube)"), (-16.0, "−16"), (-23.0, "−23 (EBU)")] {
                                 if ui.selectable_label((cfg.target - t).abs() < 0.05, name).clicked() {
                                     cfg.target = t;
                                 }
                             }
-                            if cfg.measuring.is_none() && ui.button("Messen").clicked() {
-                                measure = true;
-                            }
+                            ui.add(egui::DragValue::new(&mut cfg.target).range(-30.0..=-6.0).speed(0.1).suffix(" LUFS").fixed_decimals(1));
                         });
-                        if let Some((_, pr)) = &cfg.measuring {
-                            ui.add(egui::ProgressBar::new(pr.load(Ordering::Relaxed) as f32 / 1000.0).desired_width(300.0).text("Messen …"));
+                        if cfg.measuring.is_none() && ui.small_button("Messen").clicked() {
+                            measure = true;
                         }
-                        match &cfg.measured {
-                            Some(Ok(m)) => {
-                                let g = crate::loudness::gain_for(*m, cfg.target);
-                                ui.label(format!("Aktuell {:.1} LUFS, Spitze {:.1} dBFS → Verstärkung {:+.1} dB", m.lufs, 20.0 * m.peak.max(1e-6).log10(), 20.0 * g.log10()));
-                            }
-                            Some(Err(e)) => {
-                                ui.colored_label(Color32::from_rgb(230, 140, 80), e.as_str());
-                            }
-                            None => {}
+                    });
+                    if let Some((_, pr)) = &cfg.measuring {
+                        ui.add(egui::ProgressBar::new(pr.load(Ordering::Relaxed) as f32 / 1000.0).desired_width(300.0).text("Messen …"));
+                    }
+                    match &cfg.measured {
+                        Some(Ok(m)) => {
+                            let (g, limited) = crate::loudness::gain_with_limiter(*m, cfg.target);
+                            ui.label(format!(
+                                "Aktuell {:.1} LUFS, Spitze {:.1} dBFS → Verstärkung {:+.1} dB{}",
+                                m.lufs,
+                                20.0 * m.peak.max(1e-6).log10(),
+                                20.0 * g.max(1e-9).log10(),
+                                if cfg.normalize && limited { " (Spitzen per Limiter auf −1 dBFS)" } else { "" }
+                            ));
                         }
+                        Some(Err(e)) => {
+                            ui.colored_label(Color32::from_rgb(230, 140, 80), e.as_str());
+                        }
+                        None => {}
                     }
                 });
                 if !has_audio {
                     ui.weak("Das Projekt enthält keinen Ton.");
                 }
-                ui.add_space(8.0);
+                head(ui, "Datei");
+                if let Some((a, b)) = mark_range {
+                    let r = ui.checkbox(&mut cfg.use_range, format!("Nur Bereich zwischen den Marken ({} – {})", crate::ui::timecode(a, p.fps), crate::ui::timecode(b, p.fps)));
+                    if r.changed() {
+                        cfg.measured = None;
+                    }
+                }
+                ui.checkbox(&mut cfg.s.fast_start, "Für Streaming optimieren (Fast Start)");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut cfg.title).hint_text("Titel").desired_width(235.0));
+                    ui.add(egui::TextEdit::singleline(&mut cfg.author).hint_text("Autor").desired_width(235.0));
+                });
+                ui.checkbox(&mut cfg.reveal, "Nach dem Export im Explorer zeigen");
+                let chapters = p.marker_list().len();
+                if chapters > 0 && ui.small_button(format!("YouTube-Kapitelliste kopieren ({chapters} Kapitel)")).clicked() {
+                    copy_chapters = true;
+                }
+                ui.add_space(4.0);
+                ui.weak(format!(
+                    "{ow}×{oh} · {ofps} Bilder/s · Video ca. {:.1} Mbit/s + Ton {audio_kbps} kbit/s · Dauer {}:{:02} · Größe ca. {:.0} MB",
+                    video_kbps as f64 / 1000.0,
+                    secs as u64 / 60,
+                    secs as u64 % 60,
+                    (video_kbps + audio_kbps) as f64 * secs / 8.0 / 1000.0
+                ));
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Exportieren …").clicked() {
                         go = true;
@@ -481,6 +740,21 @@ impl App {
                 });
             });
         self.export_cfg = Some(cfg);
+        if let Some(item) = save_preset {
+            self.prefs.export_presets.retain(|i| i.name != item.name);
+            self.prefs.export_presets.push(item);
+            self.save_prefs();
+        }
+        if let Some(n) = delete_preset {
+            self.prefs.export_presets.retain(|i| i.name != n);
+            self.save_prefs();
+            if let (Some(c), Some(first)) = (self.export_cfg.as_mut(), export::builtin_presets().first()) {
+                c.apply(first);
+            }
+        }
+        if copy_chapters {
+            self.copy_chapters(ctx);
+        }
         if measure {
             self.start_measure();
         }
@@ -499,8 +773,15 @@ impl App {
         let Some(job) = &self.export_job else { return };
         let done = job.result.lock().unwrap().clone();
         if let Some(r) = done {
+            let note = job.note.lock().unwrap().take();
             self.status = match r {
-                Ok(()) => format!("Export fertig: {}", job.path.display()),
+                Ok(()) => {
+                    if job.reveal && !cfg!(test) {
+                        let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", job.path.display())).spawn();
+                    }
+                    let size = std::fs::metadata(&job.path).map(|m| crate::media::format_bytes(m.len())).unwrap_or_default();
+                    format!("Export fertig: {} – {size}{}", job.path.display(), note.map(|n| format!(" · {n}")).unwrap_or_default())
+                }
                 Err(e) => format!("Export: {e}"),
             };
             self.export_job = None;
@@ -637,6 +918,21 @@ impl App {
             self.open_path_checked(p);
             return;
         }
+        // Quellmaterial lokal sichern: Dateien aus Temp-Ordnern und Mail-Anhängen immer, sonst nach Einstellung
+        // (die Tests legen ihre Dateien selbst im Temp-Ordner an: dort nur auf ausdrücklichen Wunsch kopieren)
+        let original = p.clone();
+        let want = self.prefs.copy_imports_local || (!cfg!(test) && crate::media::is_temporary(&original));
+        let p = if !want || self.project.assets.iter().any(|a| std::path::Path::new(&a.path) == original) {
+            original
+        } else {
+            match crate::media::local_copy(&self.feat.data_dir, &original, true, true) {
+                Ok(local) => local,
+                Err(e) => {
+                    self.status = format!("Lokale Kopie fehlgeschlagen ({e}) – das Original wird verwendet");
+                    original
+                }
+            }
+        };
         if matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "wmv" | "avi" | "mkv" | "mts" | "m2ts" | "ts") {
             match video::probe(&p) {
                 Ok(i) => {

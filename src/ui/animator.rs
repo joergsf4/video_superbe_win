@@ -141,7 +141,7 @@ pub struct AnimGeom {
 impl App {
     /// Der Animator erscheint unter dem Monitor, solange der Reiter „Effekte“ offen und ein Bild-/Titelclip gewählt ist.
     pub(crate) fn animator_clip(&self) -> Option<Clip> {
-        if self.inspector_tab != 3 {
+        if self.inspector_tab != 3 || !self.show_animator {
             return None;
         }
         self.selected.and_then(|id| self.project.clip(id)).filter(|c| !c.is_audio()).cloned()
@@ -235,7 +235,7 @@ impl App {
             ui.menu_button(RichText::new("Voreinstellung").size(12.0), |ui| {
                 for p in AnimPreset::ALL {
                     if ui.button(p.label()).clicked() {
-                        self.edit_clip(id, |c| c.apply_preset(p));
+                        self.apply_preset_all(p, id);
                         ui.close();
                     }
                 }

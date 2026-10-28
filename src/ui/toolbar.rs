@@ -45,6 +45,10 @@ impl App {
                     self.export_srt();
                     ui.close();
                 }
+                if ui.button("Zwischenspeicher …").clicked() {
+                    self.show_cache = true;
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button(if self.feat.recorder.is_some() { "Aufnahme beenden" } else { "Sprecher aufnehmen" }).clicked() {
                     self.toggle_recording();
@@ -225,6 +229,22 @@ impl App {
                     self.relink_missing();
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("Medien lokal sammeln").on_hover_text("Kopiert alle Medien des Projekts in den Medienordner (VideoSuperbe-Daten\\Medien) und verknüpft sie neu").clicked() {
+                    self.collect_media_locally();
+                    ui.close();
+                }
+                let mut local = self.prefs.copy_imports_local;
+                if ui.checkbox(&mut local, "Beim Import alles lokal speichern").on_hover_text("Ohne diese Einstellung wird nur kopiert, was sonst verschwinden könnte (Dateien aus Temp-Ordnern, Mail-Anhänge)").changed() {
+                    self.prefs.copy_imports_local = local;
+                    self.save_prefs();
+                }
+                if ui.button("Medienordner im Explorer zeigen").clicked() {
+                    let dir = crate::media::media_folder(&self.feat.data_dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+                    ui.close();
+                }
             });
             ui.menu_button("Marker", |ui| {
                 if ui.button("Zu Zeitcode springen …").clicked() {
@@ -302,6 +322,19 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                if ui.checkbox(&mut self.storyboard, "Storyboard-Ansicht           Strg+Alt+B").clicked() {
+                    ui.close();
+                }
+                if ui.checkbox(&mut self.show_animator, "Keyframe-Animator").on_hover_text("Unter dem Monitor, solange der Reiter „Effekte“ offen ist").clicked() {
+                    if self.show_animator {
+                        self.inspector_tab = 3;
+                    }
+                    ui.close();
+                }
+                if ui.checkbox(&mut self.loop_range, "Abspielbereich als Schleife   Strg+Alt+L").clicked() {
+                    ui.close();
+                }
+                ui.separator();
                 ui.menu_button("Zoom", |ui| {
                     let fps = self.project.fps.max(1) as f64;
                     for (label, span) in [("1 Bild   Alt+1", 1.0 / fps), ("5 Bilder   Alt+2", 5.0 / fps), ("1 Sekunde   Alt+3", 1.0), ("10 Sekunden   Alt+4", 10.0), ("1 Minute   Alt+5", 60.0), ("10 Minuten   Strg+Alt+6", 600.0)] {
@@ -313,6 +346,10 @@ impl App {
                     ui.separator();
                     if ui.button("Markierter Bereich   Alt+F").clicked() {
                         self.zoom_to_range();
+                        ui.close();
+                    }
+                    if ui.button("Gewählte Objekte   Strg+Alt+F").clicked() {
+                        self.zoom_to_selection();
                         ui.close();
                     }
                     if ui.button("Vergrößern   Strg+↑").clicked() {

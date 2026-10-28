@@ -1,6 +1,6 @@
 //! Timeline: Werkzeugleiste, Spurköpfe (Ton, Solo, Sichtbarkeit, Sperre), Lineal mit Kapitel- und Bereichsmarken,
 //! Clips mit Vorschaubildern, Wellenform, Pegellinie, Blenden und Anfassern, Abspielmarker
-//! (TimelineView.swift; Maße: Kopfbreite 112, Zeilenhöhe 54, Lineal 24).
+//! (TimelineView.swift; Maße: Kopfbreite 112, Zeilenhöhe 54 (veränderbar), Lineal 24 mit Bereichsleiste unten).
 
 use super::volume;
 use super::*;
@@ -11,10 +11,28 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub const HEADER_W: f32 = 112.0;
+/// Standardhöhe einer Spur (Spurmenü: klein 36, normal 54, groß 84)
 pub const ROW_H: f32 = 54.0;
+/// Lineal (Skala, Marken) samt Bereichsleiste in den unteren 6 Pixeln
 pub const RULER_H: f32 = 24.0;
-const CLIP_H: f32 = ROW_H - 4.0;
+/// Höhe der Skala; darunter liegt die Bereichsleiste
+pub const SCALE_H: f32 = 18.0;
 const YELLOW: Color32 = Color32::from_rgb(255, 214, 10);
+
+/// Laufende Geste in der Bereichsleiste: 1 = Anfang, 2 = Ende, 3 = Band (mit Abstand vom Anfang)
+#[derive(Clone, Copy, Debug)]
+pub struct RangeDrag {
+    pub mode: u8,
+    pub grab: f64,
+}
+
+/// Laufendes Stretchen: Clip, Kante, Zielzeit der Kante
+#[derive(Clone, Copy, Debug)]
+pub struct StretchDrag {
+    pub id: Uuid,
+    pub left: bool,
+    pub target: f64,
+}
 
 /// Laufendes Verschieben von Clips (samt Partnern).
 #[derive(Clone, Debug)]
@@ -66,6 +84,8 @@ pub struct TlState {
     pub edge: Option<EdgePreview>,
     /// geöffnetes Blendenmenü: (Clip A, Clip B, Position)
     pub junction_popup: Option<(Uuid, Uuid, Pos2)>,
+    pub range_drag: Option<RangeDrag>,
+    pub stretch: Option<StretchDrag>,
 }
 
 fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -96,7 +116,11 @@ impl App {
 
     pub(crate) fn timeline_panel(&mut self, ui: &mut Ui) {
         self.timeline_toolbar(ui);
-        self.timeline_body(ui);
+        if self.storyboard {
+            self.storyboard_view(ui);
+        } else {
+            self.timeline_body(ui);
+        }
     }
 
     fn timeline_toolbar(&mut self, ui: &mut Ui) {
@@ -111,12 +135,38 @@ impl App {
                     ui.painter().rect_filled(r, 0.0, Color32::from_white_alpha(40));
                     ui.add_space(4.0);
                 };
-                if icon_button_sized(ui, I_UNDO, "Rückgängig (Strg+Z)", false, 15.0, Vec2::new(28.0, 24.0), !self.undo.is_empty()).clicked() {
+                let ur = icon_button_sized(ui, I_UNDO, "Rückgängig (Strg+Z) · Rechtsklick: Liste der letzten Schritte", false, 15.0, Vec2::new(28.0, 24.0), true);
+                if ur.clicked() {
                     self.do_undo();
                 }
-                if icon_button_sized(ui, I_REDO, "Wiederholen (Strg+Y)", false, 15.0, Vec2::new(28.0, 24.0), !self.redo.is_empty()).clicked() {
+                ur.context_menu(|ui| {
+                    let h = self.undo_history(12);
+                    if h.is_empty() {
+                        ui.weak("Nichts zum Zurücknehmen");
+                    }
+                    for (i, t) in h.iter().enumerate() {
+                        if ui.button(format!("{}. {t}", i + 1)).clicked() {
+                            self.undo_steps(i + 1);
+                            ui.close();
+                        }
+                    }
+                });
+                let rr = icon_button_sized(ui, I_REDO, "Wiederholen (Strg+Y) · Rechtsklick: Liste", false, 15.0, Vec2::new(28.0, 24.0), true);
+                if rr.clicked() {
                     self.do_redo();
                 }
+                rr.context_menu(|ui| {
+                    let h = self.redo_history(12);
+                    if h.is_empty() {
+                        ui.weak("Nichts zum Wiederherstellen");
+                    }
+                    for (i, t) in h.iter().enumerate() {
+                        if ui.button(format!("{}. {t}", i + 1)).clicked() {
+                            self.redo_steps(i + 1);
+                            ui.close();
+                        }
+                    }
+                });
                 sep(ui);
                 if icon_button_sized(ui, I_DELETE, "Löschen (Entf)", false, 15.0, Vec2::new(28.0, 24.0), self.selected.is_some()).clicked() {
                     self.delete_selection();
@@ -145,6 +195,34 @@ impl App {
                 let rec = self.feat.recorder.is_some();
                 if icon_button_sized(ui, I_MIC, if rec { "Aufnahme beenden" } else { "Sprecher aufnehmen (ab der Abspielposition)" }, rec, 15.0, Vec2::new(28.0, 24.0), true).clicked() {
                     self.toggle_recording();
+                }
+                sep(ui);
+                // Einfüge- und Mausmodus (Tasten 1–5 bzw. 6/7/8/0; Esc = Standard)
+                let im = self.insert_mode;
+                ui.menu_button(RichText::new(format!("Einfügen: {}", im.label())).size(11.5).color(if im == crate::ops::InsertMode::Auto { SECONDARY } else { ACCENT }), |ui| {
+                    for m in crate::ops::InsertMode::ALL {
+                        if ui.radio(self.insert_mode == m, format!("{}  ({})", m.label(), m.key())).clicked() {
+                            self.set_insert_mode(m);
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Einfügemodus: 1 Automatisch · 2 Einspur-Ripple · 3 Mehrspur-Ripple · 4 Austauschen (ersetzt das gewählte Objekt) · 5 Überschreiben");
+                let mm = self.mouse_mode;
+                ui.menu_button(RichText::new(format!("Maus: {}", mm.label())).size(11.5).color(if mm == crate::ops::MouseMode::Single { SECONDARY } else { ACCENT }), |ui| {
+                    for m in crate::ops::MouseMode::ALL {
+                        if ui.radio(self.mouse_mode == m, format!("{}  ({})", m.label(), m.key())).clicked() {
+                            self.set_mouse_mode(m);
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Mausmodus (Esc = zurück zum Standard): 6 Einzelne Objekte · 7 Alle Spuren · 8 Eine Spur · 0 Stretchen · Objektinhalt verschieben · Schneiden. In 7/8 rückt beim Verschieben und Kürzen alles dahinter mit.");
+                sep(ui);
+                if icon_button(ui, "\u{E80A}", if self.storyboard { "Zurück zur Zeitleiste (Strg+Alt+B)" } else { "Storyboard: Szenen als Raster, per Ziehen umsortieren (Strg+Alt+B)" }, self.storyboard).clicked() {
+                    self.storyboard = !self.storyboard;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(I_ZOOM_IN).font(FontId::new(15.0, icons())).color(Color32::from_gray(190)));
@@ -207,6 +285,8 @@ impl App {
 
     fn timeline_body(&mut self, ui: &mut Ui) {
         const BAR_W: f32 = 11.0;
+        let row_h = self.row_h;
+        let clip_h = row_h - 4.0;
         let full = ui.available_rect_before_wrap();
         self.tl_rect = full;
         let bg = ui.allocate_rect(full, Sense::click_and_drag());
@@ -215,7 +295,7 @@ impl App {
         let x0 = full.left() + HEADER_W;
         let top = full.top() + RULER_H;
         let ntr = self.project.tracks.len();
-        let content_h = ntr as f32 * ROW_H;
+        let content_h = ntr as f32 * row_h;
         let view_h = (full.height() - RULER_H - BAR_W).max(1.0);
         self.view_w = (full.width() - HEADER_W).max(100.0);
         let max_scroll = (content_h - view_h).max(0.0);
@@ -249,15 +329,15 @@ impl App {
 
         // Zeilen
         let drag_track_hint = self.tl.move_drag.as_ref().and_then(|d| self.project.find_clip(d.primary).map(|(t, _)| (t as isize + d.dtrack).clamp(0, ntr as isize - 1) as usize));
-        self.tl.hover_track = drag_track_hint.or_else(|| bg.hover_pos().filter(|p| p.y >= top && p.x >= full.left()).map(|p| ((p.y - top + self.scroll_y) / ROW_H) as usize).filter(|i| *i < ntr));
+        self.tl.hover_track = drag_track_hint.or_else(|| bg.hover_pos().filter(|p| p.y >= top && p.x >= full.left()).map(|p| ((p.y - top + self.scroll_y) / row_h) as usize).filter(|i| *i < ntr));
         for i in 0..ntr {
-            let y = top + i as f32 * ROW_H - self.scroll_y;
-            if y + ROW_H < top || y > full.bottom() {
+            let y = top + i as f32 * row_h - self.scroll_y;
+            if y + row_h < top || y > full.bottom() {
                 continue;
             }
-            let row = Rect::from_min_size(Pos2::new(x0, y), Vec2::new(full.right() - x0, ROW_H));
+            let row = Rect::from_min_size(Pos2::new(x0, y), Vec2::new(full.right() - x0, row_h));
             rows.rect_filled(row, 0.0, if i % 2 == 0 { TRACK } else { TRACK_ALT });
-            rows.line_segment([Pos2::new(x0, y + ROW_H), Pos2::new(full.right(), y + ROW_H)], Stroke::new(1.0, Color32::from_black_alpha(70)));
+            rows.line_segment([Pos2::new(x0, y + row_h), Pos2::new(full.right(), y + row_h)], Stroke::new(1.0, Color32::from_black_alpha(70)));
             if drag_track_hint == Some(i) {
                 rows.rect_filled(row, 0.0, ACCENT.gamma_multiply(0.12));
                 rows.rect_stroke(row, 0.0, Stroke::new(1.5, ACCENT.gamma_multiply(0.8)), StrokeKind::Inside);
@@ -273,8 +353,8 @@ impl App {
         let mut commit_trim = false;
         for (ti, c) in &all {
             let ti = *ti;
-            let y = top + ti as f32 * ROW_H - self.scroll_y;
-            if y + ROW_H < top || y > full.bottom() {
+            let y = top + ti as f32 * row_h - self.scroll_y;
+            if y + row_h < top || y > full.bottom() {
                 continue;
             }
             let (tl_, tr_) = if trim_ids.contains(&c.id) { (trim_dl, trim_dr) } else { (0.0, 0.0) };
@@ -283,7 +363,7 @@ impl App {
             if xa + w < x0 || xa > full.right() {
                 continue;
             }
-            let rect = Rect::from_min_size(Pos2::new(xa, y + 2.0), Vec2::new(w, CLIP_H));
+            let rect = Rect::from_min_size(Pos2::new(xa, y + 2.0), Vec2::new(w, clip_h));
             let vis = rect.intersect(area);
             let hidden_or_muted = self.project.tracks[ti].hidden || (c.is_audio() && self.project.tracks[ti].muted);
             let mut cp = ui.painter_at(vis);
@@ -308,7 +388,7 @@ impl App {
                         let i0 = ((from + x / pps_src) * bps) as usize;
                         let i1 = i0.max(((from + (x + step) / pps_src) * bps) as usize) + 1;
                         let m = peaks.get(i0..i1.min(peaks.len())).map(|s| s.iter().copied().fold(0.0f32, f32::max)).unwrap_or(0.0);
-                        let h = ((m * 1.4).min(1.0) * CLIP_H * 0.9).max(1.0);
+                        let h = ((m * 1.4).min(1.0) * clip_h * 0.9).max(1.0);
                         let cy = rect.center().y;
                         mesh.add_colored_rect(Rect::from_min_size(Pos2::new(rect.left() + x as f32, cy - h / 2.0), Vec2::new((step * 0.8).max(1.0) as f32, h)), col);
                         x += step;
@@ -317,8 +397,8 @@ impl App {
                 }
             } else if let Some(a) = c.asset_id().and_then(|a| self.project.asset(a)).cloned() {
                 if let Some(tex) = self.thumb(ui.ctx(), &a) {
-                    let tile_w = ROW_H * 16.0 / 9.0;
-                    let th = CLIP_H - 14.0;
+                    let tile_w = row_h * 16.0 / 9.0;
+                    let th = clip_h - 14.0;
                     let n = (rect.width() / tile_w).ceil() as usize + 1;
                     let ts = tex.size_vec2();
                     let k = (tile_w / ts.x).max(th / ts.y);
@@ -349,7 +429,7 @@ impl App {
                         continue;
                     }
                     let x = rect.left() + ((t - a) / c.speed * pps as f64) as f32;
-                    let h = if is_bar { CLIP_H } else { CLIP_H * 0.45 };
+                    let h = if is_bar { clip_h } else { clip_h * 0.45 };
                     cp.rect_filled(Rect::from_min_size(Pos2::new(x - if is_bar { 1.0 } else { 0.5 }, rect.bottom() - h), Vec2::new(if is_bar { 2.0 } else { 1.0 }, h)), 0.0, Color32::from_rgb(255, 140, 38).gamma_multiply(if is_bar { 1.0 } else { 0.7 }));
                 }
             }
@@ -357,7 +437,7 @@ impl App {
             let (xin, _) = self.project.overlaps(c.id);
             if xin > 0.0 {
                 let cw = (xin * self.zoom) as f32;
-                let r = Rect::from_min_size(rect.min, Vec2::new(cw, CLIP_H));
+                let r = Rect::from_min_size(rect.min, Vec2::new(cw, clip_h));
                 let line = Stroke::new(1.0, Color32::from_white_alpha(200));
                 cp.rect_filled(r, 0.0, Color32::from_white_alpha(46));
                 // Zeichen je Art: Kreuz = Überblenden, V = Schwarz-/Weißblende, Pfeil = Wischen/Schieben, Rahmen = Zoom/Iris
@@ -375,7 +455,7 @@ impl App {
                         cp.line_segment([b, b - dir * 6.0 - n * 4.0], line);
                     }
                     "zoom" | "iris" => {
-                        cp.rect_stroke(r.shrink2(Vec2::new((cw * 0.25).min(20.0), CLIP_H * 0.25)), 2.0, line, StrokeKind::Inside);
+                        cp.rect_stroke(r.shrink2(Vec2::new((cw * 0.25).min(20.0), clip_h * 0.25)), 2.0, line, StrokeKind::Inside);
                     }
                     _ => {
                         cp.line_segment([r.left_top(), r.right_bottom()], line);
@@ -392,11 +472,11 @@ impl App {
             let mut line_pts: Vec<Pos2> = vec![];
             if has_line {
                 for t in volume::breakpoints(c) {
-                    line_pts.push(Pos2::new(rect.left() + (t * self.zoom) as f32, rect.top() + volume::y_of(c.curve_gain(t), CLIP_H as f64, max_g) as f32));
+                    line_pts.push(Pos2::new(rect.left() + (t * self.zoom) as f32, rect.top() + volume::y_of(c.curve_gain(t), clip_h as f64, max_g) as f32));
                 }
                 cp.add(Shape::line(line_pts.clone(), Stroke::new(1.5, YELLOW.gamma_multiply(0.9))));
                 for p in &c.volume_points {
-                    let pt = Pos2::new(rect.left() + (p.t * self.zoom) as f32, rect.top() + volume::y_of(p.gain, CLIP_H as f64, max_g) as f32);
+                    let pt = Pos2::new(rect.left() + (p.t * self.zoom) as f32, rect.top() + volume::y_of(p.gain, clip_h as f64, max_g) as f32);
                     cp.circle(pt, 4.0, Color32::WHITE, Stroke::new(1.0, Color32::BLACK));
                 }
             }
@@ -411,8 +491,8 @@ impl App {
                 cp.add(Shape::convex_polygon(vec![rect.right_top(), rect.right_top() - Vec2::new(fw, 0.0), rect.right_bottom()], shade, Stroke::NONE));
             }
             // Anfasser zum Kürzen
-            cp.rect_filled(Rect::from_min_size(rect.left_top() + Vec2::new(2.5, 0.0), Vec2::new(2.0, CLIP_H)), 0.0, Color32::from_white_alpha(90));
-            cp.rect_filled(Rect::from_min_size(rect.right_top() + Vec2::new(-4.5, 0.0), Vec2::new(2.0, CLIP_H)), 0.0, Color32::from_white_alpha(90));
+            cp.rect_filled(Rect::from_min_size(rect.left_top() + Vec2::new(2.5, 0.0), Vec2::new(2.0, clip_h)), 0.0, Color32::from_white_alpha(90));
+            cp.rect_filled(Rect::from_min_size(rect.right_top() + Vec2::new(-4.5, 0.0), Vec2::new(2.0, clip_h)), 0.0, Color32::from_white_alpha(90));
             let selected = sel_set.contains(&c.id);
             cp.rect_stroke(rect, 3.0, if selected { Stroke::new(2.0, YELLOW) } else { Stroke::new(1.0, Color32::from_black_alpha(100)) }, StrokeKind::Inside);
             let fi_x = rect.left() + (c.fade_in * self.zoom) as f32;
@@ -428,8 +508,20 @@ impl App {
             let locked = self.project.tracks[ti].locked;
             let body = ui.interact(vis, cid.with("body"), Sense::click_and_drag());
             if body.clicked() {
-                let (shift, cmd) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
-                self.select(c.id, shift || cmd);
+                if self.mouse_mode == crate::ops::MouseMode::Razor && !locked {
+                    // Schneiden und Trimmen: Klick teilt den Clip an der Mausposition (bildgenau)
+                    if let Some(p) = body.interact_pointer_pos() {
+                        let fps = self.project.fps.max(1) as f64;
+                        let t = (self.x2t(x0, p.x) * fps).round() / fps;
+                        self.select(c.id, false);
+                        if self.project.split(c.id, t).is_none() {
+                            self.status = "Hier kann nicht geteilt werden.".into();
+                        }
+                    }
+                } else {
+                    let (shift, cmd) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+                    self.select(c.id, shift || cmd);
+                }
                 self.sel_track = ti;
             }
             if body.double_clicked() && has_line && !locked {
@@ -444,14 +536,15 @@ impl App {
                 }
             }
             let origin = ui.input(|i| i.pointer.press_origin());
-            if body.drag_started() && !locked {
+            if body.drag_started() && !locked && self.mouse_mode != crate::ops::MouseMode::Razor {
                 let press = origin.unwrap_or(body.interact_pointer_pos().unwrap_or(rect.center()));
                 let near_line = has_line && line_pts.windows(2).any(|w| dist_to_segment(press, w[0], w[1]) < 7.0) && !alt;
                 if near_line {
                     let press_t = ((press.x - rect.left()) as f64 / self.zoom).clamp(0.0, c.duration);
                     let start = volume::begin_line(c, press_t, 8.0 / self.zoom);
                     self.tl.vol = Some(VolDrag { clip: c.id, start, max_g });
-                } else if alt && !self.project.is_still(c) {
+                } else if (alt || self.mouse_mode == crate::ops::MouseMode::Slip) && !self.project.is_still(c) {
+                    // Objektinhalt verschieben (Alt + Ziehen bzw. Mausmodus): Quellausschnitt verschieben, Lage und Länge bleiben
                     self.tl.slip = Some((c.id, 0.0));
                 } else {
                     if !sel_set.contains(&c.id) {
@@ -468,7 +561,7 @@ impl App {
                 if let (Some(cur), Some(press)) = (ui.input(|i| i.pointer.latest_pos()), origin) {
                     let (dx, dy) = (cur.x - press.x, cur.y - press.y);
                     if let Some(v) = self.tl.vol.clone().filter(|v| v.clip == c.id) {
-                        let gain = volume::gain_at_y(cur.y as f64 - rect.top() as f64, CLIP_H as f64, v.max_g);
+                        let gain = volume::gain_at_y(cur.y as f64 - rect.top() as f64, clip_h as f64, v.max_g);
                         let r = volume::line_drag(&v.start, gain, v.max_g);
                         if let Some(cl) = self.project.clip_mut(c.id) {
                             cl.volume_points = v.start.points.clone();
@@ -495,8 +588,25 @@ impl App {
                         let de = e_t.map(|t| (t - (raw + c.duration)).abs()).unwrap_or(f64::INFINITY);
                         let start = if ds <= de && s_t.is_some() { s_t.unwrap() } else if let Some(e) = e_t { e - c.duration } else { raw };
                         self.tl.snap_guide = if ds <= de { s_t } else { e_t };
-                        let dt = start.max(0.0) - c.start;
-                        let dtrack = if self.mouse_mode == crate::ops::MouseMode::Single { (dy / ROW_H).round() as isize } else { 0 };
+                        // die ganze Auswahl darf nicht vor 0 rutschen (alle bewegen sich gemeinsam)
+                        let first = md.ids.iter().filter_map(|i| self.project.clip(*i)).map(|x| x.start).fold(c.start, f64::min);
+                        let mut dt = (start - c.start).max(-first);
+                        // Spurwechsel mit Trägheit: erst bei deutlich mehr als einer halben Zeile (kein Springen an der Kante)
+                        let dy_rows = dy / row_h;
+                        let mut dtrack = if self.mouse_mode.moves_freely() { if (dy_rows - md.dtrack as f32).abs() < 0.62 { md.dtrack } else { dy_rows.round() as isize } } else { 0 };
+                        // Vorschau = Ergebnis: ist die Stelle nicht erlaubt, bleibt die letzte gültige Lage (kein Zurückspringen beim Loslassen)
+                        let valid = |x: f64, y: isize| self.project.clone().move_clips(&md.ids, y, x);
+                        if !valid(dt, dtrack) {
+                            if dtrack != md.dtrack && valid(dt, md.dtrack) {
+                                dtrack = md.dtrack;
+                            } else if dtrack != 0 && valid(dt, 0) {
+                                dtrack = 0;
+                            } else if valid(md.dt, md.dtrack) {
+                                (dt, dtrack) = (md.dt, md.dtrack);
+                            } else {
+                                (dt, dtrack) = (0.0, 0);
+                            }
+                        }
                         self.tl.move_drag = Some(MoveDrag { dt, dtrack, ..md });
                     }
                 }
@@ -539,7 +649,7 @@ impl App {
             }
             // Kürzen
             for left in [true, false] {
-                let hr = if left { Rect::from_min_size(rect.left_top(), Vec2::new(7.0, CLIP_H)) } else { Rect::from_min_size(rect.right_top() - Vec2::new(7.0, 0.0), Vec2::new(7.0, CLIP_H)) };
+                let hr = if left { Rect::from_min_size(rect.left_top(), Vec2::new(7.0, clip_h)) } else { Rect::from_min_size(rect.right_top() - Vec2::new(7.0, 0.0), Vec2::new(7.0, clip_h)) };
                 let hr = Rect::from_min_max(hr.min + Vec2::new(0.0, 12.0), hr.max).intersect(vis.expand(1.0));
                 if hr.width() <= 0.0 {
                     continue;
@@ -548,7 +658,15 @@ impl App {
                 if resp.hovered() || resp.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
-                if resp.drag_started() && !locked {
+                if resp.drag_started() && !locked && self.mouse_mode == crate::ops::MouseMode::Stretch {
+                    // Stretchen: der ganze Ausschnitt wird auf die neue Länge gedehnt (das Tempo ändert sich)
+                    self.select(c.id, false);
+                    let mut ids = HashSet::from([c.id]);
+                    ids.extend(self.project.partner_id(c.id));
+                    let edge = if left { c.start } else { c.end() };
+                    self.tl.trim = Some(TrimDrag { id: c.id, ids, left, dl: 0.0, dr: 0.0, wanted: edge, opts: Default::default() });
+                    self.tl.stretch = Some(StretchDrag { id: c.id, left, target: edge });
+                } else if resp.drag_started() && !locked && self.mouse_mode != crate::ops::MouseMode::Razor {
                     self.select(c.id, false);
                     // Alt = J-L-Schnitt (nur Bild oder nur Ton), Strg = Roll, sonst Ripple nach Mausmodus
                     let (alt_k, cmd_k) = ui.input(|i| (i.modifiers.alt, i.modifiers.command));
@@ -558,11 +676,7 @@ impl App {
                     } else if cmd_k && self.project.roll_neighbor(c.id, left).is_some() {
                         opts.roll = true;
                     } else {
-                        opts.ripple = match self.mouse_mode {
-                            crate::ops::MouseMode::OneTrack => crate::ops::RippleScope::Track,
-                            crate::ops::MouseMode::AllTracks => crate::ops::RippleScope::All,
-                            crate::ops::MouseMode::Single => crate::ops::RippleScope::None,
-                        };
+                        opts.ripple = self.mouse_mode.ripple();
                     }
                     let mut ids = HashSet::from([c.id]);
                     if opts.linked {
@@ -570,7 +684,22 @@ impl App {
                     }
                     self.tl.trim = Some(TrimDrag { id: c.id, ids, left, dl: 0.0, dr: 0.0, wanted: if left { c.start } else { c.end() }, opts });
                 }
-                if resp.dragged() {
+                if resp.dragged() && self.tl.stretch.is_some_and(|s| s.id == c.id && s.left == left) {
+                    if let (Some(tr), Some(cur), Some(press)) = (self.tl.trim.clone(), ui.input(|i| i.pointer.latest_pos()), origin) {
+                        let edge = if left { c.start } else { c.end() } + (cur.x - press.x) as f64 / self.zoom;
+                        let wanted = self.snap_time_alt(edge, &tr.ids, alt);
+                        let mut p = self.project.clone();
+                        if p.stretch(c.id, left, wanted) {
+                            if let Some(nc) = p.clip(c.id) {
+                                self.tl.trim = Some(TrimDrag { dl: nc.start - c.start, dr: nc.end() - c.end(), wanted, ..tr });
+                                self.tl.stretch = Some(StretchDrag { id: c.id, left, target: wanted });
+                                if !self.project.is_still(c) {
+                                    self.status = format!("Stretchen: Tempo {:.2}× · Länge {:.2} s", nc.speed, nc.duration);
+                                }
+                            }
+                        }
+                    }
+                } else if resp.dragged() {
                     if let (Some(tr), Some(cur), Some(press)) = (self.tl.trim.clone().filter(|t| t.id == c.id && t.left == left), ui.input(|i| i.pointer.latest_pos()), origin) {
                         let dt = (cur.x - press.x) as f64 / self.zoom;
                         let edge = if left { c.start } else { c.end() } + dt;
@@ -603,7 +732,7 @@ impl App {
             // Mitte der Linienstücke: senkrecht ziehen
             if has_line && !locked {
                 for (st, g, idx) in volume::segments(c) {
-                    let pt = Pos2::new(rect.left() + (st * self.zoom) as f32, rect.top() + volume::y_of(g, CLIP_H as f64, max_g) as f32);
+                    let pt = Pos2::new(rect.left() + (st * self.zoom) as f32, rect.top() + volume::y_of(g, clip_h as f64, max_g) as f32);
                     if !vis.contains(pt) {
                         continue;
                     }
@@ -615,7 +744,7 @@ impl App {
                     }
                     if sr.dragged() {
                         if let (Some(v), Some(cur), Some(press)) = (self.tl.vol.clone().filter(|v| v.clip == c.id), ui.input(|i| i.pointer.latest_pos()), origin) {
-                            let d = -((cur.y - press.y) as f64) / (CLIP_H as f64 - 2.0 * volume::INSET) * v.max_g;
+                            let d = -((cur.y - press.y) as f64) / (clip_h as f64 - 2.0 * volume::INSET) * v.max_g;
                             let r = volume::segment_drag(&v.start, idx, d, v.max_g);
                             if let Some(cl) = self.project.clip_mut(c.id) {
                                 cl.volume_points = v.start.points.clone();
@@ -678,6 +807,64 @@ impl App {
                     });
                     ui.separator();
                 }
+                // Bearbeiten (wie im Bearbeiten-Menü; ein nicht gewählter Clip wird zuerst gewählt)
+                let ensure = |s: &mut App| {
+                    if !s.selected_set().contains(&cc.id) {
+                        s.select(cc.id, false);
+                    }
+                };
+                if ui.button("Ausschneiden").clicked() {
+                    ensure(self);
+                    self.cut_clips();
+                    ui.close();
+                }
+                if ui.button("Kopieren").clicked() {
+                    ensure(self);
+                    self.copy_clips();
+                    ui.close();
+                }
+                if ui.add_enabled(!self.clipboard.is_empty(), egui::Button::new("Einfügen")).clicked() {
+                    self.paste_clips();
+                    ui.close();
+                }
+                if ui.button("Duplizieren").clicked() {
+                    ensure(self);
+                    self.duplicate_clips();
+                    ui.close();
+                }
+                ui.separator();
+                let inside = self.playhead > cc.start + 0.01 && self.playhead < cc.end() - 0.01;
+                if ui.add_enabled(inside, egui::Button::new("Zerschneiden an der Abspielposition")).clicked() {
+                    self.select(cc.id, false);
+                    self.split_at_playhead();
+                    ui.close();
+                }
+                if ui.add_enabled(inside, egui::Button::new("Anfang entfernen (bis zur Abspielposition)")).clicked() {
+                    self.select(cc.id, false);
+                    self.trim_selection_to_playhead(true);
+                    ui.close();
+                }
+                if ui.add_enabled(inside, egui::Button::new("Ende entfernen (ab der Abspielposition)")).clicked() {
+                    self.select(cc.id, false);
+                    self.trim_selection_to_playhead(false);
+                    ui.close();
+                }
+                if ui.button("Szene entfernen (Lücke schließen)").clicked() {
+                    ensure(self);
+                    self.ripple_delete_selection();
+                    ui.close();
+                }
+                if cc.group.is_none() && ui.add_enabled(self.selected_set().len() >= 2, egui::Button::new("Gruppe bilden")).clicked() {
+                    ensure(self);
+                    self.group_selection();
+                    ui.close();
+                }
+                if !cc.is_audio() && ui.button("Zoom auf diesen Clip").clicked() {
+                    self.select(cc.id, false);
+                    self.zoom_to_selection();
+                    ui.close();
+                }
+                ui.separator();
                 if cc.part == ClipPart::Video && !cc.is_title() && ui.button("Szenen erkennen und teilen").clicked() {
                     self.detect_scenes(cc.id);
                     ui.close();
@@ -715,8 +902,13 @@ impl App {
             self.tl.snap_guide = None;
         }
         if commit_trim {
+            let stretch = self.tl.stretch.take();
             if let Some(tr) = self.tl.trim.take() {
-                if tr.dl.abs() > 1e-9 || tr.dr.abs() > 1e-9 {
+                if let Some(s) = stretch {
+                    if tr.dl.abs() > 1e-9 || tr.dr.abs() > 1e-9 {
+                        self.project.stretch(s.id, s.left, s.target);
+                    }
+                } else if tr.dl.abs() > 1e-9 || tr.dr.abs() > 1e-9 {
                     if tr.left {
                         self.project.trim_start_opt(tr.id, tr.wanted, &tr.opts);
                     } else {
@@ -736,7 +928,7 @@ impl App {
         let pointer = ui.input(|i| i.pointer.latest_pos());
         let drag_target: Option<crate::ops::Junction> = match pointer {
             Some(pos) if (trans_hover.is_some() || trans_drop.is_some()) && pos.x >= x0 && pos.y >= top && ntr > 0 => {
-                let row = (((pos.y - top + self.scroll_y) / ROW_H).floor().max(0.0) as usize).min(ntr - 1);
+                let row = (((pos.y - top + self.scroll_y) / row_h).floor().max(0.0) as usize).min(ntr - 1);
                 self.junction_near(self.x2t(x0, pos.x), row)
             }
             _ => None,
@@ -745,8 +937,8 @@ impl App {
             self.apply_transition(j.a, j.b, Some(&d.0), None);
         }
         for tr in 0..ntr {
-            let y = top + tr as f32 * ROW_H - self.scroll_y;
-            if y + ROW_H < top || y > full.bottom() {
+            let y = top + tr as f32 * row_h - self.scroll_y;
+            if y + row_h < top || y > full.bottom() {
                 continue;
             }
             for j in self.project.junctions(tr) {
@@ -812,14 +1004,23 @@ impl App {
                 if t2 < 0 || t2 as usize >= ntr {
                     continue;
                 }
-                let y = top + t2 as f32 * ROW_H - self.scroll_y;
+                let y = top + t2 as f32 * row_h - self.scroll_y;
                 let xa = self.t2x(x0, c.start + md.dt);
-                let r = Rect::from_min_size(Pos2::new(xa, y + 2.0), Vec2::new(((c.duration * self.zoom) as f32).max(6.0), CLIP_H));
+                let r = Rect::from_min_size(Pos2::new(xa, y + 2.0), Vec2::new(((c.duration * self.zoom) as f32).max(6.0), clip_h));
                 let gp = rows.clone();
                 gp.rect_filled(r, 3.0, Self::clip_color(c).gamma_multiply(0.9));
                 gp.rect_stroke(r, 3.0, Stroke::new(2.0, YELLOW), StrokeKind::Inside);
                 let name = if c.is_title() { "T".to_string() } else { c.asset_id().and_then(|a| self.project.asset(a)).map(|a| a.name.clone()).unwrap_or_default() };
                 gp.text(r.left_top() + Vec2::new(16.0, 3.0), Align2::LEFT_TOP, name, FontId::proportional(10.0), Color32::WHITE);
+                // Positionsanzeige (Handbuch: Stunden:Minuten:Sekunden:Bild)
+                if c.id == md.primary {
+                    let txt = timecode((c.start + md.dt).max(0.0), self.project.fps);
+                    let g = ui.painter().layout_no_wrap(txt, FontId::monospace(11.0), Color32::BLACK);
+                    let lr = Rect::from_min_size(Pos2::new(r.left(), (r.top() - 18.0).max(top)), g.size() + Vec2::new(10.0, 4.0));
+                    let tp = ui.painter_at(full);
+                    tp.rect_filled(lr, 4.0, YELLOW);
+                    tp.galley(lr.min + Vec2::new(5.0, 2.0), g, Color32::BLACK);
+                }
             }
         }
 
@@ -830,26 +1031,40 @@ impl App {
             let aid = da.id;
             if pos.x >= x0 && pos.y >= top {
                 if let Some(a) = self.project.asset(aid).cloned() {
-                    let ti = (((pos.y - top + self.scroll_y) / ROW_H).floor().max(0.0) as usize).min(ntr - 1);
+                    let ti = (((pos.y - top + self.scroll_y) / row_h).floor().max(0.0) as usize).min(ntr - 1);
                     let raw = self.x2t(x0, pos.x).max(0.0);
                     let start = self.snap_time(ui, raw, &HashSet::new()).max(0.0);
                     self.tl.hover_track = Some(ti);
                     let both = a.has_video && a.has_audio && !a.is_image;
-                    let ghost_dur = da.range.map(|r| r.1 - r.0).unwrap_or(a.duration);
+                    // mehrere Medien aus dem Pool: nacheinander ab der Ablageposition
+                    let many: Vec<Uuid> = if self.pool.dragging.len() > 1 && self.pool.dragging.contains(&aid) { self.pool.dragging.clone() } else { vec![] };
+                    let ghost_dur = if many.is_empty() { da.range.map(|r| r.1 - r.0).unwrap_or(a.duration) } else { many.iter().filter_map(|i| self.project.asset(*i)).map(|a| a.duration).sum() };
                     let ghost = |track: usize, label: &str| {
-                        let y = top + track as f32 * ROW_H - self.scroll_y;
+                        let y = top + track as f32 * row_h - self.scroll_y;
                         let xa = self.t2x(x0, start);
-                        let r = Rect::from_min_max(Pos2::new(xa, y + 2.0), Pos2::new((xa + (ghost_dur * self.zoom) as f32).max(xa + 6.0), y + ROW_H - 2.0));
+                        let r = Rect::from_min_max(Pos2::new(xa, y + 2.0), Pos2::new((xa + (ghost_dur * self.zoom) as f32).max(xa + 6.0), y + row_h - 2.0));
                         rows.rect_filled(r, 3.0, ACCENT.gamma_multiply(0.25));
                         rows.rect_stroke(r, 3.0, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
                         rows.text(r.left_top() + Vec2::new(4.0, 3.0), Align2::LEFT_TOP, label, FontId::proportional(10.5), Color32::WHITE);
                     };
-                    ghost(ti, &format!("Spur {}", ti + 1));
+                    ghost(ti, &if many.is_empty() { format!("Spur {}", ti + 1) } else { format!("Spur {} · {} Medien", ti + 1, many.len()) });
                     if both {
                         ghost(ti + 1, "Ton");
                     }
                     if let Some(d) = dropped {
-                        self.add_to_timeline(d.id, Some(ti), Some(start), d.range);
+                        if many.is_empty() {
+                            self.add_to_timeline(d.id, Some(ti), Some(start), d.range);
+                        } else {
+                            // jedes hinter das vorige
+                            let mut t = start;
+                            for id in &many {
+                                self.add_to_timeline(*id, Some(ti), Some(t), None);
+                                if let Some(c) = self.selected.and_then(|s| self.project.clip(s)) {
+                                    t = c.end();
+                                }
+                            }
+                        }
+                        self.pool.dragging.clear();
                         self.sel_track = ti;
                         self.tl.snap_guide = None;
                     }
@@ -876,26 +1091,64 @@ impl App {
         let head_clip = ui.painter_at(Rect::from_min_max(Pos2::new(full.left(), top), Pos2::new(x0, full.bottom())));
         let mut track_action: Option<(usize, u8)> = None;
         for i in 0..ntr {
-            let y = top + i as f32 * ROW_H - self.scroll_y;
-            if y + ROW_H < top || y > full.bottom() {
+            let y = top + i as f32 * row_h - self.scroll_y;
+            if y + row_h < top || y > full.bottom() {
                 continue;
             }
-            let r = Rect::from_min_size(Pos2::new(full.left(), y), Vec2::new(HEADER_W, ROW_H));
+            let r = Rect::from_min_size(Pos2::new(full.left(), y), Vec2::new(HEADER_W, row_h));
             head_clip.rect_filled(r, 0.0, if i % 2 == 0 { PANEL } else { HEADER_ALT });
             head_clip.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, Color32::from_black_alpha(70)));
+            let is_target = self.target_track == Some(i);
             let hot = self.tl.hover_track == Some(i) || self.sel_track == i;
-            head_clip.text(Pos2::new(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, format!("{}", i + 1), FontId::proportional(if hot { 19.0 } else { 16.0 }), if hot { ACCENT } else { SECONDARY });
+            head_clip.text(Pos2::new(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, format!("{}", i + 1), FontId::proportional(if hot { 19.0 } else { 16.0 }), if hot || is_target { ACCENT } else { SECONDARY });
             let (muted, solo, hidden, locked) = {
                 let t = &self.project.tracks[i];
                 (t.muted, t.solo == Some(true), t.hidden, t.locked)
             };
+            // Spurfarbe als Streifen links, Name bzw. „Ziel“ oben, Hinweis auf Spurregler
+            let tr_info = self.project.tracks[i].clone();
+            if let Some(c) = tr_info.color.as_deref().and_then(|n| TRACK_COLORS.iter().find(|t| t.0 == n)) {
+                head_clip.rect_filled(Rect::from_min_size(r.min, Vec2::new(4.0, row_h)), 0.0, Color32::from_rgb(c.2[0], c.2[1], c.2[2]));
+            }
+            if row_h >= 46.0 {
+                let label = tr_info.custom_name().map(str::to_string).or_else(|| is_target.then(|| "Ziel".to_string()));
+                if let Some(l) = label {
+                    let col = if tr_info.custom_name().is_some() { Color32::from_gray(185) } else { ACCENT };
+                    head_clip.text(Pos2::new(r.left() + 31.0, r.top() + 8.0), Align2::LEFT_CENTER, l, FontId::proportional(9.5), col);
+                }
+            }
+            if tr_info.gain() < 0.999 || tr_info.alpha() < 0.999 || tr_info.gain() > 1.001 {
+                head_clip.circle_filled(Pos2::new(r.right() - 7.0, r.top() + 8.0), 3.0, ACCENT);
+            }
+            if is_target {
+                head_clip.rect_stroke(r.shrink(1.5), 2.0, Stroke::new(1.5, ACCENT.gamma_multiply(0.8)), StrokeKind::Inside);
+            }
             let mut x = r.left() + 30.0;
             let cy = r.center().y;
             let hs = ui.interact(r.intersect(head_clip.clip_rect()), ui.id().with(("trkhead", i)), Sense::click());
-            if hs.clicked() {
+            if hs.double_clicked() {
+                // der erste Klick des Doppelklicks hat die Zielspur umgeschaltet: zurücknehmen
+                self.toggle_target_track(i);
+                track_action = Some((i, 3));
+            } else if hs.clicked() {
                 self.sel_track = i;
+                self.toggle_target_track(i);
             }
+            let hs = hs.on_hover_text(format!(
+                "{}Klick: Zielspur für das Einfügen ein/aus · Doppelklick: umbenennen · Rechtsklick: Spurmenü{}",
+                tr_info.custom_name().map(|n| format!("{n}\n")).unwrap_or_default(),
+                if tr_info.gain() != 1.0 || tr_info.alpha() != 1.0 { format!("\nSpur-Regler: Lautstärke {:.0} %, Deckkraft {:.0} %", tr_info.gain() * 100.0, tr_info.alpha() * 100.0) } else { String::new() }
+            ));
             hs.context_menu(|ui| {
+                if ui.button("Umbenennen …").clicked() {
+                    track_action = Some((i, 3));
+                    ui.close();
+                }
+                if ui.button(if is_target { "Zielspur aufheben" } else { "Als Zielspur für Einfügen festlegen" }).clicked() {
+                    track_action = Some((i, 4));
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Spur darüber einfügen").clicked() {
                     track_action = Some((i, 0));
                     ui.close();
@@ -908,6 +1161,43 @@ impl App {
                     track_action = Some((i, 2));
                     ui.close();
                 }
+                ui.separator();
+                ui.menu_button("Spurfarbe", |ui| {
+                    if ui.radio(tr_info.color.is_none(), "Keine").clicked() {
+                        self.project.tracks[i].color = None;
+                        ui.close();
+                    }
+                    for (name, label, _) in TRACK_COLORS {
+                        if ui.radio(tr_info.color.as_deref() == Some(name), label).clicked() {
+                            self.project.tracks[i].color = Some(name.to_string());
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Spurhöhe (alle Spuren)", |ui| {
+                    for (h, label) in [(36.0, "Klein"), (54.0, "Normal"), (84.0, "Groß")] {
+                        if ui.radio((self.row_h - h).abs() < 0.5, label).clicked() {
+                            self.set_track_height(h);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Lautstärke der Spur", |ui| {
+                    for v in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5] {
+                        if ui.radio((tr_info.gain() - v).abs() < 0.01, format!("{:.0} %", v * 100.0)).clicked() {
+                            self.project.tracks[i].volume = (v != 1.0).then_some(v);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Deckkraft der Spur", |ui| {
+                    for v in [1.0, 0.75, 0.5, 0.25, 0.0] {
+                        if ui.radio((tr_info.alpha() - v).abs() < 0.01, format!("{:.0} %", v * 100.0)).clicked() {
+                            self.project.tracks[i].opacity = (v != 1.0).then_some(v);
+                            ui.close();
+                        }
+                    }
+                });
             });
             let mut flag = |ui: &mut Ui, id: &str, w: f32, tip: &str, draw: &dyn Fn(&egui::Painter, Rect, bool)| -> bool {
                 let rr = Rect::from_center_size(Pos2::new(x + w / 2.0, cy), Vec2::new(w + 4.0, 22.0));
@@ -958,13 +1248,73 @@ impl App {
             match k {
                 0 => self.insert_track_at(i),
                 1 => self.insert_track_at(i + 1),
+                3 => self.begin_track_rename(i),
+                4 => self.toggle_target_track(i),
                 _ => self.remove_track(i),
             }
         }
 
         // ---------- Lineal ----------
-        let ruler = Rect::from_min_size(full.min, Vec2::new(full.width(), RULER_H));
+        let ruler = Rect::from_min_size(full.min, Vec2::new(full.width(), SCALE_H));
         painter.rect_filled(ruler, 0.0, BAR);
+        // Bereichsleiste unter der Skala: Abspielbereich zwischen I und O, mit der Maus setzen und ziehen
+        let bar = Rect::from_min_max(Pos2::new(x0, full.top() + SCALE_H), Pos2::new(full.right(), top));
+        painter.rect_filled(Rect::from_min_max(Pos2::new(full.left(), bar.top()), bar.max), 0.0, Color32::from_rgb(40, 43, 48));
+        {
+            let bp = ui.painter_at(bar);
+            let (mi, mo) = (self.project.mark_in, self.project.mark_out);
+            if mi.is_some() || mo.is_some() {
+                let xa = self.t2x(x0, mi.unwrap_or(0.0));
+                let xb = self.t2x(x0, mo.unwrap_or(self.project.duration()));
+                bp.rect_filled(Rect::from_min_max(Pos2::new(xa, bar.top() + 1.5), Pos2::new(xb.max(xa + 3.0), bar.bottom() - 1.5)), 2.0, ACCENT);
+                if mi.is_some() {
+                    bp.rect_filled(Rect::from_min_size(Pos2::new(xa - 1.0, bar.top()), Vec2::new(3.0, bar.height())), 0.0, Color32::WHITE);
+                }
+                if mo.is_some() {
+                    bp.rect_filled(Rect::from_min_size(Pos2::new(xb - 2.0, bar.top()), Vec2::new(3.0, bar.height())), 0.0, Color32::WHITE);
+                }
+            }
+            if self.loop_range {
+                bp.text(Pos2::new(bar.right() - 4.0, bar.center().y), Align2::RIGHT_CENTER, "⟲", FontId::proportional(10.0), ACCENT);
+            }
+            let br = ui.interact(bar, ui.id().with("rangebar"), Sense::click_and_drag()).on_hover_text("Abspielbereich: Klick setzt den Anfang, Umschalt-Klick das Ende; Enden und Band lassen sich ziehen (I/O wie gewohnt)");
+            let pps = self.zoom;
+            let shift = ui.input(|i| i.modifiers.shift);
+            if br.drag_started() || br.clicked() {
+                if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+                    let st = self.x2t(x0, p.x).max(0.0);
+                    let tol = 7.0 / pps;
+                    let mode = match (self.project.mark_in, self.project.mark_out) {
+                        (Some(i), _) if (st - i).abs() <= tol => 1,
+                        (_, Some(o)) if (st - o).abs() <= tol => 2,
+                        (Some(i), Some(o)) if st > i && st < o && br.drag_started() => 3,
+                        _ if shift => 2,
+                        _ => 1,
+                    };
+                    let grab = self.project.mark_in.map_or(0.0, |i| st - i);
+                    self.tl.range_drag = Some(RangeDrag { mode, grab });
+                }
+            }
+            if let (Some(rd), Some(p)) = (self.tl.range_drag, ui.input(|i| i.pointer.latest_pos())) {
+                let t = self.x2t(x0, p.x).max(0.0);
+                let alt = Self::alt_down(ui);
+                let s = self.snap_target(t, &HashSet::new(), alt).unwrap_or(t);
+                match rd.mode {
+                    1 => self.project.mark_in = Some(s.max(0.0).min(self.project.mark_out.unwrap_or(f64::INFINITY) - 0.05)),
+                    2 => self.project.mark_out = Some(s.max(self.project.mark_in.unwrap_or(0.0) + 0.05)),
+                    _ => {
+                        if let (Some(i), Some(o)) = (self.project.mark_in, self.project.mark_out) {
+                            let ni = (t - rd.grab).max(0.0);
+                            self.project.mark_in = Some(ni);
+                            self.project.mark_out = Some(ni + (o - i));
+                        }
+                    }
+                }
+                if br.drag_stopped() || br.clicked() || !ui.input(|i| i.pointer.any_down()) {
+                    self.tl.range_drag = None;
+                }
+            }
+        }
         let rp = ui.painter_at(Rect::from_min_max(Pos2::new(x0, full.top()), Pos2::new(full.right(), top)));
         let steps = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
         let step = steps.iter().copied().find(|s| s * self.zoom >= 70.0).unwrap_or(600.0);
@@ -1137,7 +1487,7 @@ impl App {
         let press = ui.input(|i| i.pointer.press_origin());
         if bg.drag_started() {
             if let Some(p) = press.filter(|p| !on_bar(*p)) {
-                if p.x >= x0 && p.y < top {
+                if p.x >= x0 && p.y < full.top() + SCALE_H {
                     self.tl.scrubbing = true;
                 } else if p.x >= x0 && p.y >= top {
                     self.tl.marquee = Some((p, p));
@@ -1153,8 +1503,8 @@ impl App {
                     let r = Rect::from_two_pos(a, p);
                     let mut hit = HashSet::new();
                     for (ti, c) in &all {
-                        let y0 = top + *ti as f32 * ROW_H - self.scroll_y;
-                        let cr = Rect::from_min_size(Pos2::new(self.t2x(x0, c.start), y0), Vec2::new(((c.duration * self.zoom) as f32).max(1.0), ROW_H));
+                        let y0 = top + *ti as f32 * row_h - self.scroll_y;
+                        let cr = Rect::from_min_size(Pos2::new(self.t2x(x0, c.start), y0), Vec2::new(((c.duration * self.zoom) as f32).max(1.0), row_h));
                         if cr.intersects(r) {
                             hit.insert(c.id);
                         }
@@ -1172,12 +1522,12 @@ impl App {
         if bg.clicked() {
             if let Some(p) = bg.interact_pointer_pos().filter(|p| !on_bar(*p)) {
                 if p.y < top {
-                    if p.x >= x0 {
+                    if p.x >= x0 && p.y < full.top() + SCALE_H {
                         self.seek_snapped(ui, x0, p.x);
                         self.tl.snap_guide = None;
                     }
                 } else {
-                    let i = ((p.y - top + self.scroll_y) / ROW_H) as usize;
+                    let i = ((p.y - top + self.scroll_y) / row_h) as usize;
                     if i < ntr {
                         self.sel_track = i;
                     }

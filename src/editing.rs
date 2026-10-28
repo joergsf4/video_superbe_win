@@ -68,8 +68,14 @@ impl App {
         let Some(a) = self.project.asset(aid).cloned() else { return };
         let start = at.unwrap_or(self.playhead);
         let mode = self.insert_mode;
-        let target = track.or_else(|| (mode != crate::ops::InsertMode::Auto).then(|| self.default_insert_track(&a)));
-        let id = self.project.insert_media_with(&a, start, target, range, mode, 1.0);
+        if mode == crate::ops::InsertMode::Replace && self.selected.is_none() {
+            self.status = "Zum Austauschen zuerst ein Objekt in der Zeitleiste wählen.".into();
+            return;
+        }
+        // Zielspur (Klick auf den Spurkopf) gilt, solange sie existiert und nicht gesperrt ist
+        let target_track = self.target_track.filter(|&t| self.project.tracks.get(t).is_some_and(|tr| !tr.locked));
+        let target = track.or(target_track).or_else(|| (mode != crate::ops::InsertMode::Auto).then(|| self.default_insert_track(&a)));
+        let id = self.project.insert_media_replacing(&a, start, target, range, mode, 1.0, self.selected);
         match id {
             Some(id) => {
                 if a.has_video && !a.is_image && (a.fps - self.project.fps as f64).abs() > 2.0 && a.fps > 0.0 {
@@ -95,6 +101,7 @@ impl App {
         let idx = idx.min(self.project.tracks.len());
         let n = self.project.tracks.len() + 1;
         self.project.tracks.insert(idx, Track { name: format!("Spur {n}"), ..Default::default() });
+        self.tracks_shifted(idx, true);
         self.sel_track = idx;
         self.status = format!("Spur {} eingefügt.", idx + 1);
     }
@@ -106,10 +113,12 @@ impl App {
             return;
         }
         let ids: Vec<Uuid> = self.project.tracks[idx].clips.iter().map(|c| c.id).collect();
+        let links: HashSet<Uuid> = self.project.tracks[idx].clips.iter().filter_map(|c| c.link).collect();
         self.project.tracks.remove(idx);
-        // Verknüpfungen zu gelöschten Clips auflösen
+        self.tracks_shifted(idx, false);
+        // Verknüpfungen zu gelöschten Clips auflösen (der Partner bleibt als eigenständiger Clip)
         for c in self.project.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
-            if c.link.is_some_and(|l| ids.contains(&l)) {
+            if c.link.is_some_and(|l| links.contains(&l)) {
                 c.link = None;
             }
         }
@@ -212,11 +221,177 @@ impl App {
         }
     }
 
+    /// Tempo ändern; nachfolgende Clips rücken nach (keine Lücke beim Beschleunigen, kein Blockieren beim Verlangsamen).
     pub(crate) fn set_speed(&mut self, id: Uuid, v: f64) {
         let before = self.project.clone();
-        self.project.set_speed(id, v);
+        self.project.set_speed_opt(id, v, true);
         if self.project == before {
-            self.status = "Kein Platz für die geänderte Länge".into();
+            self.status = "Tempo lässt sich hier nicht ändern (gesperrte Spur?)".into();
+        }
+    }
+
+    // ---------- Spuren ----------
+
+    /// Zielspur für das Einfügen aus Medienpool und Quellmonitor (Klick auf den Spurkopf); erneuter Klick hebt sie auf.
+    pub(crate) fn toggle_target_track(&mut self, i: usize) {
+        self.target_track = if self.target_track == Some(i) { None } else { Some(i) };
+    }
+
+    /// Hält Zielspur und gewählte Spur stimmig, nachdem bei `idx` eine Spur eingefügt (`inserted`) oder gelöscht wurde.
+    pub(crate) fn tracks_shifted(&mut self, idx: usize, inserted: bool) {
+        if let Some(t) = self.target_track {
+            self.target_track = if inserted {
+                Some(if t >= idx { t + 1 } else { t })
+            } else if t == idx {
+                None
+            } else {
+                Some(if t > idx { t - 1 } else { t })
+            };
+        }
+    }
+
+    /// Höhe der Spuren in der Zeitleiste (klein/normal/groß, gilt für alle Spuren).
+    pub(crate) fn set_track_height(&mut self, h: f32) {
+        self.row_h = h.clamp(30.0, 120.0);
+    }
+
+    // ---------- Fotos, Storyboard ----------
+
+    /// Anzeigedauer aller Fotos (nicht Titel) setzen; nachfolgende Objekte rücken nach.
+    pub(crate) fn set_all_photo_duration(&mut self, d: f64) {
+        let ids: HashSet<Uuid> = self.project.tracks.iter().flat_map(|t| &t.clips).filter(|c| self.project.is_still(c) && !c.is_title()).map(|c| c.id).collect();
+        self.status = if self.project.set_still_duration(&ids, d) { format!("Alle Fotos: {d:.0} Sekunden") } else { "Anzeigedauer konnte nicht angepasst werden (Platz oder gesperrte Spur).".into() };
+    }
+
+    /// Storyboard: Szene vor eine andere verschieben (`before` = `None`: ans Ende).
+    pub(crate) fn move_scene(&mut self, id: Uuid, before: Option<Uuid>) {
+        let ordered = self.project.storyboard_scenes();
+        if !ordered.contains(&id) {
+            return;
+        }
+        let mut order: Vec<Uuid> = ordered.into_iter().filter(|x| *x != id).collect();
+        match before.and_then(|b| order.iter().position(|x| *x == b)) {
+            Some(i) => order.insert(i, id),
+            None => order.push(id),
+        }
+        if !self.project.reorder_storyboard(&order) {
+            self.status = "Umsortieren nicht möglich (gesperrte Spur oder Überlagerung).".into();
+        }
+    }
+
+    // ---------- Effekte für mehrere Clips ----------
+
+    /// Clips, auf die sich eine Bildeffekt-Einstellung bezieht: sind mehrere Clips gewählt und gehört `id` dazu, alle
+    /// gewählten Bild-/Videoclips (nach Zeit sortiert), sonst nur `id`.
+    pub(crate) fn effect_targets(&self, id: Uuid) -> Vec<Uuid> {
+        let sel = self.selected_set();
+        if !sel.contains(&id) || sel.len() < 2 {
+            return vec![id];
+        }
+        let mut v: Vec<&Clip> = self.project.tracks.iter().flat_map(|t| &t.clips).filter(|c| sel.contains(&c.id) && c.part == ClipPart::Video).collect();
+        v.sort_by(|a, b| a.start.total_cmp(&b.start));
+        v.iter().map(|c| c.id).collect()
+    }
+
+    /// Bewegungs-Voreinstellung auf alle gewählten Clips anwenden.
+    pub(crate) fn apply_preset_all(&mut self, p: crate::anim::AnimPreset, from: Uuid) {
+        let ids = self.effect_targets(from);
+        for i in &ids {
+            if let Some(c) = self.project.clip_mut(*i) {
+                c.apply_preset(p);
+            }
+        }
+        self.show_animator = true;
+        if ids.len() > 1 {
+            self.status = format!("{} auf {} Clips angewendet", p.label(), ids.len());
+        }
+    }
+
+    /// Zoom auf Bereich: Der Nutzer zieht im Monitor einen Rahmen auf (`reverse`: Zoom heraus).
+    pub(crate) fn begin_zoom_pick(&mut self, id: Uuid, reverse: bool) {
+        if self.source.is_some() {
+            self.exit_source();
+        }
+        self.set_playing(false);
+        self.select(id, false);
+        self.zoom_pick = Some((id, reverse));
+        self.status = "Im Monitor einen Rahmen aufziehen (Esc bricht ab)".into();
+    }
+
+    /// Rahmen fertig: Mitte (`cx`, `cy`) und Breite `w` als Anteile des Filmbilds.
+    pub(crate) fn finish_zoom_pick(&mut self, cx: f64, cy: f64, w: f64) {
+        let Some((id, reverse)) = self.zoom_pick.take() else { return };
+        // Ausgangslage ist das Bild, wie es im Monitor zu sehen war (an der Abspielposition, mit Keyframes)
+        let base = self.project.clip(id).map(|c| c.transform_at((self.playhead - c.start).clamp(0.0, c.duration)));
+        let s0 = base.as_ref().map_or(1.0, |b| b.scale);
+        if let Some(c) = self.project.clip_mut(id) {
+            c.apply_zoom_region(cx, cy, w, reverse, base);
+        }
+        self.show_animator = true;
+        self.status = format!("Zoom {} Bereich: {:.1}× über die Clipdauer (Keyframes im Animator änderbar)", if reverse { "aus dem" } else { "auf den" }, crate::anim::zoom_region_factor(w, s0));
+    }
+
+    // ---------- Rückgängig-Liste ----------
+
+    /// Kurzbeschreibung einer Änderung (aus dem Vergleich zweier Projektstände).
+    pub(crate) fn describe_change(a: &Project, b: &Project) -> &'static str {
+        let ca: Vec<&Clip> = a.tracks.iter().flat_map(|t| &t.clips).collect();
+        let cb: Vec<&Clip> = b.tracks.iter().flat_map(|t| &t.clips).collect();
+        if a.tracks.len() != b.tracks.len() {
+            return if b.tracks.len() > a.tracks.len() { "Spur hinzugefügt" } else { "Spur gelöscht" };
+        }
+        if ca.len() != cb.len() {
+            return if cb.len() > ca.len() { if cb.len() - ca.len() > 1 { "Clips eingefügt/geteilt" } else { "Clip eingefügt/geteilt" } } else { "Clip gelöscht" };
+        }
+        let da: std::collections::HashMap<Uuid, &Clip> = ca.iter().map(|c| (c.id, *c)).collect();
+        for c in &cb {
+            if let Some(o) = da.get(&c.id).filter(|o| **o != *c) {
+                return if o.fx != c.fx || o.keys != c.keys {
+                    "Effekt geändert"
+                } else if o.start != c.start && o.duration == c.duration {
+                    "Clip verschoben"
+                } else if o.duration != c.duration || o.source_in != c.source_in {
+                    "Clip gekürzt"
+                } else if o.volume != c.volume || o.volume_points != c.volume_points {
+                    "Lautstärke geändert"
+                } else {
+                    "Clip geändert"
+                };
+            }
+        }
+        if a.markers != b.markers || a.bookmarks != b.bookmarks || a.mark_in != b.mark_in || a.mark_out != b.mark_out {
+            return "Marker geändert";
+        }
+        if a.tracks != b.tracks {
+            return "Spur geändert";
+        }
+        if a.assets != b.assets {
+            return "Medienpool geändert";
+        }
+        "Änderung"
+    }
+
+    /// Die letzten Schritte zum Zurücknehmen (jüngster zuerst).
+    pub(crate) fn undo_history(&self, limit: usize) -> Vec<&'static str> {
+        let n = self.undo.len();
+        (1..=limit.min(n)).map(|k| Self::describe_change(&self.undo[n - k], if k == 1 { &self.project } else { &self.undo[n - k + 1] })).collect()
+    }
+
+    /// Die nächsten Schritte zum Wiederherstellen.
+    pub(crate) fn redo_history(&self, limit: usize) -> Vec<&'static str> {
+        let n = self.redo.len();
+        (1..=limit.min(n)).map(|k| Self::describe_change(if k == 1 { &self.project } else { &self.redo[n - k + 1] }, &self.redo[n - k])).collect()
+    }
+
+    pub(crate) fn undo_steps(&mut self, steps: usize) {
+        for _ in 0..steps {
+            self.do_undo();
+        }
+    }
+
+    pub(crate) fn redo_steps(&mut self, steps: usize) {
+        for _ in 0..steps {
+            self.do_redo();
         }
     }
 
@@ -319,14 +494,20 @@ impl App {
         }
     }
 
-    /// Text für die YouTube-Beschreibung („0:00 Intro“ …).
+    /// Text für die YouTube-Beschreibung („0:00 Anfang“ zuerst, wie von YouTube verlangt).
     pub(crate) fn chapters_text(&self) -> String {
         let stamp = |t: f64| {
             let s = t.round() as i64;
             let (h, m, sec) = (s / 3600, s / 60 % 60, s % 60);
             if h > 0 { format!("{h}:{m:02}:{sec:02}") } else { format!("{m}:{sec:02}") }
         };
-        self.project.marker_list().iter().map(|m| format!("{} {}", stamp(m.t), m.name)).collect::<Vec<_>>().join("\n")
+        let list = self.project.marker_list();
+        let mut out: Vec<String> = vec![];
+        if list.first().is_none_or(|m| m.t > 0.5) {
+            out.push("0:00 Anfang".into());
+        }
+        out.extend(list.iter().map(|m| format!("{} {}", stamp(m.t), m.name)));
+        out.join("\n")
     }
 
     /// Kopiert die Kapitel in die Zwischenablage und meldet YouTube-Hinweise in der Statuszeile.
@@ -339,9 +520,9 @@ impl App {
         ctx.copy_text(self.chapters_text());
         let mut hint = String::new();
         if list[0].t.abs() > 0.5 {
-            hint += " – Achtung: YouTube verlangt eine Marke bei 0:00";
+            hint += " – „0:00 Anfang“ ergänzt (YouTube verlangt ein Kapitel bei 0:00)";
         }
-        if list.len() < 3 {
+        if list.len() + usize::from(list[0].t.abs() > 0.5) < 3 {
             hint += " – YouTube braucht mindestens 3 Kapitel";
         }
         self.status = format!("{} Kapitel kopiert{hint}", list.len());

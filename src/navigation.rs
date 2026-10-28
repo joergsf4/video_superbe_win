@@ -43,7 +43,7 @@ impl App {
 
     pub(crate) fn set_mouse_mode(&mut self, m: MouseMode) {
         self.mouse_mode = m;
-        self.status = format!("Mausmodus: {}", m.label());
+        self.status = format!("Mausmodus: {}{}", m.label(), if m == MouseMode::Single { "" } else { " (Esc: zurück zum Standard)" });
     }
 
     // ---------- Einfügen ----------
@@ -288,11 +288,7 @@ impl App {
             return;
         }
         let o = TrimOptions {
-            ripple: match self.mouse_mode {
-                MouseMode::OneTrack => RippleScope::Track,
-                MouseMode::AllTracks => RippleScope::All,
-                MouseMode::Single => RippleScope::None,
-            },
+            ripple: self.mouse_mode.ripple(),
             ..Default::default()
         };
         let mut done: HashSet<Uuid> = HashSet::new();
@@ -383,6 +379,20 @@ impl App {
         self.scroll = (i - (o - i) * 0.02).max(0.0);
     }
 
+    /// Zoom auf die gewählten Objekte (Handbuch: „Objekt-Zoom“), waagerecht auf deren Zeitspanne.
+    pub(crate) fn zoom_to_selection(&mut self) {
+        let ids = self.project.with_partners(&self.selected_set());
+        let cs: Vec<&Clip> = ids.iter().filter_map(|i| self.project.clip(*i)).collect();
+        let lo = cs.iter().map(|c| c.start).fold(f64::INFINITY, f64::min);
+        let hi = cs.iter().map(|c| c.end()).fold(f64::NEG_INFINITY, f64::max);
+        if cs.is_empty() || hi <= lo + 0.05 {
+            self.status = "Zum Zoomen zuerst Objekte wählen".into();
+            return;
+        }
+        self.zoom_to_span((hi - lo) * 1.1);
+        self.scroll = (lo - (hi - lo) * 0.03).max(0.0);
+    }
+
     pub(crate) fn zoom_step(&mut self, zoom_in: bool) {
         self.zoom = (self.zoom * if zoom_in { 1.4 } else { 1.0 / 1.4 }).clamp(2.0, 600.0);
     }
@@ -421,9 +431,27 @@ impl App {
             return;
         };
         let beats = self.project.beat_times(&reference, every);
-        let (moved, kept) = self.project.snap_cuts_to_beats(vt, &beats);
-        self.status = if moved == 0 { "Alle Schnitte liegen schon im Takt (oder es fehlt Material zum Verlängern).".into() } else { format!("{moved} Schnitte auf den Takt gelegt, {kept} unverändert.") };
+        let r = self.project.snap_cuts_to_beats(vt, &beats);
+        self.status = beat_snap_message(&r);
     }
+}
+
+/// Meldung zur musikalischen Schnittanpassung.
+pub(crate) fn beat_snap_message(r: &crate::ops::BeatSnapResult) -> String {
+    let mut parts: Vec<String> = vec![];
+    if r.moved > 0 {
+        parts.push(format!("{} Schnitte auf den Takt gelegt", r.moved));
+    }
+    if r.on_beat > 0 {
+        parts.push(format!("{} lagen schon im Takt", r.on_beat));
+    }
+    if r.no_material > 0 {
+        parts.push(format!("{} ohne genug Material zum Verlängern", r.no_material));
+    }
+    if r.gaps > 0 {
+        parts.push(format!("{} Lücken ausgelassen", r.gaps));
+    }
+    if parts.is_empty() { "Keine Schnitte gefunden.".into() } else { parts.join(", ") }
 }
 
 #[cfg(test)]

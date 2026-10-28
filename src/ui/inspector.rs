@@ -6,8 +6,6 @@ use crate::anim::Channel;
 use crate::model::*;
 use eframe::egui::{RichText, Rect};
 
-const TABS: [&str; 4] = ["Eigenschaften", "Blenden", "Titel", "Effekte"];
-
 pub(super) fn caption(ui: &mut Ui, text: impl Into<String>) {
     ui.label(RichText::new(text.into()).size(11.5).color(SECONDARY));
 }
@@ -23,31 +21,12 @@ pub(super) fn arr_to_rgba(a: [f32; 4]) -> Rgba {
 impl App {
     pub(crate) fn inspector_panel(&mut self, ui: &mut Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                // Reiter (segmentiert)
-                let w = (ui.available_width() - 12.0) / TABS.len() as f32;
-                ui.spacing_mut().item_spacing.x = 0.0;
-                for (i, name) in TABS.iter().enumerate() {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
-                    let on = self.inspector_tab == i;
-                    let fill = if on { Color32::from_rgb(88, 94, 102) } else if resp.hovered() { Color32::from_rgb(70, 75, 81) } else { BAR };
-                    let r = match i {
-                        0 => egui::CornerRadius { nw: 5, sw: 5, ne: 0, se: 0 },
-                        3 => egui::CornerRadius { nw: 0, sw: 0, ne: 5, se: 5 },
-                        _ => egui::CornerRadius::ZERO,
-                    };
-                    ui.painter().rect_filled(rect, r, fill);
-                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, *name, FontId::proportional(11.5), if on { Color32::WHITE } else { Color32::from_gray(190) });
-                    if resp.clicked() {
-                        self.inspector_tab = i;
-                    }
-                }
-            });
             ui.add_space(10.0);
             egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 0)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // Reiter (Symbol über Beschriftung)
+                self.inspector_tabs(ui);
+                ui.add_space(10.0);
                 let sel = self.selected.and_then(|id| self.project.clip(id).cloned());
                 match (self.inspector_tab, sel) {
                     (2, c) => self.title_tab(ui, c),
@@ -56,6 +35,7 @@ impl App {
                     }
                     (0, Some(c)) => self.properties_tab(ui, c),
                     (1, Some(c)) => self.blend_tab(ui, c),
+                    (4, Some(c)) => self.mask_tab(ui, c),
                     (_, Some(c)) => self.effects_tab(ui, c),
                 }
             });
@@ -87,7 +67,19 @@ impl App {
                 cl.volume = v;
             }
         }
-        let still = c.asset_id().and_then(|a| self.project.asset(a)).is_some_and(|a| a.is_image) || c.is_title();
+        let photo = c.asset_id().and_then(|a| self.project.asset(a)).is_some_and(|a| a.is_image);
+        let still = photo || c.is_title();
+        if photo {
+            // Anzeigedauer: nachfolgende Objekte, Titel und Musik rücken mit, Kamerafahrten dehnen sich mit
+            ui.add_space(8.0);
+            let mut d = c.duration;
+            if slider_row(ui, "Anzeigedauer", &mut d, 1.0..=20.0, secs) && !self.project.set_still_duration(&std::collections::HashSet::from([id]), d) {
+                self.status = "Anzeigedauer konnte nicht angepasst werden (Platz oder gesperrte Spur).".into();
+            }
+            if ui.small_button("Dauer für alle Fotos übernehmen").clicked() {
+                self.set_all_photo_duration(c.duration);
+            }
+        }
         if !still {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
