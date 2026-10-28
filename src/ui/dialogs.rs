@@ -27,7 +27,7 @@ impl App {
         egui::Window::new(format!("Spur {} umbenennen", i + 1)).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut text).hint_text(format!("Spur {}", i + 1)).desired_width(240.0));
             r.request_focus();
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 ok = true;
             }
             ui.horizontal(|ui| {

@@ -208,7 +208,15 @@ impl App {
         painter.rect_filled(frame, 0.0, Color32::from_black_alpha(115));
         let resp = ui.interact(frame, ui.id().with("zoom_pick"), Sense::drag());
         let reverse = self.zoom_pick.is_some_and(|z| z.1);
-        let pick = match (ui.input(|i| i.pointer.press_origin()), ui.input(|i| i.pointer.latest_pos())) {
+        // Startpunkt merken (beim Loslassen gibt egui keinen Ursprung mehr)
+        let key = ui.id().with("zoom_pick_origin");
+        if resp.drag_started() {
+            if let Some(o) = ui.input(|i| i.pointer.press_origin()) {
+                ui.data_mut(|d| d.insert_temp(key, o));
+            }
+        }
+        let origin: Option<egui::Pos2> = ui.data(|d| d.get_temp(key));
+        let pick = match (origin, ui.input(|i| i.pointer.latest_pos())) {
             (Some(o), Some(p)) if resp.dragged() || resp.drag_stopped() => {
                 let o = egui::pos2(o.x.clamp(frame.left(), frame.right()), o.y.clamp(frame.top(), frame.bottom()));
                 let (dx, dy) = (p.x - o.x, p.y - o.y);
@@ -230,6 +238,7 @@ impl App {
                 painter.rect_filled(lr, 4.0, ACCENT);
                 painter.galley(lr.min + Vec2::new(4.0, 2.0), g, Color32::WHITE);
                 if resp.drag_stopped() {
+                    ui.data_mut(|d| d.remove::<egui::Pos2>(key));
                     if f.width() < frame.width() * 0.06 {
                         self.status = "Bereich zu klein – bitte größer aufziehen".into();
                     } else {

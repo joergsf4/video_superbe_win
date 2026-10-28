@@ -1281,7 +1281,8 @@ impl App {
             let pps = self.zoom;
             let shift = ui.input(|i| i.modifiers.shift);
             if br.drag_started() || br.clicked() {
-                if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+                // beim Klick ist die Taste schon los (kein Ursprung mehr): dann zählt die Klickposition
+                if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(br.interact_pointer_pos()) {
                     let st = self.x2t(x0, p.x).max(0.0);
                     let tol = 7.0 / pps;
                     let mode = match (self.project.mark_in, self.project.mark_out) {

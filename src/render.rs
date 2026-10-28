@@ -1115,7 +1115,17 @@ pub mod tests {
         let dir = std::env::temp_dir().join("video-superbe-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
-        image::RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255])).save(&path).unwrap();
+        // Mehrere Tests nutzen dieselben Bilder gleichzeitig: nie eine Datei überschreiben, die ein anderer Test gerade liest
+        // (vorhandenes gleiches Bild wird übernommen, sonst über eine Zwischendatei ersetzt)
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        if image::open(&path).is_ok_and(|o| o.to_rgba8() == img) {
+            return path;
+        }
+        let tmp = dir.join(format!("{}.{}.{}.png", name, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
+        img.save(&tmp).unwrap();
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
         path
     }
 

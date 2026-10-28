@@ -360,7 +360,17 @@ pub mod tests {
             let v = (amp * (2.0 * std::f64::consts::PI * hz * i as f64 / rate as f64).sin() * 32767.0) as i16;
             d.extend(v.to_le_bytes());
         }
-        std::fs::write(&path, d).unwrap();
+        // Mehrere Tests schreiben dieselbe Datei gleichzeitig: Liegt sie mit gleichem Inhalt schon da (und ist gerade von
+        // einem anderen Test geöffnet), wird sie nicht noch einmal geschrieben.
+        if std::fs::read(&path).is_ok_and(|old| old == d) {
+            return path;
+        }
+        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id() as u64 * 1000 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() % 1000) as u64));
+        std::fs::write(&tmp, &d).unwrap();
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            assert!(std::fs::read(&path).is_ok_and(|old| old == d), "Testdatei {name} lässt sich nicht schreiben");
+        }
         path
     }
 

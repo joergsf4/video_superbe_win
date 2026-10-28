@@ -1270,3 +1270,373 @@ fn preview_texture_keeps_its_handle_and_size_while_a_slider_changes_the_picture(
     assert_eq!(id0, id1, "dieselbe Textur wird weiterverwendet (kein neues Speicherobjekt je Bild); bei langsamen Bildern darf nur die Größe wechseln");
     assert!(h.app.preview.renders >= 10);
 }
+
+// ---------- Mac-Version 1.2: Austauschen, Mausmodi, Spurkopf, Bereichsleiste, Storyboard, Pool, Masken, Zoom auf Bereich ----------
+
+#[test]
+fn keys_4_and_0_and_escape_switch_the_new_modes() {
+    let (p, _, _) = av_project();
+    let mut h = H::new(p);
+    h.key(Key::Num4);
+    assert_eq!(h.app.insert_mode, crate::ops::InsertMode::Replace);
+    h.key(Key::Num0);
+    assert_eq!(h.app.mouse_mode, crate::ops::MouseMode::Stretch);
+    h.key(Key::Escape);
+    assert_eq!(h.app.mouse_mode, crate::ops::MouseMode::Single, "Esc: zurück zum Standard-Mausmodus");
+    // Austauschen ohne gewähltes Objekt: Hinweis statt Einfügen
+    h.app.clear_selection();
+    let n = h.app.project.tracks.iter().map(|t| t.clips.len()).sum::<usize>();
+    let aid = h.app.project.assets[0].id;
+    h.app.add_asset_clip(aid);
+    assert_eq!(h.app.project.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), n);
+    assert!(h.app.status.contains("Austauschen"), "{}", h.app.status);
+}
+
+#[test]
+fn razor_mode_splits_where_clicked_and_slip_mode_shifts_the_source() {
+    let (p, r1, _) = av_project();
+    let mut h = H::new(p);
+    h.app.set_mouse_mode(crate::ops::MouseMode::Razor);
+    h.click(h.at(2.0, 0));
+    assert_eq!(h.app.project.tracks[0].clips.len(), 3, "geteilt");
+    assert!((h.clip(r1).end() - 2.0).abs() < 1.0 / 30.0 + 0.02, "an der Mausposition: {}", h.clip(r1).end());
+    // Ziehen schneidet nicht und verschiebt nichts
+    let before = h.app.project.clone();
+    h.drag(h.at(1.0, 0), h.at(1.5, 0));
+    assert_eq!(h.app.project, before);
+    // Objektinhalt verschieben: Lage und Länge bleiben, die Quelle wandert
+    let (p, r1, _) = av_project();
+    let mut h = H::new(p);
+    h.app.set_mouse_mode(crate::ops::MouseMode::Slip);
+    let (s0, d0) = (h.clip(r1).start, h.clip(r1).duration);
+    h.drag(h.at(2.0, 0), h.at(1.0, 0));
+    let c = h.clip(r1);
+    assert_eq!((c.start, c.duration), (s0, d0));
+    assert!((c.source_in - 1.0).abs() < 0.05, "Quelle um 1 s verschoben: {}", c.source_in);
+}
+
+#[test]
+fn stretch_mode_changes_the_tempo_at_the_edge() {
+    let (p, r1, r2) = av_project();
+    let mut h = H::new(p);
+    h.app.select(r2, false);
+    h.app.ripple_delete_selection();
+    h.frames(2);
+    h.key(Key::Num0);
+    h.drag(h.at(3.95, 0), h.at(7.95, 0));
+    let c = h.clip(r1);
+    assert!((c.duration - 8.0).abs() < 0.1 && (c.speed - 0.5).abs() < 0.02, "gestreckt: {} s, {}×", c.duration, c.speed);
+    let au = h.clip(h.app.project.partner_id(r1).unwrap());
+    assert!((au.speed - c.speed).abs() < 1e-9, "Ton zieht mit");
+}
+
+#[test]
+fn track_header_sets_the_target_track_and_renames_on_double_click() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    let r = h.app.tl_rect;
+    let head = |i: usize| Pos2::new(r.left() + 10.0, r.top() + RULER_H + i as f32 * ROW_H + 12.0);
+    h.click(head(3));
+    assert_eq!(h.app.target_track, Some(3), "Klick legt die Zielspur fest");
+    h.app.playhead = 10.0;
+    h.app.clear_selection();
+    h.app.add_asset_clip(ids.asset_a);
+    let id = h.app.selected.expect("eingefügt");
+    assert_eq!(h.app.project.find_clip(id).unwrap().0, 3, "Einfügen auf der Zielspur");
+    h.frames(30);
+    h.click(head(3));
+    assert_eq!(h.app.target_track, None, "erneuter Klick hebt sie auf");
+    // Doppelklick: umbenennen
+    h.frames(30);
+    h.click(head(1));
+    h.click(head(1));
+    assert!(h.app.track_rename.is_some(), "Umbenennen-Fenster offen");
+    assert_eq!(h.app.target_track, None, "Doppelklick schaltet die Zielspur nicht um");
+    h.run(vec![Event::Text("Musik".into())]);
+    h.key(Key::Enter);
+    assert_eq!(h.app.project.tracks[1].name, "Musik");
+    assert_eq!(h.app.project.tracks[1].custom_name(), Some("Musik"));
+    // Spur einfügen verschiebt die Zielspur mit
+    h.app.target_track = Some(2);
+    h.app.insert_track_at(0);
+    assert_eq!(h.app.target_track, Some(3));
+    h.app.remove_track(3);
+    assert_eq!(h.app.target_track, None);
+    // Spurfarbe, -höhe, -lautstärke und -deckkraft werden gezeichnet
+    h.app.project.tracks[0].color = Some("green".into());
+    h.app.project.tracks[0].volume = Some(0.5);
+    h.app.project.tracks[0].opacity = Some(0.25);
+    h.app.set_track_height(84.0);
+    h.frames(3);
+    h.app.set_track_height(36.0);
+    h.frames(3);
+    assert_eq!(h.app.row_h, 36.0);
+}
+
+#[test]
+fn range_bar_sets_and_moves_the_marks_and_loop_repeats_the_range() {
+    let (p, _) = project();
+    let mut h = H::new(p);
+    let bar = |h: &H, t: f64| {
+        let mut p = h.at(t, 0);
+        p.y = h.app.tl_rect.top() + crate::ui::timeline::SCALE_H + 3.0;
+        p
+    };
+    h.click(bar(&h, 2.0));
+    assert!((h.app.project.mark_in.unwrap() - 2.0).abs() < 0.05, "{:?}", h.app.project.mark_in);
+    h.scoped_mods(Modifiers::SHIFT, |h| h.click(bar(h, 5.0)));
+    assert!((h.app.project.mark_out.unwrap() - 5.0).abs() < 0.05, "{:?}", h.app.project.mark_out);
+    // Band ziehen: beide Marken wandern
+    h.drag(bar(&h, 3.5), bar(&h, 4.5));
+    assert!((h.app.project.mark_in.unwrap() - 3.0).abs() < 0.06 && (h.app.project.mark_out.unwrap() - 6.0).abs() < 0.06, "{:?} {:?}", h.app.project.mark_in, h.app.project.mark_out);
+    // Ende ziehen
+    h.drag(bar(&h, 6.0), bar(&h, 7.0));
+    assert!((h.app.project.mark_out.unwrap() - 7.0).abs() < 0.06);
+    assert_eq!(h.app.playhead, 0.0, "die Bereichsleiste scrubbt nicht");
+    // Schleife: Bereich 1,0 … 1,3 s, nach dem Ende geht es am Anfang weiter
+    h.app.project.mark_in = Some(1.0);
+    h.app.project.mark_out = Some(1.3);
+    h.app.loop_range = true;
+    h.app.play_range();
+    h.frames(2);
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    h.frames(2);
+    assert!(h.app.playing, "läuft weiter");
+    assert!(h.app.playhead < 1.3 && h.app.playhead >= 1.0, "zurück am Anfang: {}", h.app.playhead);
+    h.app.set_playing(false);
+}
+
+#[test]
+fn undo_list_names_the_steps_and_undoes_several() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    h.drag(h.at(1.0, 0), h.at(2.0, 0));
+    h.app.select(ids.c_b, false);
+    h.key(Key::Delete);
+    h.app.select(ids.c_title, false);
+    h.key(Key::D);
+    let list = h.app.undo_history(12);
+    assert_eq!(&list[..3], &["Clip eingefügt/geteilt", "Clip gelöscht", "Clip verschoben"], "{list:?}");
+    h.app.undo_steps(2);
+    h.frames(1);
+    assert!(h.app.project.clip(ids.c_b).is_some(), "zwei Schritte zurück");
+    assert_eq!(h.app.redo_history(5), vec!["Clip gelöscht", "Clip eingefügt/geteilt"]);
+    h.app.redo_steps(2);
+    assert!(h.app.project.clip(ids.c_b).is_none());
+}
+
+#[test]
+fn storyboard_shows_scenes_reorders_and_sets_photo_durations() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    h.scoped_mods(Modifiers::COMMAND | Modifiers::ALT, |h| h.key(Key::B));
+    assert!(h.app.storyboard, "Strg+Alt+B schaltet das Storyboard ein");
+    h.frames(3);
+    // Hauptspur ist Spur 1 (Clip A); Clip B liegt auf Spur 2
+    assert_eq!(h.app.project.storyboard_scenes(), vec![ids.c_a]);
+    // drei Fotos auf der Hauptspur
+    let b_asset = h.clip(ids.c_b).asset_id().unwrap();
+    for t in [2.0, 4.0] {
+        h.app.project.tracks[0].clips.push(clip(b_asset, t, 2.0));
+    }
+    h.frames(2);
+    let sc = h.app.project.storyboard_scenes();
+    h.app.move_scene(sc[2], Some(sc[0]));
+    assert_eq!(h.app.project.storyboard_scenes()[0], sc[2]);
+    h.app.set_all_photo_duration(3.0);
+    let starts: Vec<f64> = h.app.project.storyboard_scenes().iter().map(|i| h.clip(*i).start).collect();
+    assert_eq!(starts, vec![0.0, 3.0, 6.0]);
+    h.frames(3);
+    h.scoped_mods(Modifiers::COMMAND | Modifiers::ALT, |h| h.key(Key::B));
+    assert!(!h.app.storyboard);
+}
+
+#[test]
+fn pool_selects_like_the_explorer_and_drags_several_media() {
+    let (mut p, ids) = project();
+    let green = solid_png("gui_green.png", 64, 36, [30, 200, 30]);
+    let g = image_asset(&mut p, &green, 64.0, 36.0);
+    let mut h = H::new(p);
+    h.frames(3);
+    let tile = |h: &H, id: Uuid| h.app.pool_tiles.iter().find(|(i, _)| *i == id).expect("Kachel").1.center();
+    let b_asset = h.clip(ids.c_b).asset_id().unwrap();
+    h.click(tile(&h, ids.asset_a));
+    assert_eq!(h.app.pool.selection.len(), 1);
+    h.scoped_mods(Modifiers::COMMAND, |h| h.click(tile(h, g)));
+    assert_eq!(h.app.pool.selection.len(), 2, "Strg-Klick ergänzt");
+    h.frames(30);
+    h.click(tile(&h, ids.asset_a));
+    h.scoped_mods(Modifiers::SHIFT, |h| h.click(tile(h, g)));
+    assert_eq!(h.app.pool.selection.len(), 3, "Umschalt-Klick wählt den Bereich");
+    // Tastatur: Pfeil rechts bei Maus über dem Pool
+    h.frames(30);
+    h.click(tile(&h, ids.asset_a));
+    h.mv(tile(&h, ids.asset_a));
+    h.key(Key::ArrowRight);
+    assert!(h.app.pool.selection.contains(&b_asset) && h.app.pool.selection.len() == 1, "Pfeil wählt das nächste Medium");
+    // Strg+A über dem Pool wählt alle Medien (nicht die Clips)
+    h.cmd_key(Key::A);
+    assert_eq!(h.app.pool.selection.len(), 3);
+    // mehrere Medien auf einmal ziehen: hintereinander ab der Ablage
+    h.frames(30);
+    h.click(tile(&h, ids.asset_a));
+    h.scoped_mods(Modifiers::COMMAND, |h| h.click(tile(h, g)));
+    let before = h.app.project.tracks[4].clips.len();
+    h.drag(tile(&h, ids.asset_a), h.at(10.0, 4));
+    let tr = &h.app.project.tracks[4].clips;
+    assert_eq!(tr.len(), before + 2, "zwei Clips");
+    let mut cs: Vec<&Clip> = tr.iter().collect();
+    cs.sort_by(|a, b| a.start.total_cmp(&b.start));
+    assert!((cs[0].start - 10.0).abs() < 0.1 && (cs[1].start - cs[0].end()).abs() < 1e-6, "{} {}", cs[0].start, cs[1].start);
+    // Entf über dem Pool: nur unbenutzte Medien verschwinden
+    let unused = solid_png("gui_unused.png", 32, 18, [90, 90, 90]);
+    h.app.import_file(unused);
+    let un = h.app.project.assets.last().unwrap().id;
+    h.frames(3);
+    h.app.pool.selection = std::collections::HashSet::from([un, ids.asset_a]);
+    h.mv(tile(&h, un));
+    h.key(Key::Delete);
+    assert!(h.app.project.asset(un).is_none() && h.app.project.asset(ids.asset_a).is_some(), "{}", h.app.status);
+    // Ansichten, Sortierung, Suche
+    for v in crate::media::PoolView::ALL {
+        h.app.pool.view = v;
+        h.frames(2);
+        assert_eq!(h.app.pool_tiles.len(), h.app.project.assets.len(), "{v:?}");
+    }
+    h.app.pool.sort = crate::media::PoolSort::Name;
+    h.app.pool.ascending = false;
+    let names: Vec<String> = h.app.pool_assets().iter().map(|a| a.name.clone()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_by(|a, b| crate::media::natural_cmp(b, a));
+    assert_eq!(names, sorted);
+    // Suche nach Namen (ohne Groß-/Kleinschreibung)
+    h.app.project.assets.iter_mut().find(|a| a.id == g).unwrap().name = "Grüner Hintergrund.png".into();
+    h.app.pool.search = "grüner".into();
+    h.frames(2);
+    assert_eq!(h.app.pool_tiles.len(), 1);
+    h.app.pool.search.clear();
+    h.app.pool.filter = crate::media::PoolFilter::Audio;
+    h.frames(2);
+    assert!(h.app.pool_tiles.is_empty());
+}
+
+#[test]
+fn inspector_tabs_effect_cards_masks_and_photo_effects_render() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    h.app.select(ids.c_a, false);
+    for tab in 0..5 {
+        h.app.inspector_tab = tab;
+        h.frames(2);
+    }
+    // Effekte: alle Unterreiter, auch mit Maske, Foto-Effekten, Bewegung
+    h.app.inspector_tab = 3;
+    for sub in 0..3 {
+        h.app.effects_sub = sub;
+        h.frames(2);
+    }
+    {
+        let c = h.app.project.clip_mut(ids.c_a).unwrap();
+        c.fx.mask = Some(crate::masks::MaskKind::Heart.defaults());
+        c.fx.photo = Some(PhotoFx { enhance: Some(0.7), denoise: Some(0.3), ..Default::default() });
+        c.apply_preset(crate::anim::AnimPreset::ZoomIn);
+    }
+    for sub in 0..3 {
+        h.app.effects_sub = sub;
+        h.frames(2);
+    }
+    h.app.inspector_tab = 4;
+    h.frames(3);
+    assert_eq!(h.app.mask_thumbs.len(), 12, "alle Masken-Kacheln haben ein Vorschaubild");
+    h.app.project.clip_mut(ids.c_a).unwrap().reset_fx(FxGroup::Mask);
+    assert!(h.clip(ids.c_a).fx.mask.is_none());
+    // Titel: Masken-Reiter und Bewegung
+    h.app.select(ids.c_title, false);
+    h.app.inspector_tab = 4;
+    h.frames(2);
+    h.app.inspector_tab = 3;
+    h.frames(2);
+    // Animator nur auf Wunsch
+    assert!(h.app.animator_clip().is_none(), "Animator aus");
+    h.app.show_animator = true;
+    assert!(h.app.animator_clip().is_some());
+    h.frames(2);
+    // ohne Auswahl: Hinweis in gleicher Höhe (die Zeitleiste springt nicht)
+    let tl_before = h.app.tl_rect;
+    h.app.clear_selection();
+    h.frames(2);
+    assert_eq!(h.app.tl_rect.top(), tl_before.top(), "Zeitleiste bleibt stehen");
+}
+
+#[test]
+fn photo_duration_and_presets_for_several_clips() {
+    let (mut p, ids) = project();
+    let c2 = clip(ids.asset_a, 2.0, 2.0);
+    let c2id = c2.id;
+    p.tracks[0].clips.push(c2);
+    let mut h = H::new(p);
+    h.app.select(ids.c_a, false);
+    h.app.select(c2id, true);
+    h.app.inspector_tab = 0;
+    h.frames(2);
+    h.app.apply_preset_all(crate::anim::AnimPreset::ZoomOut, ids.c_a);
+    assert!(h.clip(ids.c_a).is_keyed(crate::anim::Channel::Scale) && h.clip(c2id).is_keyed(crate::anim::Channel::Scale), "für beide gewählten Clips");
+    assert!(h.app.show_animator);
+    h.app.set_all_photo_duration(4.0);
+    assert_eq!((h.clip(ids.c_a).duration, h.clip(c2id).start), (4.0, 4.0));
+}
+
+#[test]
+fn zoom_on_region_by_drawing_a_frame_in_the_monitor() {
+    let (p, ids) = project();
+    let mut h = H::new(p);
+    h.app.playhead = 0.5;
+    h.app.begin_zoom_pick(ids.c_a, false);
+    h.frames(2);
+    let c = h.app.preview_rect.center();
+    h.drag(c - Vec2::new(60.0, 20.0), c + Vec2::new(60.0, 40.0));
+    assert!(h.app.zoom_pick.is_none(), "{}", h.app.status);
+    let cl = h.clip(ids.c_a);
+    assert!(cl.is_keyed(crate::anim::Channel::Scale), "Zoom-Keyframes geschrieben");
+    assert!(cl.value(crate::anim::Channel::Scale, cl.duration) > 1.5, "{}", cl.value(crate::anim::Channel::Scale, cl.duration));
+    assert!(h.app.show_animator);
+    // Esc bricht ab
+    h.app.begin_zoom_pick(ids.c_a, true);
+    h.frames(2);
+    h.key(Key::Escape);
+    assert!(h.app.zoom_pick.is_none());
+    // zu kleiner Rahmen: Hinweis, nichts geändert
+    let before = h.clip(ids.c_a).clone();
+    h.app.begin_zoom_pick(ids.c_a, false);
+    h.frames(2);
+    h.drag(c, c + Vec2::new(8.0, 4.0));
+    assert_eq!(h.clip(ids.c_a), &before);
+}
+
+#[test]
+fn export_dialog_presets_cache_window_and_rename_render() {
+    let (p, aid) = audio_project();
+    let mut h = H::new(p);
+    h.app.add_to_timeline(aid, Some(3), Some(0.0), None);
+    h.app.export_dialog();
+    h.frames(3);
+    let c = h.app.export_cfg.as_mut().unwrap();
+    assert_eq!(c.preset, "YouTube Full HD");
+    let all = crate::export::builtin_presets();
+    c.apply(&all[3]);
+    assert!(!c.normalize && c.s.height == Some(720));
+    c.manual_bitrate = true;
+    c.s.kbps = Some(3000);
+    c.save_name = Some("Mein Preset".into());
+    h.frames(3);
+    h.app.export_cfg = None;
+    h.app.show_cache = true;
+    h.frames(3);
+    h.app.show_cache = false;
+    h.app.begin_track_rename(0);
+    h.frames(2);
+    h.key(Key::Escape);
+    assert!(h.app.track_rename.is_none());
+    h.app.rename_track(2, "  ");
+    assert_eq!(h.app.project.tracks[2].name, "Spur 3", "leer = wieder „Spur N“");
+}
