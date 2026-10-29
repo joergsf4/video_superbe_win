@@ -41,10 +41,15 @@ fn main() -> eframe::Result {
     video::init();
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--export") && args.len() >= 4 {
-        return export_cli(&args[2], &args[3]);
+        return export_cli(&args[2], &args[3], args.get(4).is_some_and(|c| c.eq_ignore_ascii_case("hevc")));
     }
     if args.get(1).map(String::as_str) == Some("--gpuinfo") {
-        let _ = std::fs::write("gpuinfo.txt", video::gpu_info());
+        let mut info = video::gpu_info();
+        info += "\nExport-Encoder:\n";
+        for c in export::encoders() {
+            info += &format!("  {}: {} ({}), bis {} × {}, Bitratenmodus {}\n", c.codec.label(), c.name, c.device(), c.max_w, c.max_h, if c.rate_control { "einstellbar" } else { "fest" });
+        }
+        let _ = std::fs::write("gpuinfo.txt", info);
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("--mftlist") {
@@ -103,11 +108,14 @@ fn videotest(args: &[String]) -> eframe::Result {
 }
 
 
-/// Headless-Export: `VideoSuperbe.exe --export projekt.mvd.json ausgabe.mp4`; Ergebnis in `<ausgabe>.log`.
-fn export_cli(project: &str, out: &str) -> eframe::Result {
+/// Headless-Export: `VideoSuperbe.exe --export projekt.mvd.json ausgabe.mp4 [hevc]`; Ergebnis in `<ausgabe>.log`.
+fn export_cli(project: &str, out: &str, hevc: bool) -> eframe::Result {
     let log = format!("{out}.log");
     let r = model::load(std::path::Path::new(project)).and_then(|p| {
-        let o = export::ExportOpts::from_project(&p);
+        let mut o = export::ExportOpts::from_project(&p);
+        if hevc {
+            o.codec = export::VideoCodec::Hevc;
+        }
         export::export(&p, std::path::Path::new(out), &o, &mut |_| true)
     });
     let _ = std::fs::write(

@@ -1629,6 +1629,38 @@ fn zoom_on_region_by_drawing_a_frame_in_the_monitor() {
 }
 
 #[test]
+fn export_dialog_offers_only_what_the_encoders_can() {
+    let (p, aid) = audio_project();
+    let mut h = H::new(p);
+    h.app.add_to_timeline(aid, Some(3), Some(0.0), None);
+    let caps = crate::export::encoders();
+    let hevc = caps.iter().any(|c| c.codec == crate::export::VideoCodec::Hevc);
+    h.app.export_dialog();
+    h.frames(3);
+    let c = h.app.export_cfg.as_mut().unwrap();
+    assert_eq!(c.s.codec, crate::export::VideoCodec::H264, "Standard bleibt H.264");
+    c.s.codec = crate::export::VideoCodec::Hevc;
+    (c.s.constant_bitrate, c.s.gop) = (true, 5.0);
+    h.frames(3);
+    let c = h.app.export_cfg.as_ref().unwrap();
+    if hevc {
+        assert_eq!(c.s.codec, crate::export::VideoCodec::Hevc);
+        let rc = caps.iter().find(|c| c.codec == crate::export::VideoCodec::Hevc).unwrap().rate_control;
+        assert_eq!(c.s.constant_bitrate, rc, "Bitratenmodus bleibt nur, wenn der Encoder ihn kann");
+    } else {
+        assert_eq!(c.s.codec, crate::export::VideoCodec::H264, "ohne HEVC-Encoder zurück auf H.264");
+    }
+    // eine Auflösung, die kein Encoder schafft, wird auf die größte mögliche gesetzt
+    h.app.project.render_width = 7680;
+    h.app.project.render_height = 4320;
+    h.app.export_cfg.as_mut().unwrap().s.height = None;
+    h.frames(3);
+    let s = &h.app.export_cfg.as_ref().unwrap().s;
+    assert!(s.check(caps, 7680, 4320).is_ok(), "{s:?}");
+    assert_eq!(s.height, Some(2160));
+}
+
+#[test]
 fn export_dialog_presets_cache_window_and_rename_render() {
     let (p, aid) = audio_project();
     let mut h = H::new(p);

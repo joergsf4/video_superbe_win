@@ -1,17 +1,56 @@
-//! Export nach MP4 (H.264 + AAC) über den Media-Foundation-Sink-Writer (in Windows eingebaut).
+//! Export nach MP4 (H.264 oder HEVC + AAC) über den Media-Foundation-Sink-Writer (in Windows eingebaut).
+//! Welche Encoder es gibt und bis zu welcher Bildgröße sie arbeiten, wird einmal ausprobiert (`encoders`).
 
 use crate::audio::{Mixer, RATE};
 use crate::model::*;
 use crate::render::Renderer;
 use std::path::Path;
-use windows::core::{HSTRING, PCWSTR};
+use std::sync::OnceLock;
+use windows::core::{Interface, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Media::MediaFoundation::*;
+
+/// Videoformat der Ausgabe. H.264 kann Windows immer (Software-Encoder); HEVC nur mit passender Grafikkarte
+/// (NVIDIA, Intel Quick Sync, AMD) oder den HEVC-Videoerweiterungen aus dem Store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Hevc,
+}
+
+impl VideoCodec {
+    pub const ALL: [VideoCodec; 2] = [VideoCodec::H264, VideoCodec::Hevc];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Hevc => "HEVC (H.265)",
+        }
+    }
+
+    fn subtype(self) -> GUID {
+        match self {
+            VideoCodec::H264 => MFVideoFormat_H264,
+            VideoCodec::Hevc => MFVideoFormat_HEVC,
+        }
+    }
+
+    /// HEVC erreicht dieselbe Qualität mit etwa zwei Dritteln der Bitrate.
+    pub fn bitrate_factor(self) -> f64 {
+        match self {
+            VideoCodec::H264 => 1.0,
+            VideoCodec::Hevc => 0.65,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ExportOpts {
     pub width: usize,
     pub height: usize,
     pub fps: u32,
+    pub codec: VideoCodec,
     pub video_kbps: u32,
     /// Nur diesen Zeitbereich (Sekunden) exportieren; `None` = ganzer Film
     pub range: Option<(f64, f64)>,
@@ -45,6 +84,7 @@ impl ExportOpts {
             width: w & !1,
             height: h & !1,
             fps: p.fps.clamp(1, 120) as u32,
+            codec: VideoCodec::H264,
             video_kbps: kbps,
             range: None,
             audio_gain: 1.0,
@@ -61,13 +101,14 @@ impl ExportOpts {
     }
 }
 
-/// Gespeicherte Exporteinstellungen (Voreinstellung im Export-Dialog; Port von ExportPresets.swift ohne HEVC).
+/// Gespeicherte Exporteinstellungen (Voreinstellung im Export-Dialog; Port von ExportPresets.swift).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ExportSettings {
     /// Ausgabe: kurze Seite in Pixeln (`None` = Filmformat) und Bildrate (`None` = Filmformat)
     pub height: Option<i64>,
     pub fps: Option<i64>,
+    pub codec: VideoCodec,
     /// Faktor auf die automatische Bitrate; `kbps` überschreibt sie
     pub quality: f64,
     pub kbps: Option<u32>,
@@ -83,7 +124,7 @@ pub struct ExportSettings {
 
 impl Default for ExportSettings {
     fn default() -> Self {
-        ExportSettings { height: None, fps: None, quality: 1.0, kbps: None, constant_bitrate: false, gop: 2.0, profile_high: true, audio_kbps: 192, mono: false, fast_start: true, lufs: Some(-14.0) }
+        ExportSettings { height: None, fps: None, codec: VideoCodec::H264, quality: 1.0, kbps: None, constant_bitrate: false, gop: 2.0, profile_high: true, audio_kbps: 192, mono: false, fast_start: true, lufs: Some(-14.0) }
     }
 }
 
@@ -129,7 +170,8 @@ impl ExportSettings {
             width: w,
             height: h,
             fps,
-            video_kbps: self.kbps.unwrap_or_else(|| (base_kbps(w, h, fps) as f64 * self.quality) as u32).clamp(300, 150_000),
+            codec: self.codec,
+            video_kbps: self.kbps.unwrap_or_else(|| self.auto_kbps(w, h, fps)).clamp(300, 150_000),
             range,
             audio_gain: 1.0,
             limiter: false,
@@ -142,6 +184,184 @@ impl ExportSettings {
             title: title.trim().to_string(),
             author: author.trim().to_string(),
         }
+    }
+
+    /// Bitrate ohne feste Vorgabe: Grundwert × Qualität × Codec-Faktor.
+    pub fn auto_kbps(&self, w: usize, h: usize, fps: u32) -> u32 {
+        (base_kbps(w, h, fps) as f64 * self.quality * self.codec.bitrate_factor()) as u32
+    }
+
+    /// Kann dieser Rechner die Einstellungen exportieren? Sonst ein Satz, warum nicht.
+    pub fn check(&self, caps: &[EncoderCaps], rw: i64, rh: i64) -> Result<(), String> {
+        let Some(c) = caps.iter().find(|c| c.codec == self.codec) else {
+            return Err(format!("{} gibt es auf diesem Rechner nicht.", self.codec.label()));
+        };
+        let (w, h) = output_size(rw, rh, self.height);
+        if !c.fits(w, h) {
+            return Err(format!("{w} × {h} ist für {} auf diesem Rechner zu groß.", self.codec.label()));
+        }
+        Ok(())
+    }
+
+    /// Passt die Einstellungen an das an, was dieser Rechner kann: anderer Codec, kleinere Auflösung, Bitratenmodus
+    /// und Schlüsselbildabstand auf Standard, wenn der Encoder sie nicht einstellen lässt.
+    pub fn fit_to(&mut self, caps: &[EncoderCaps], rw: i64, rh: i64) {
+        let Some(c) = caps.iter().find(|c| c.codec == self.codec).or(caps.first()) else { return };
+        self.codec = c.codec;
+        if !c.fits_short(rw, rh, self.height) {
+            self.height = available_heights(c, rw, rh).into_iter().flatten().next();
+        }
+        if !c.rate_control {
+            self.constant_bitrate = false;
+            self.gop = 2.0;
+        }
+    }
+}
+
+/// Auflösungen im Export-Dialog, die der Encoder schafft (`None` = wie der Film).
+pub fn available_heights(c: &EncoderCaps, rw: i64, rh: i64) -> Vec<Option<i64>> {
+    [None, Some(2160), Some(1440), Some(1080), Some(720), Some(480)].into_iter().filter(|h| c.fits_short(rw, rh, *h)).collect()
+}
+
+/// Was ein Video-Encoder auf diesem Rechner kann (einmal ausprobiert: kurzer Export im Hoch- und Querformat).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncoderCaps {
+    pub codec: VideoCodec,
+    /// Name laut Windows (z. B. „NVIDIA HEVC Encoder MFT“) und ob er auf der Grafikkarte läuft
+    pub name: String,
+    pub hardware: bool,
+    /// größte erfolgreich getestete Breite und Höhe
+    pub max_w: usize,
+    pub max_h: usize,
+    /// Bitratenmodus (konstant/variabel) und Schlüsselbildabstand lassen sich einstellen
+    pub rate_control: bool,
+}
+
+impl EncoderCaps {
+    pub fn fits(&self, w: usize, h: usize) -> bool {
+        w <= self.max_w && h <= self.max_h
+    }
+
+    fn fits_short(&self, rw: i64, rh: i64, height: Option<i64>) -> bool {
+        let (w, h) = output_size(rw, rh, height);
+        self.fits(w, h)
+    }
+
+    /// „NVIDIA HEVC Encoder MFT“ → „NVIDIA-Grafikkarte“; Software-Encoder → „Prozessor“.
+    pub fn device(&self) -> String {
+        if !self.hardware {
+            return "Prozessor".into();
+        }
+        let n = self.name.to_lowercase();
+        let vendor = ["nvidia", "intel", "amd", "qualcomm"].into_iter().find(|v| n.contains(v));
+        match vendor {
+            Some("nvidia") => "NVIDIA-Grafikkarte".into(),
+            Some("intel") => "Intel-Grafik (Quick Sync)".into(),
+            Some("amd") => "AMD-Grafikkarte".into(),
+            Some("qualcomm") => "Qualcomm-Grafik".into(),
+            _ => "Grafikkarte".into(),
+        }
+    }
+}
+
+static ENCODERS: OnceLock<Vec<EncoderCaps>> = OnceLock::new();
+
+/// Verfügbare Encoder (beim ersten Aufruf ausprobiert, dauert je nach Rechner bis zu einigen Sekunden).
+pub fn encoders() -> &'static [EncoderCaps] {
+    ENCODERS.get_or_init(|| {
+        crate::video::init();
+        VideoCodec::ALL.into_iter().filter_map(probe_codec).collect()
+    })
+}
+
+/// Schon ausprobiert? (Der Export-Dialog wartet sonst, ohne die Oberfläche anzuhalten.)
+pub fn encoders_ready() -> Option<&'static [EncoderCaps]> {
+    ENCODERS.get().map(|v| v.as_slice())
+}
+
+/// Startet das Ausprobieren im Hintergrund (beim Programmstart).
+pub fn warm_up() {
+    std::thread::spawn(|| {
+        encoders();
+    });
+}
+
+/// Probiert einen Codec in 16:9 quer und hoch, jeweils von 4K abwärts, bis ein kurzer Export gelingt.
+fn probe_codec(codec: VideoCodec) -> Option<EncoderCaps> {
+    let mut caps: Option<EncoderCaps> = None;
+    for portrait in [false, true] {
+        for short in [2160usize, 1440, 1080, 720, 480] {
+            let long = short * 16 / 9;
+            let (w, h) = if portrait { (short, long) } else { (long, short) };
+            let Ok((name, hardware, rate_control)) = probe(codec, w, h) else { continue };
+            let c = caps.get_or_insert(EncoderCaps { codec, name, hardware, max_w: 0, max_h: 0, rate_control });
+            (c.max_w, c.max_h) = (c.max_w.max(w), c.max_h.max(h));
+            c.rate_control &= rate_control;
+            break;
+        }
+    }
+    caps
+}
+
+/// Kurzer Export von zwei schwarzen Bildern; liefert Encodername, Hardware ja/nein und ob Bitratenmodus und
+/// Schlüsselbildabstand angenommen wurden.
+fn probe(codec: VideoCodec, w: usize, h: usize) -> Result<(String, bool, bool), String> {
+    let dir = std::env::temp_dir().join("video-superbe-tests");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("probe-{:?}-{w}x{h}-{}.mp4", codec, std::process::id()));
+    let o = ExportOpts { width: w, height: h, fps: 30, codec, video_kbps: 8000, ..ExportOpts::from_project(&Project::default()) };
+    let r = (|| unsafe {
+        let (writer, vi, _, full) = open_writer(&path, &o, None)?;
+        let info = encoder_info(&writer, vi);
+        writer.BeginWriting().map_err(|e| e.to_string())?;
+        let black = rgba_to_nv12(&vec![0u8; w * h * 4], w, h);
+        for i in 0..2 {
+            let s = sample_from(&black, i * 333_333, 333_333)?;
+            writer.WriteSample(vi, &s).map_err(|e| e.to_string())?;
+        }
+        writer.Finalize().map_err(|e| e.to_string())?;
+        let ok = std::fs::metadata(&path).map(|m| m.len() > 200).unwrap_or(false);
+        if !ok {
+            return Err("leere Datei".to_string());
+        }
+        // Microsofts Software-Encoder tragen keinen Namen
+        let (name, hw) = match info {
+            Some((n, hw)) if !n.is_empty() => (n, hw),
+            other => (format!("Microsoft-{}-Encoder", codec.label()), other.is_some_and(|i| i.1)),
+        };
+        Ok((name, hw, full))
+    })();
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
+/// Name des Encoders, den der Sink-Writer für den Videostrom gewählt hat, und ob er Hardware ist.
+unsafe fn encoder_info(writer: &IMFSinkWriter, stream: u32) -> Option<(String, bool)> {
+    unsafe {
+        let ex: IMFSinkWriterEx = writer.cast().ok()?;
+        for i in 0..8 {
+            let mut cat = GUID::zeroed();
+            let mut t: Option<IMFTransform> = None;
+            if ex.GetTransformForStream(stream, i, Some(&mut cat), &mut t).is_err() {
+                break;
+            }
+            if cat != MFT_CATEGORY_VIDEO_ENCODER {
+                continue;
+            }
+            let attrs = t?.GetAttributes().ok()?;
+            let mut s = PWSTR::null();
+            let mut n = 0u32;
+            let name = if attrs.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut s, &mut n).is_ok() {
+                let v = s.to_string().unwrap_or_default();
+                windows::Win32::System::Com::CoTaskMemFree(Some(s.0 as *const _));
+                v
+            } else {
+                String::new()
+            };
+            let hw = attrs.GetItem(&MFT_ENUM_HARDWARE_URL_Attribute, None).is_ok();
+            return Some((name, hw));
+        }
+        None
     }
 }
 
@@ -214,80 +434,10 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
     }
     let a0 = (t0 * RATE as f64).round() as i64;
     let (w, h, fps) = (o.width & !1, o.height & !1, o.fps.max(1));
-    let e = |e: windows::core::Error| e.to_string();
     let audio = has_audio(p);
+    let chans: u32 = if o.mono { 1 } else { 2 };
     unsafe {
-        let mut attrs: Option<IMFAttributes> = None;
-        MFCreateAttributes(&mut attrs, 2).map_err(e)?;
-        let attrs = attrs.ok_or("Attribute")?;
-        attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1).map_err(e)?;
-        let _ = std::fs::remove_file(path);
-        let wpath = HSTRING::from(path.as_os_str());
-        let writer = MFCreateSinkWriterFromURL(PCWSTR(wpath.as_ptr()), None, &attrs).map_err(|er| format!("Datei kann nicht angelegt werden: {er}"))?;
-
-        // Video
-        let vout = MFCreateMediaType().map_err(e)?;
-        vout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(e)?;
-        vout.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).map_err(e)?;
-        vout.SetUINT32(&MF_MT_AVG_BITRATE, o.video_kbps * 1000).map_err(e)?;
-        vout.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(e)?;
-        vout.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32)).map_err(e)?;
-        vout.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)).map_err(e)?;
-        vout.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).map_err(e)?;
-        vout.SetUINT32(&MF_MT_MPEG2_PROFILE, if o.profile_high { 100 } else { 77 }).map_err(e)?; // High bzw. Main
-        let vi = writer.AddStream(&vout).map_err(e)?;
-        let vin = MFCreateMediaType().map_err(e)?;
-        vin.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(e)?;
-        vin.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).map_err(e)?;
-        vin.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(e)?;
-        vin.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32)).map_err(e)?;
-        vin.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)).map_err(e)?;
-        vin.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).map_err(e)?;
-        // Keine B-Bilder: sonst beginnt das Bild um ein Bild später als der Ton (Zeitversatz im Container).
-        // Bitratenmodus und Schlüsselbildabstand; lehnt ein Encoder sie ab, geht es mit seinen Standardwerten weiter.
-        let enc_attrs = |full: bool| -> Result<IMFAttributes, String> {
-            let mut enc: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut enc, 3).map_err(e)?;
-            let enc = enc.ok_or("Attribute")?;
-            enc.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0).map_err(e)?;
-            if full {
-                // eAVEncCommonRateControlMode: 0 = CBR, 2 = variabel (Durchschnitt)
-                enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, if o.constant_bitrate { 0 } else { 2 }).map_err(e)?;
-                enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, ((o.gop.max(0.5) * fps as f64).round() as u32).max(1)).map_err(e)?;
-            }
-            Ok(enc)
-        };
-        if writer.SetInputMediaType(vi, &vin, Some(&enc_attrs(true)?)).is_err() {
-            writer.SetInputMediaType(vi, &vin, Some(&enc_attrs(false)?)).map_err(|er| format!("Videoformat: {er}"))?;
-        }
-
-        // Audio
-        let mut ai = 0;
-        let chans: u32 = if o.mono { 1 } else { 2 };
-        if audio {
-            let aout = MFCreateMediaType().map_err(e)?;
-            aout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(e)?;
-            aout.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE as u32).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, chans).map_err(e)?;
-            // der Windows-AAC-Encoder kennt 96/128/160/192 kbit/s (bei Mono halbiert)
-            let kbps = if AAC_KBPS.contains(&o.audio_kbps) { o.audio_kbps } else { 192 };
-            aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, if o.mono { (kbps / 2).max(96) * 125 } else { kbps * 125 }).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 1).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29).map_err(e)?;
-            aout.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0).map_err(e)?;
-            ai = writer.AddStream(&aout).map_err(e)?;
-            let ain = MFCreateMediaType().map_err(e)?;
-            ain.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(e)?;
-            ain.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE as u32).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, chans).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * chans).map_err(e)?;
-            ain.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE as u32 * 2 * chans).map_err(e)?;
-            writer.SetInputMediaType(ai, &ain, None).map_err(|er| format!("Tonformat: {er}"))?;
-        }
+        let (writer, vi, ai, _) = open_writer(path, o, audio.then_some(chans))?;
         writer.BeginWriting().map_err(|er| format!("Start: {er}"))?;
 
         let mut renderer = Renderer::new();
@@ -338,11 +488,106 @@ pub fn export(p: &Project, path: &Path, o: &ExportOpts, progress: &mut dyn FnMut
         }
         writer.Finalize().map_err(|er| format!("Abschluss: {er}"))?;
     }
+    if o.codec == VideoCodec::Hevc {
+        // Media Foundation schreibt „hev1“; Apple (QuickTime, iPhone, Safari) spielt HEVC im MP4 nur als „hvc1“
+        crate::mp4post::tag_hvc1(path).map_err(|er| format!("Nachbearbeitung (HEVC-Kennung): {er}"))?;
+    }
     if o.fast_start || !o.title.is_empty() || !o.author.is_empty() {
         crate::mp4post::finish(path, o.fast_start, &o.title, &o.author).map_err(|er| format!("Nachbearbeitung (Fast Start/Metadaten): {er}"))?;
     }
     progress(1.0);
     Ok(())
+}
+
+/// Legt den Sink-Writer mit Video- und (bei `audio_chans`) Tonstrom an. Liefert die Stromnummern und ob der Encoder
+/// Bitratenmodus und Schlüsselbildabstand angenommen hat.
+unsafe fn open_writer(path: &Path, o: &ExportOpts, audio_chans: Option<u32>) -> Result<(IMFSinkWriter, u32, u32, bool), String> {
+    let (w, h, fps) = (o.width & !1, o.height & !1, o.fps.max(1));
+    let e = |e: windows::core::Error| e.to_string();
+    unsafe {
+        let mut attrs: Option<IMFAttributes> = None;
+        MFCreateAttributes(&mut attrs, 2).map_err(e)?;
+        let attrs = attrs.ok_or("Attribute")?;
+        attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1).map_err(e)?;
+        // HEVC-Encoder sitzen fast immer auf der Grafikkarte; H.264 bleibt beim bewährten Software-Encoder
+        if o.codec == VideoCodec::Hevc {
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).map_err(e)?;
+        }
+        let _ = std::fs::remove_file(path);
+        let wpath = HSTRING::from(path.as_os_str());
+        let writer = MFCreateSinkWriterFromURL(PCWSTR(wpath.as_ptr()), None, &attrs).map_err(|er| format!("Datei kann nicht angelegt werden: {er}"))?;
+
+        // Video
+        let vout = MFCreateMediaType().map_err(e)?;
+        vout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(e)?;
+        vout.SetGUID(&MF_MT_SUBTYPE, &o.codec.subtype()).map_err(e)?;
+        vout.SetUINT32(&MF_MT_AVG_BITRATE, o.video_kbps * 1000).map_err(e)?;
+        vout.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(e)?;
+        vout.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32)).map_err(e)?;
+        vout.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)).map_err(e)?;
+        vout.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).map_err(e)?;
+        // H.264 High bzw. Main; HEVC Main (8 Bit, 4:2:0)
+        let profile = match o.codec {
+            VideoCodec::H264 if o.profile_high => 100,
+            VideoCodec::H264 => 77,
+            VideoCodec::Hevc => 1,
+        };
+        vout.SetUINT32(&MF_MT_MPEG2_PROFILE, profile).map_err(e)?;
+        let vi = writer.AddStream(&vout).map_err(|er| format!("{} wird nicht unterstützt: {er}", o.codec.label()))?;
+        let vin = MFCreateMediaType().map_err(e)?;
+        vin.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(e)?;
+        vin.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).map_err(e)?;
+        vin.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(e)?;
+        vin.SetUINT64(&MF_MT_FRAME_SIZE, pack(w as u32, h as u32)).map_err(e)?;
+        vin.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)).map_err(e)?;
+        vin.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).map_err(e)?;
+        // Keine B-Bilder: sonst beginnt das Bild um ein Bild später als der Ton (Zeitversatz im Container).
+        // Bitratenmodus und Schlüsselbildabstand; lehnt ein Encoder sie ab, geht es mit seinen Standardwerten weiter.
+        let enc_attrs = |full: bool| -> Result<IMFAttributes, String> {
+            let mut enc: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut enc, 3).map_err(e)?;
+            let enc = enc.ok_or("Attribute")?;
+            enc.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0).map_err(e)?;
+            if full {
+                // eAVEncCommonRateControlMode: 0 = CBR, 2 = variabel (Durchschnitt)
+                enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, if o.constant_bitrate { 0 } else { 2 }).map_err(e)?;
+                enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, ((o.gop.max(0.5) * fps as f64).round() as u32).max(1)).map_err(e)?;
+            }
+            Ok(enc)
+        };
+        let full = writer.SetInputMediaType(vi, &vin, Some(&enc_attrs(true)?)).is_ok();
+        if !full {
+            writer.SetInputMediaType(vi, &vin, Some(&enc_attrs(false)?)).map_err(|er| format!("Videoformat: {er}"))?;
+        }
+
+        // Audio
+        let mut ai = 0;
+        if let Some(chans) = audio_chans {
+            let aout = MFCreateMediaType().map_err(e)?;
+            aout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(e)?;
+            aout.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).map_err(e)?;
+            aout.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(e)?;
+            aout.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE as u32).map_err(e)?;
+            aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, chans).map_err(e)?;
+            // der Windows-AAC-Encoder kennt 96/128/160/192 kbit/s (bei Mono halbiert)
+            let kbps = if AAC_KBPS.contains(&o.audio_kbps) { o.audio_kbps } else { 192 };
+            aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, if o.mono { (kbps / 2).max(96) * 125 } else { kbps * 125 }).map_err(e)?;
+            aout.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 1).map_err(e)?;
+            aout.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29).map_err(e)?;
+            aout.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0).map_err(e)?;
+            ai = writer.AddStream(&aout).map_err(e)?;
+            let ain = MFCreateMediaType().map_err(e)?;
+            ain.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(e)?;
+            ain.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE as u32).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, chans).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * chans).map_err(e)?;
+            ain.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE as u32 * 2 * chans).map_err(e)?;
+            writer.SetInputMediaType(ai, &ain, None).map_err(|er| format!("Tonformat: {er}"))?;
+        }
+        Ok((writer, vi, ai, full))
+    }
 }
 
 #[cfg(test)]
@@ -528,6 +773,95 @@ mod tests {
         assert!(f.iter().sum::<f64>() / 3.0 > 20.0 && f.iter().sum::<f64>() / 3.0 < 250.0, "Bild vorhanden: {f:?}");
         let g = mean_rgb(d.frame_at(0.05).unwrap());
         assert!((f[0] - g[0]).abs() < 60.0, "ähnliche Bilder im Abstand von 0,45 s");
+    }
+
+    #[test]
+    fn encoders_are_probed() {
+        let e = encoders();
+        eprintln!("{e:#?}");
+        let h264 = e.iter().find(|c| c.codec == VideoCodec::H264).expect("H.264 gibt es unter Windows immer");
+        assert!(h264.fits(1920, 1080) && h264.fits(1080, 1920), "{h264:?}");
+        assert!(!h264.hardware, "H.264 bleibt beim Software-Encoder");
+        assert!(encoders_ready().is_some());
+    }
+
+    #[test]
+    fn exports_hevc_when_the_hardware_can() {
+        let Some(c) = encoders().iter().find(|c| c.codec == VideoCodec::Hevc) else {
+            eprintln!("kein HEVC-Encoder auf diesem Rechner, Test übersprungen");
+            return;
+        };
+        eprintln!("HEVC über {} ({})", c.name, c.device());
+        let mut p = test_project();
+        let wav = write_sine_wav("exp_hevc_tone.wav", 440.0, 2.0, 48000, 0.5);
+        let a = MediaAsset { path: wav.to_string_lossy().into_owned(), name: "tone".into(), duration: 2.0, has_audio: true, ..Default::default() };
+        let aid = a.id;
+        p.assets.push(a);
+        p.tracks[1].clips.push(Clip { part: ClipPart::Audio, ..clip(aid, 0.0, 2.0) });
+        let s = ExportSettings { codec: VideoCodec::Hevc, ..Default::default() };
+        let mut o = s.opts(&p, None, "HEVC-Test", "");
+        assert!(o.video_kbps < ExportSettings::default().opts(&p, None, "", "").video_kbps, "HEVC braucht weniger Bitrate");
+        let out = std::env::temp_dir().join("video-superbe-tests").join("export_hevc_out.mp4");
+        export(&p, &out, &o, &mut |_| true).expect("HEVC-Export");
+        assert_eq!(crate::mp4post::sample_entry_kinds(&out).unwrap(), vec!["hvc1", "mp4a"], "Apple-taugliche Kennung");
+        // Parametersätze (VPS, SPS, PPS) stecken in hvcC: Anzahl der Arrays steht hinter 22 Bytes Konfiguration
+        let d = std::fs::read(&out).unwrap();
+        let i = d.windows(4).position(|w| w == b"hvcC").expect("hvcC") + 4;
+        assert!(d[i + 22] >= 3, "VPS/SPS/PPS in hvcC: {}", d[i + 22]);
+        assert_eq!(crate::mp4post::read_metadata(&out).unwrap().0, "HEVC-Test");
+        let info = crate::video::probe(&out).expect("probe");
+        assert_eq!((info.width, info.height), (320, 180), "{info:?}");
+        assert!(info.has_audio && (info.duration - 2.0).abs() < 0.25, "{info:?}");
+        let mut dec = Decoder::open(&out).unwrap();
+        let f1 = mean_rgb(dec.frame_at(0.4).unwrap());
+        assert!(f1[0] > 150.0 && f1[2] < 90.0, "erstes Bild rot: {f1:?}");
+        let f0 = mean_rgb(dec.frame_at(0.0).unwrap());
+        assert!(f0[0] > 150.0, "Bild beginnt sofort (kein Versatz): {f0:?}");
+        let f2 = mean_rgb(dec.frame_at(1.5).unwrap());
+        assert!(f2[2] > 150.0 && f2[0] < 90.0, "zweites Bild blau: {f2:?}");
+        let mut ad = AudioDecoder::open(&out).unwrap();
+        let r = rms(&ad.read(RATE / 2, RATE as usize / 2));
+        assert!(r > 0.2 && r < 0.5, "Ton vorhanden, rms={r}");
+        // Bitratenmodus und Schlüsselbildabstand nur, wenn der Encoder sie annimmt
+        if c.rate_control {
+            (o.constant_bitrate, o.gop) = (true, 1.0);
+            export(&p, &out, &o, &mut |_| true).expect("HEVC konstant");
+            assert!(crate::video::probe(&out).is_ok());
+        }
+    }
+
+    #[test]
+    fn settings_fit_the_available_encoders() {
+        let h264 = EncoderCaps { codec: VideoCodec::H264, name: "H264 Encoder MFT".into(), hardware: false, max_w: 3840, max_h: 2160, rate_control: true };
+        let hevc = EncoderCaps { codec: VideoCodec::Hevc, name: "NVIDIA HEVC Encoder MFT".into(), hardware: true, max_w: 3840, max_h: 3840, rate_control: false };
+        assert_eq!(hevc.device(), "NVIDIA-Grafikkarte");
+        assert_eq!(h264.device(), "Prozessor");
+        // Hochformat 4K: 2160 × 3840 passt nur zu HEVC
+        let (rw, rh) = (1080, 1920);
+        assert_eq!(available_heights(&h264, rw, rh), vec![None, Some(1080), Some(720), Some(480)]);
+        assert_eq!(available_heights(&hevc, rw, rh), vec![None, Some(2160), Some(1440), Some(1080), Some(720), Some(480)]);
+        let mut s = ExportSettings { height: Some(2160), codec: VideoCodec::Hevc, constant_bitrate: true, gop: 5.0, ..Default::default() };
+        assert!(s.check(&[h264.clone(), hevc.clone()], rw, rh).is_ok());
+        assert!(s.check(&[h264.clone()], rw, rh).is_err(), "kein HEVC");
+        // ohne HEVC: zurück auf H.264 und die größte Auflösung, die geht
+        s.fit_to(&[h264.clone()], rw, rh);
+        assert_eq!((s.codec, s.height, s.constant_bitrate, s.gop), (VideoCodec::H264, Some(1080), true, 5.0));
+        // HEVC ohne einstellbaren Bitratenmodus: Standardwerte
+        let mut s = ExportSettings { codec: VideoCodec::Hevc, constant_bitrate: true, gop: 5.0, ..Default::default() };
+        s.fit_to(&[h264.clone(), hevc.clone()], 1920, 1080);
+        assert_eq!((s.codec, s.constant_bitrate, s.gop), (VideoCodec::Hevc, false, 2.0));
+        // Querformat 4K mit H.264: bleibt
+        let mut s = ExportSettings { height: Some(2160), ..Default::default() };
+        s.fit_to(&[h264.clone()], 1920, 1080);
+        assert_eq!(s.height, Some(2160));
+        // Film größer als alles: „Wie der Film“ wird zur größten passenden Stufe
+        let mut s = ExportSettings::default();
+        s.fit_to(&[h264], 5120, 2880);
+        assert_eq!(s.height, Some(2160));
+        // Codec im JSON (eigene Voreinstellungen); alte Einträge ohne Codec → H.264
+        let j = serde_json::to_string(&ExportSettings { codec: VideoCodec::Hevc, ..Default::default() }).unwrap();
+        assert!(j.contains("\"codec\":\"hevc\""), "{j}");
+        assert_eq!(serde_json::from_str::<ExportSettings>("{\"height\":720}").unwrap().codec, VideoCodec::H264);
     }
 
     #[test]

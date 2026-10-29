@@ -203,6 +203,64 @@ pub fn finish(path: &Path, fast_start: bool, title: &str, author: &str) -> Resul
     })
 }
 
+/// Sammelt die Sample-Einträge (`stsd`) aller Spuren: Lage des Typs in der Datei und Typ. `base` = Dateiposition von `data`.
+fn collect_entries(data: &[u8], base: u64, out: &mut Vec<(u64, [u8; 4])>) {
+    let mut i = 0;
+    while i + 8 <= data.len() {
+        let len = be32(data, i) as usize;
+        if len < 8 || i + len > data.len() {
+            return;
+        }
+        let kind: [u8; 4] = data[i + 4..i + 8].try_into().unwrap();
+        let inner = &data[i + 8..i + len];
+        let at = base + i as u64 + 8;
+        if CONTAINERS[..5].contains(&&kind) {
+            collect_entries(inner, at, out);
+        } else if &kind == b"stsd" && inner.len() >= 8 {
+            // Version/Flags, Anzahl, dann die Einträge als Boxen
+            let mut j = 8;
+            for _ in 0..be32(inner, 4) {
+                if j + 8 > inner.len() || be32(inner, j) < 8 {
+                    break;
+                }
+                out.push((at + j as u64 + 4, inner[j + 4..j + 8].try_into().unwrap()));
+                j += be32(inner, j) as usize;
+            }
+        }
+        i += len;
+    }
+}
+
+fn entries(f: &mut File) -> Result<Vec<(u64, [u8; 4])>, String> {
+    let tops = read_tops(f)?;
+    let moov = tops.iter().find(|t| &t.kind == b"moov").ok_or("MP4 ohne moov")?;
+    let mut body = vec![0u8; (moov.len - 8) as usize];
+    f.seek(SeekFrom::Start(moov.start + 8)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut body).map_err(|e| e.to_string())?;
+    let mut v = vec![];
+    collect_entries(&body, moov.start + 8, &mut v);
+    Ok(v)
+}
+
+/// Benennt HEVC-Einträge `hev1` in `hvc1` um (gleiche Länge, nur 4 Bytes). Media Foundation legt die Parametersätze
+/// ohnehin in `hvcC` ab; Apple-Geräte spielen HEVC im MP4 nur mit `hvc1`.
+pub fn tag_hvc1(path: &Path) -> Result<(), String> {
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| e.to_string())?;
+    for (at, kind) in entries(&mut f)? {
+        if &kind == b"hev1" {
+            f.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+            f.write_all(b"hvc1").map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Typen der Sample-Einträge aller Spuren, z. B. `["hvc1", "mp4a"]` (für Tests und Diagnose).
+pub fn sample_entry_kinds(path: &Path) -> Result<Vec<String>, String> {
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    Ok(entries(&mut f)?.iter().map(|(_, k)| String::from_utf8_lossy(k).into_owned()).collect())
+}
+
 /// Reihenfolge der obersten Boxen (für Tests und Diagnose).
 pub fn top_level_kinds(path: &Path) -> Result<Vec<String>, String> {
     let mut f = File::open(path).map_err(|e| e.to_string())?;

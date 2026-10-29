@@ -42,7 +42,7 @@ Standbilder), liegt im Ordner `VideoSuperbe-Daten` neben der EXE.
 | **Messinstrumente** | Histogramm und RGB-Parade (Ansicht ▸ Messinstrumente) |
 | **Ansicht** | Vollbildvorschau (Doppelklick auf den Monitor oder Alt+Enter) |
 | **Sonstiges** | Standbild einfügen und exportieren, Kapitelmarken für YouTube, Autosave mit Wiederherstellung, fehlende Medien neu verknüpfen, Zwischenspeicher-Übersicht (Datei ▸ Zwischenspeicher) |
-| **Export** | MP4 (H.264 + AAC) mit Voreinstellungen (auch eigene), Auflösung (kurze Seite, auch Hochformat), Bildrate, Qualität oder feste Bitrate, CBR/VBR, Schlüsselbildabstand, Profil High/Main, AAC 96–192 kbit/s, Mono, Fast Start, Titel/Autor, YouTube-Kapitelliste; nur der Bereich zwischen den Marken; Lautheit normalisieren (−14 / −16 / −23 LUFS, ITU-R BS.1770) mit Limiter (−1 dBFS) und Nachmessen |
+| **Export** | MP4 (H.264 oder HEVC/H.265 + AAC) mit Voreinstellungen (auch eigene), Auflösung (kurze Seite, auch Hochformat), Bildrate, Qualität oder feste Bitrate, CBR/VBR, Schlüsselbildabstand, Profil High/Main, AAC 96–192 kbit/s, Mono, Fast Start, Titel/Autor, YouTube-Kapitelliste; nur der Bereich zwischen den Marken; Lautheit normalisieren (−14 / −16 / −23 LUFS, ITU-R BS.1770) mit Limiter (−1 dBFS) und Nachmessen |
 
 Die Vorschau benutzt denselben Renderer wie der Export: Was man sieht, kommt auch in die Datei. Der Renderer rechnet in parallelen Bildbändern auf allen Prozessorkernen und setzt das Vorschaubild nur neu zusammen, wenn sich etwas ändert. Mit `VSB_PERF=1` schreibt das Programm ein Leistungsprotokoll (`perf.log` im Datenordner).
 
@@ -86,7 +86,7 @@ Wie in der Mac-Version, mit Strg statt ⌘ und Alt statt ⌥.
 
 Nicht enthalten (sie brauchen Apples Frameworks): Person freistellen, KI-Verbesserung (Rauschfilter und Hochskalieren mit
 VideoToolbox), Hintergrund-Effekte hinter dem Motiv und Smart-Kamerafahrt (Motiv- und Gesichtserkennung mit Vision);
-außerdem Webcam- und Bildschirmaufnahme, rückwärts abspielen, HEVC-Export und automatische Untertitel per Spracherkennung.
+außerdem Webcam- und Bildschirmaufnahme, rückwärts abspielen und automatische Untertitel per Spracherkennung.
 Projekte mit diesen Einstellungen lassen sich trotzdem öffnen und bearbeiten; die Einstellungen bleiben in der Datei erhalten.
 
 ## HEVC / H.265 (iPhone, GoPro) und HDR
@@ -102,6 +102,13 @@ Windows hat für Programme ohne Installation keinen HEVC-Decoder. Video superbe 
 - **HDR (HLG, PQ)**: BT.2020-Material wird beim Decodieren nach SDR/BT.709 umgerechnet (Tonemapping mit weichem Spitzenlicht),
   damit die Farben nicht flach wirken.
 - Die Vorschau decodiert im Hintergrund mit Vorlauf; die Oberfläche blockiert nie.
+
+**HEVC-Export**: über den Encoder der Grafikkarte (NVIDIA NVENC, Intel Quick Sync, AMD) oder, falls installiert, die
+HEVC-Videoerweiterungen aus dem Store. Beim Programmstart probiert Video superbe im Hintergrund aus, welche Encoder es gibt
+und bis zu welcher Bildgröße sie arbeiten (kurzer Export im Quer- und Hochformat); der Export-Dialog bietet nur an, was
+dabei geklappt hat (Codec, Auflösungen, Bitratenmodus und Schlüsselbildabstand, Voreinstellungen). HEVC wird als Main
+(8 Bit) mit der Kennung `hvc1` geschrieben, damit QuickTime, iPhone und Safari die Datei abspielen; die automatische
+Bitrate liegt bei etwa zwei Dritteln der H.264-Bitrate. H.264 bleibt beim Software-Encoder von Windows.
 
 ## Selbst bauen
 
@@ -137,9 +144,9 @@ powershell -File tests\e2e.ps1 -Exe target\x86_64-pc-windows-gnu\release\video-s
 
 ```
 VideoSuperbe.exe [projekt.mvd.json]
-VideoSuperbe.exe --export projekt.mvd.json ausgabe.mp4     # Ergebnis in ausgabe.mp4.log
+VideoSuperbe.exe --export projekt.mvd.json ausgabe.mp4 [hevc]  # Ergebnis in ausgabe.mp4.log
 VideoSuperbe.exe --videotest datei.mp4 [sekunden ...]      # schreibt videotest.txt
-VideoSuperbe.exe --gpuinfo                                 # Grafikkarte und HEVC-Unterstützung
+VideoSuperbe.exe --gpuinfo                                 # Grafikkarte, HEVC-Decoder und Export-Encoder
 ```
 
 ## Lizenzen von Drittkomponenten

@@ -173,6 +173,8 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, arg: Option<PathBuf>) -> Self {
         let mut app = Self::with_ctx(&cc.egui_ctx, arg.clone());
+        // Encoder schon jetzt ausprobieren, damit der Export-Dialog nur anbietet, was dieser Rechner kann
+        export::warm_up();
         // Sicherung eines nicht gesicherten Projekts anbieten (nur beim Start ohne Projektdatei)
         app.feat.restore_offer = arg.is_none() && app.autosave_path().exists();
         app
@@ -379,6 +381,9 @@ impl App {
         if self.export_job.is_some() || self.project.duration() <= 0.0 {
             return;
         }
+        if export::encoders_ready().is_none() {
+            export::warm_up();
+        }
         let mut cfg = ExportCfg {
             preset: String::new(),
             s: export::ExportSettings::default(),
@@ -460,6 +465,9 @@ impl App {
         if !cfg.manual_bitrate {
             s.kbps = None;
         }
+        if let Some(caps) = export::encoders_ready() {
+            s.fit_to(caps, p.render_width, p.render_height);
+        }
         let mut opts = s.opts(&p, (!whole).then_some(range), &cfg.title, &cfg.author);
         std::thread::spawn(move || {
             let mut base = 0.0;
@@ -511,9 +519,18 @@ impl App {
         let mut delete_preset: Option<String> = None;
         let mut copy_chapters = false;
         let p = &self.project;
-        let (ow, oh) = export::output_size(p.render_width, p.render_height, cfg.s.height);
+        let (rw, rh) = (p.render_width, p.render_height);
+        // nur anbieten, was die Encoder dieses Rechners können (beim Start ausprobiert)
+        let caps = export::encoders_ready();
+        if let Some(caps) = caps {
+            cfg.s.fit_to(caps, rw, rh);
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let enc = caps.and_then(|c| c.iter().find(|e| e.codec == cfg.s.codec));
+        let (ow, oh) = export::output_size(rw, rh, cfg.s.height);
         let ofps = cfg.s.fps.unwrap_or(p.fps).clamp(1, 120) as u32;
-        let auto_kbps = (export::base_kbps(ow, oh, ofps) as f64 * cfg.s.quality) as u32;
+        let auto_kbps = cfg.s.auto_kbps(ow, oh, ofps);
         let video_kbps = if cfg.manual_bitrate { cfg.s.kbps.unwrap_or(auto_kbps) } else { auto_kbps };
         let audio_kbps = if !has_audio { 0 } else if cfg.s.mono { (cfg.s.audio_kbps / 2).max(96) } else { cfg.s.audio_kbps };
         let secs = match (cfg.use_range, mark_range) {
@@ -544,7 +561,12 @@ impl App {
                             if i == n_builtin {
                                 ui.separator();
                             }
-                            if ui.selectable_label(cfg.preset == item.name, &item.name).clicked() {
+                            let ok = caps.map(|c| item.settings.check(c, rw, rh));
+                            let r = ui.add_enabled(matches!(ok, Some(Ok(()))), egui::Button::selectable(cfg.preset == item.name, &item.name));
+                            if let Some(Err(why)) = &ok {
+                                r.clone().on_disabled_hover_text(why.as_str());
+                            }
+                            if r.clicked() {
                                 cfg.apply(item);
                             }
                         }
@@ -594,8 +616,9 @@ impl App {
                         Some(480) => "SD (480p)".into(),
                         Some(x) => format!("{x}p"),
                     };
+                    let heights = enc.map(|c| export::available_heights(c, rw, rh)).unwrap_or_default();
                     egui::ComboBox::from_id_salt("export_h").width(150.0).selected_text(label(cfg.s.height)).show_ui(ui, |ui| {
-                        for h in [None, Some(2160), Some(1440), Some(1080), Some(720), Some(480)] {
+                        for h in heights {
                             ui.selectable_value(&mut cfg.s.height, h, label(h));
                         }
                     });
@@ -609,8 +632,25 @@ impl App {
                         }
                     });
                 });
-                row(ui, "Codec", &mut |ui| {
-                    ui.weak("H.264 (überall abspielbar) + AAC");
+                row(ui, "Codec", &mut |ui| match caps {
+                    None => {
+                        ui.spinner();
+                        ui.weak("Encoder werden geprüft …");
+                    }
+                    Some([]) => {
+                        ui.colored_label(Color32::from_rgb(230, 140, 80), "Kein Video-Encoder gefunden (Windows N ohne Media Feature Pack?)");
+                    }
+                    Some(all) => {
+                        for c in all {
+                            ui.selectable_value(&mut cfg.s.codec, c.codec, c.codec.label()).on_hover_text(format!("{} ({})", c.name, c.device()));
+                        }
+                        if let Some(c) = enc {
+                            ui.weak(match c.codec {
+                                export::VideoCodec::H264 => format!("überall abspielbar · {}", c.device()),
+                                export::VideoCodec::Hevc => format!("kleinere Dateien · {}", c.device()),
+                            });
+                        }
+                    }
                 });
                 head(ui, "Video");
                 row(ui, "Qualität", &mut |ui| {
@@ -643,18 +683,25 @@ impl App {
                     });
                 }
                 egui::CollapsingHeader::new(egui::RichText::new("Erweitert").size(12.0)).id_salt("export_adv").default_open(cfg.advanced).show(ui, |ui| {
-                    row(ui, "Bitratenmodus", &mut |ui| {
-                        ui.selectable_value(&mut cfg.s.constant_bitrate, false, "Variabel (Durchschnitt)");
-                        ui.selectable_value(&mut cfg.s.constant_bitrate, true, "Konstant");
-                    });
-                    row(ui, "Schlüsselbilder", &mut |ui| {
-                        for (g, t) in [(1.0, "alle 1 s"), (2.0, "alle 2 s"), (5.0, "alle 5 s")] {
-                            ui.selectable_value(&mut cfg.s.gop, g, t);
-                        }
-                    });
+                    // Bitratenmodus und Schlüsselbildabstand nur, wenn der Encoder sie einstellen lässt
+                    if enc.is_some_and(|c| c.rate_control) {
+                        row(ui, "Bitratenmodus", &mut |ui| {
+                            ui.selectable_value(&mut cfg.s.constant_bitrate, false, "Variabel (Durchschnitt)");
+                            ui.selectable_value(&mut cfg.s.constant_bitrate, true, "Konstant");
+                        });
+                        row(ui, "Schlüsselbilder", &mut |ui| {
+                            for (g, t) in [(1.0, "alle 1 s"), (2.0, "alle 2 s"), (5.0, "alle 5 s")] {
+                                ui.selectable_value(&mut cfg.s.gop, g, t);
+                            }
+                        });
+                    }
                     row(ui, "Profil", &mut |ui| {
-                        ui.selectable_value(&mut cfg.s.profile_high, true, "High");
-                        ui.selectable_value(&mut cfg.s.profile_high, false, "Main (ältere Geräte)");
+                        if cfg.s.codec == export::VideoCodec::Hevc {
+                            ui.weak("Main (8 Bit)");
+                        } else {
+                            ui.selectable_value(&mut cfg.s.profile_high, true, "High");
+                            ui.selectable_value(&mut cfg.s.profile_high, false, "Main (ältere Geräte)");
+                        }
                     });
                     ui.weak("Farbraum: Rec.709. HDR-Material wird in den Film umgerechnet. Ohne B-Bilder (sonst liegt der Ton um ein Bild versetzt).");
                 });
@@ -725,7 +772,8 @@ impl App {
                 }
                 ui.add_space(4.0);
                 ui.weak(format!(
-                    "{ow}×{oh} · {ofps} Bilder/s · Video ca. {:.1} Mbit/s + Ton {audio_kbps} kbit/s · Dauer {}:{:02} · Größe ca. {:.0} MB",
+                    "{ow}×{oh} · {ofps} Bilder/s · {} ca. {:.1} Mbit/s + Ton {audio_kbps} kbit/s · Dauer {}:{:02} · Größe ca. {:.0} MB",
+                    cfg.s.codec.label(),
                     video_kbps as f64 / 1000.0,
                     secs as u64 / 60,
                     secs as u64 % 60,
@@ -733,7 +781,8 @@ impl App {
                 ));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Exportieren …").clicked() {
+                    let ready = caps.is_some_and(|c| cfg.s.check(c, rw, rh).is_ok());
+                    if ui.add_enabled(ready, egui::Button::new("Exportieren …")).clicked() {
                         go = true;
                     }
                     if ui.button("Abbrechen").clicked() {
