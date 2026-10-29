@@ -7,7 +7,7 @@ mod inspector;
 mod inspector3;
 mod storyboard;
 mod inspector2;
-mod monitor;
+pub(crate) mod monitor;
 mod overlay;
 pub use animator::AnimGeom;
 pub use overlay::{OverlayBox, OverlayDrag};

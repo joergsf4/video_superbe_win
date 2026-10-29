@@ -108,6 +108,10 @@ pub struct App {
     pub(crate) source_player: Option<Player>,
     /// Lage des Vorschaubereichs im Fenster (Klick daneben schließt den Quellmonitor)
     pub(crate) preview_rect: Rect,
+    /// Breite des Medienpools im letzten Bild und wofür sie zuletzt an das Filmformat angepasst wurde
+    /// (Format, Monitorhöhe, Fensterbreite)
+    pub(crate) pool_w: f32,
+    pub(crate) pool_fit_key: Option<(i64, i64, i32, i32)>,
     /// Entwurf der Filmeinstellungen (Seitenverhältnis-Index, kurze Seite, Bildrate), erst „OK“ übernimmt ihn
     pub(crate) settings_draft: Option<(usize, i64, i64)>,
     /// Wellenformen (Spitzenwerte je Medium) und laufende Berechnungen
@@ -224,6 +228,8 @@ impl App {
             source: None,
             source_player: None,
             preview_rect: Rect::NOTHING,
+            pool_w: 0.0,
+            pool_fit_key: None,
             settings_draft: None,
             waveforms: HashMap::new(),
             wave_jobs: HashMap::new(),

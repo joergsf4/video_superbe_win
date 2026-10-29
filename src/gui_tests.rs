@@ -1629,6 +1629,41 @@ fn zoom_on_region_by_drawing_a_frame_in_the_monitor() {
 }
 
 #[test]
+fn pool_takes_the_space_the_portrait_monitor_does_not_need() {
+    use crate::ui::monitor::{MON_HEADER, MON_MARGIN, MON_TRANSPORT, POOL_DEFAULT};
+    let (mut p, _) = project();
+    (p.render_width, p.render_height) = (1080, 1920);
+    let mut h = H::new(p);
+    h.frames(4);
+    let r = h.app.preview_rect;
+    let frame_w = (r.height() - MON_HEADER - MON_TRANSPORT - 2.0 * MON_MARGIN) * 1080.0 / 1920.0;
+    let fitted = h.app.pool_w;
+    assert!(fitted > POOL_DEFAULT + 100.0, "Pool breiter: {fitted}");
+    assert!((r.width() - frame_w - 2.0 * MON_MARGIN).abs() < 3.0, "Monitor so breit wie das Bild: {} vs. {}", r.width(), frame_w);
+    // Pool von Hand schmaler ziehen (Kante zwischen Monitor und Pool nach rechts): bleibt so, solange sich nichts ändert
+    let edge = Pos2::new(r.right(), r.center().y);
+    h.drag(edge, edge + Vec2::new(120.0, 0.0));
+    h.frames(3);
+    let manual = h.app.pool_w;
+    assert!(manual < fitted - 80.0, "von Hand schmaler: {fitted} → {manual}");
+    h.frames(3);
+    assert_eq!(h.app.pool_w, manual, "von Hand gezogen bleibt");
+    // Querformat: der Monitor braucht die Breite, der Pool wird wieder schmal (so schmal sein Inhalt es zulässt) und bleibt so
+    (h.app.project.render_width, h.app.project.render_height) = (1920, 1080);
+    h.frames(4);
+    let narrow = h.app.pool_w;
+    assert!(narrow < 450.0, "Pool wieder schmal: {narrow}");
+    let r = h.app.preview_rect;
+    h.frames(4);
+    assert_eq!((h.app.pool_w, h.app.preview_rect), (narrow, r), "kein Hin- und Herspringen");
+    // die Rechnung selbst
+    assert_eq!(crate::ui::monitor::pool_width_for(500.0, 424.0, 340.0, 16.0 / 9.0), POOL_DEFAULT, "zu eng für Querformat: übliche Breite");
+    // 600 px Bildhöhe im Hochformat: Bild 337,5 + Rand 60 → Monitor 397,5; der Rest von 1200 geht an den Pool
+    assert!((crate::ui::monitor::pool_width_for(800.0, 724.0, 340.0, 9.0 / 16.0) - (340.0 + 800.0 - 397.5)).abs() < 0.01);
+    assert_eq!(crate::ui::monitor::pool_width_for(2000.0, 724.0, 340.0, 9.0 / 16.0), crate::ui::monitor::POOL_MAX, "höchstens POOL_MAX");
+}
+
+#[test]
 fn export_dialog_offers_only_what_the_encoders_can() {
     let (p, aid) = audio_project();
     let mut h = H::new(p);
@@ -1687,3 +1722,4 @@ fn export_dialog_presets_cache_window_and_rename_render() {
     h.app.rename_track(2, "  ");
     assert_eq!(h.app.project.tracks[2].name, "Spur 3", "leer = wieder „Spur N“");
 }
+

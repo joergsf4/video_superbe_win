@@ -7,6 +7,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Kopfzeile und Transportleiste des Monitors, Rand um das Filmbild.
+pub(crate) const MON_HEADER: f32 = 26.0;
+pub(crate) const MON_TRANSPORT: f32 = 38.0;
+pub(crate) const MON_MARGIN: f32 = 30.0;
+/// Übliche und größte Breite des Medienpools.
+pub(crate) const POOL_DEFAULT: f32 = 340.0;
+pub(crate) const POOL_MAX: f32 = 1400.0;
+
+/// Poolbreite, bei der der Monitor (jetzt `monitor_w` × `monitor_h`, Pool `pool_w`) gerade so breit ist wie das eingepasste
+/// Filmbild samt Rand. Querformat mit wenig Platz: übliche Breite.
+pub(crate) fn pool_width_for(monitor_w: f32, monitor_h: f32, pool_w: f32, aspect: f32) -> f32 {
+    let frame_h = (monitor_h - MON_HEADER - MON_TRANSPORT - 2.0 * MON_MARGIN).max(1.0);
+    let want = frame_h * aspect + 2.0 * MON_MARGIN;
+    let spare = monitor_w + pool_w - POOL_DEFAULT - want;
+    (POOL_DEFAULT + spare.max(0.0)).min(POOL_MAX)
+}
+
 /// Videobilder für die Vorschau: ein Hintergrund-Decoder je Medium (siehe `AsyncDecoder`).
 pub struct PreviewFrames {
     pub decs: HashMap<Uuid, AsyncDecoder>,
@@ -369,14 +386,31 @@ impl App {
     }
 
     /// Vorschau-Bereich: Kopfzeile mit Zeitcode, Monitor (Projekt oder Quelle), Quellleiste, Transportleiste.
+    /// Breite des Medienpools, bei der der Monitor das Filmbild ohne breite seitliche Ränder zeigt (Hochformat): Was neben
+    /// dem eingepassten Bild frei bliebe, bekommt der Pool; nie schmaler als üblich, höchstens `POOL_MAX`.
+    /// `space` = Breite für Monitor und Pool zusammen (links vom Inspektor).
+    pub(crate) fn fitted_pool_width(&mut self, space: f32) -> Option<f32> {
+        let r = self.preview_rect;
+        if !r.is_positive() || self.pool_w <= 0.0 || self.source.is_some() {
+            return None;
+        }
+        let (rw, rh) = (self.project.render_width, self.project.render_height);
+        let key = (rw, rh, (r.height() / 8.0).round() as i32, (space / 8.0).round() as i32);
+        if self.pool_fit_key == Some(key) {
+            return None;
+        }
+        self.pool_fit_key = Some(key);
+        let w = pool_width_for(space - POOL_DEFAULT, r.height(), POOL_DEFAULT, rw as f32 / rh.max(1) as f32);        ((w - self.pool_w).abs() > 1.0).then_some(w)
+    }
+
     pub(crate) fn preview_pane(&mut self, ui: &mut Ui) {
         let full = ui.available_rect_before_wrap();
         self.preview_rect = full;
         let pane = ui.allocate_rect(full, Sense::hover());
         let in_source = self.source.is_some();
         let bar_h = if in_source { 56.0 } else { 0.0 };
-        let header = Rect::from_min_size(full.min, Vec2::new(full.width(), 26.0));
-        let transport = Rect::from_min_max(egui::pos2(full.left(), full.bottom() - 38.0), full.max);
+        let header = Rect::from_min_size(full.min, Vec2::new(full.width(), MON_HEADER));
+        let transport = Rect::from_min_max(egui::pos2(full.left(), full.bottom() - MON_TRANSPORT), full.max);
         let source_bar = Rect::from_min_max(egui::pos2(full.left(), transport.top() - bar_h), egui::pos2(full.right(), transport.top()));
         let monitor = Rect::from_min_max(egui::pos2(full.left(), header.bottom()), egui::pos2(full.right(), source_bar.top()));
 
@@ -422,7 +456,7 @@ impl App {
             }
         }
 
-        let area = monitor.shrink(30.0);
+        let area = monitor.shrink(MON_MARGIN);
         if let Some((_, a)) = &src {
             // Quelle: Bild einpassen; Ziehen aus dem Monitor legt den gewählten Bereich auf die Timeline
             let ctx = ui.ctx().clone();

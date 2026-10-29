@@ -494,18 +494,25 @@ impl App {
                 .default_size(340.0)
                 .size_range(300.0..=460.0)
                 .show_inside(ui, |ui| self.inspector_panel(ui));
-            egui::Panel::right("pool")
+            // Der Pool nimmt den Platz, den der Monitor neben dem Filmbild nicht braucht (Hochformat); neu eingepasst wird nur
+            // nach Änderung von Filmformat, Fenstergröße oder Monitorhöhe, von Hand gezogen bleibt die Breite bis dahin
+            let mut pool = egui::Panel::right("pool")
                 .frame(Frame::new().fill(PANEL))
                 .resizable(true)
-                .default_size(340.0)
-                .size_range(260.0..=900.0)
-                .show_inside(ui, |ui| {
+                .default_size(crate::ui::monitor::POOL_DEFAULT)
+                .size_range(260.0..=crate::ui::monitor::POOL_MAX);
+            // Platz für Monitor und Pool zusammen: vom linken Rand bis zum Inspektor
+            if let Some(w) = self.fitted_pool_width(ui.available_rect_before_wrap().width()) {
+                pool = pool.exact_size(w);
+            }
+            let r = pool.show_inside(ui, |ui| {
                 if self.scope_mode != crate::scopes::ScopeMode::Off {
                     self.scopes_panel(ui);
                 } else {
                     self.pool_panel(ui);
                 }
             });
+            self.pool_w = r.response.rect.width();
             // Keyframe-Animator nur unter dem Monitor (nach den Seitenleisten, damit diese die volle Höhe behalten), solange der
             // Reiter „Effekte“ offen ist und er eingeschaltet wurde. Die Höhe wächst, schrumpft aber nicht, solange der Reiter offen
             // ist (sonst springt die Zeitleiste beim Wählen von Clips); ohne passenden Clip steht ein Hinweis in gleicher Höhe da.
