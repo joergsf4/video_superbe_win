@@ -112,8 +112,8 @@ pub struct App {
     /// (Format, Monitorhöhe, Fensterbreite)
     pub(crate) pool_w: f32,
     pub(crate) pool_fit_key: Option<(i64, i64, i32, i32)>,
-    /// Entwurf der Filmeinstellungen (Seitenverhältnis-Index, kurze Seite, Bildrate), erst „OK“ übernimmt ihn
-    pub(crate) settings_draft: Option<(usize, i64, i64)>,
+    /// Entwurf der Filmeinstellungen, erst „OK“ übernimmt ihn
+    pub(crate) settings_draft: Option<crate::ui::toolbar::SettingsDraft>,
     /// Wellenformen (Spitzenwerte je Medium) und laufende Berechnungen
     pub(crate) waveforms: HashMap<Uuid, std::sync::Arc<Vec<f32>>>,
     pub(crate) wave_jobs: HashMap<Uuid, std::sync::mpsc::Receiver<Vec<f32>>>,
@@ -956,16 +956,34 @@ impl App {
 
     pub(crate) fn import_dialog(&mut self) {
         let mut dlg = rfd::FileDialog::new();
-        if let Some(dir) = videos_dir() {
+        if let Some(dir) = self.import_start_dir() {
             dlg = dlg.set_directory(dir);
         }
         if let Some(files) = dlg
             .add_filter("Medien", &["png", "jpg", "jpeg", "mp4", "mov", "m4v", "wmv", "avi", "mkv", "mts", "m2ts", "ts", "wav", "mp3", "m4a", "aac", "wma", "flac"])
             .pick_files()
         {
+            let before = self.project.assets.len();
+            let dir = files.first().and_then(|f| f.parent()).map(|d| d.to_path_buf());
             for f in files {
                 self.import_file(f);
             }
+            self.remember_import_dir(dir, self.project.assets.len() > before);
+        }
+    }
+
+    /// Ordner, in dem der Import-Dialog öffnet: der des letzten erfolgreichen Imports, sonst „Videos“.
+    pub(crate) fn import_start_dir(&self) -> Option<PathBuf> {
+        self.prefs.last_import_dir.as_ref().map(PathBuf::from).filter(|d| d.is_dir()).or_else(videos_dir)
+    }
+
+    /// Merkt sich den Ordner, wenn daraus etwas importiert wurde (gilt auch nach einem Neustart).
+    pub(crate) fn remember_import_dir(&mut self, dir: Option<PathBuf>, imported: bool) {
+        let Some(dir) = dir.filter(|_| imported) else { return };
+        let s = dir.to_string_lossy().into_owned();
+        if self.prefs.last_import_dir.as_deref() != Some(s.as_str()) {
+            self.prefs.last_import_dir = Some(s);
+            self.save_prefs();
         }
     }
 

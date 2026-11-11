@@ -1723,3 +1723,111 @@ fn export_dialog_presets_cache_window_and_rename_render() {
     assert_eq!(h.app.project.tracks[2].name, "Spur 3", "leer = wieder „Spur N“");
 }
 
+
+#[test]
+fn movie_settings_keep_21_9_and_custom_ratios() {
+    use crate::ui::toolbar::{reduce, same_ratio, SettingsDraft};
+    // 21:9 mit 1080 Zeilen = 2520 × 1080 (gekürzt 7:3) wird wieder als 21:9 erkannt (#2)
+    assert_eq!(App::settings_size((21.0, 9.0), 1080), (2520, 1080));
+    assert!(same_ratio((2520.0, 1080.0), (21.0, 9.0)));
+    assert!(!same_ratio((2520.0, 1080.0), (16.0, 9.0)));
+    assert_eq!(App::settings_size((2.39, 1.0), 1080), (2582, 1080));
+    assert_eq!(App::settings_size((9.0, 16.0), 1080), (1080, 1920));
+    assert_eq!(reduce((2560.0, 1080.0)), (64.0, 27.0));
+    assert_eq!(reduce((1000.0, 563.0)), (1.78, 1.0), "krumme Maße als x : 1");
+    let (mut p, _) = project();
+    (p.render_width, p.render_height, p.fps) = (2520, 1080, 30);
+    let mut h = H::new(p);
+    h.app.show_settings = true;
+    h.frames(3);
+    let d = h.app.settings_draft.expect("Entwurf");
+    assert!(same_ratio(d.ratio, (21.0, 9.0)) && d.short == 1080 && d.fps == 30, "{d:?}");
+    // OK nach Änderung nur der Bildrate: Format bleibt
+    let mut q = h.app.project.clone();
+    App::apply_settings(&mut q, SettingsDraft { fps: 25, ..d }, d);
+    assert_eq!((q.render_width, q.render_height, q.fps), (2520, 1080, 25));
+    // ein Format außerhalb der Liste (1000 × 563) bleibt ebenfalls unverändert
+    let odd = SettingsDraft { ratio: (1000.0, 563.0), short: 563, fps: 30 };
+    App::apply_settings(&mut q, SettingsDraft { fps: 24, ..odd }, odd);
+    assert_eq!((q.render_width, q.render_height, q.fps), (2520, 1080, 24), "Pixelmaß unverändert");
+    // eigenes Verhältnis 2,76 : 1 bei 1080
+    App::apply_settings(&mut q, SettingsDraft { ratio: (2.76, 1.0), ..d }, d);
+    assert_eq!((q.render_width, q.render_height), (2980, 1080));
+    h.app.show_settings = false;
+    h.frames(2);
+    assert!(h.app.settings_draft.is_none());
+}
+
+#[test]
+fn preview_follows_photo_to_photo() {
+    // zwei Fotos direkt hintereinander: das Vorschaubild wechselt (#5)
+    let mut p = Project::default();
+    let red = solid_png("gui_p2p_red.png", 64, 36, [220, 20, 20]);
+    let blue = solid_png("gui_p2p_blue.png", 64, 36, [20, 20, 220]);
+    let a = image_asset(&mut p, &red, 64.0, 36.0);
+    let b = image_asset(&mut p, &blue, 64.0, 36.0);
+    p.tracks[0].clips.push(clip(a, 0.0, 2.0));
+    p.tracks[0].clips.push(clip(b, 2.0, 2.0));
+    let mut h = H::new(p);
+    h.app.playhead = 1.0;
+    h.frames(3);
+    let (n, k1) = (h.app.preview.renders, h.app.preview.dbg_key());
+    h.app.playhead = 3.0;
+    h.frames(3);
+    assert!(h.app.preview.renders > n, "neues Bild beim Wechsel auf das zweite Foto");
+    assert_ne!(h.app.preview.dbg_key(), k1);
+    let m = h.app.preview.renders;
+    h.app.playhead = 3.5;
+    h.frames(2);
+    assert_eq!(h.app.preview.renders, m, "innerhalb desselben Fotos kein neues Zusammensetzen");
+}
+
+#[test]
+fn import_dialog_remembers_the_folder() {
+    let (p, _) = project();
+    let mut h = H::new(p);
+    let dir = std::env::temp_dir().join("video-superbe-tests").join("import-dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    h.app.prefs.last_import_dir = None;
+    h.app.remember_import_dir(Some(dir.clone()), false);
+    assert!(h.app.prefs.last_import_dir.is_none(), "nichts importiert: nicht merken");
+    h.app.remember_import_dir(Some(dir.clone()), true);
+    assert_eq!(h.app.import_start_dir(), Some(dir.clone()), "#4: dort öffnet der Dialog wieder");
+    // Ordner gelöscht: zurück auf „Videos“
+    h.app.prefs.last_import_dir = Some(dir.join("gibt-es-nicht").to_string_lossy().into_owned());
+    assert_eq!(h.app.import_start_dir(), crate::app::videos_dir());
+}
+
+#[test]
+fn pixel_aspect_stretches_anamorphic_media() {
+    // quadratisches Bild mit Pixel-Seitenverhältnis 2 füllt ein 2:1-Bild ganz aus (#3)
+    let mut p = Project::default();
+    let red = solid_png("gui_par_red.png", 40, 40, [220, 20, 20]);
+    let a = image_asset(&mut p, &red, 40.0, 40.0);
+    p.tracks[0].clips.push(clip(a, 0.0, 2.0));
+    (p.render_width, p.render_height) = (200, 100);
+    let px = |p: &Project, x: usize| {
+        let b = crate::render::Renderer::new().render(p, 0.5, 200, 100);
+        let o = (50 * 200 + x) * 4;
+        [b[o], b[o + 1], b[o + 2]]
+    };
+    assert!(px(&p, 10)[0] < 30, "ohne Seitenverhältnis: schwarzer Rand links");
+    p.assets[0].pixel_aspect = Some(2.0);
+    assert_eq!(p.assets[0].display_width(), 80.0);
+    assert!(px(&p, 10)[0] > 150, "anamorph: Bild reicht bis an den Rand");
+    // Projektdatei: Feld nur, wenn gesetzt
+    let j = serde_json::to_string(&p.assets[0]).unwrap();
+    assert!(j.contains("\"pixelAspect\":2.0"), "{j}");
+    p.assets[0].pixel_aspect = None;
+    assert!(!serde_json::to_string(&p.assets[0]).unwrap().contains("pixelAspect"));
+    // Inspektor zeigt die Einstellung, ohne zu stolpern
+    let id = p.tracks[0].clips[0].id;
+    let mut h = H::new(p);
+    h.app.selected = Some(id);
+    h.app.inspector_tab = 0;
+    h.frames(3);
+    let (w, h2, k) = (20, 10, 1.5);
+    let (out, nw) = crate::render::stretch_h(&vec![255u8; w * h2 * 4], w, h2, k);
+    assert_eq!((nw, out.len()), (30, 30 * 10 * 4));
+    assert!(out.iter().all(|v| *v == 255), "gleichmäßige Fläche bleibt gleich");
+}

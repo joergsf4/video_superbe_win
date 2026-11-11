@@ -34,6 +34,22 @@ pub struct MediaAsset {
     pub is_image: bool,
     #[serde(skip_serializing_if = "is_none")]
     pub is_hdr: Option<bool>,
+    /// Pixel-Seitenverhältnis (anamorphes Material: 1,33 zieht 4:3-Pixel auf 16:9); fehlt = quadratische Pixel.
+    /// Nur Windows; die Mac-Version überliest das Feld.
+    #[serde(skip_serializing_if = "is_none")]
+    pub pixel_aspect: Option<f64>,
+}
+
+impl MediaAsset {
+    /// Wirksames Pixel-Seitenverhältnis (1 = quadratisch).
+    pub fn par(&self) -> f64 {
+        self.pixel_aspect.filter(|k| (0.1..=10.0).contains(k) && (k - 1.0).abs() > 1e-6).unwrap_or(1.0)
+    }
+
+    /// Breite, wie das Bild angezeigt wird (Pixel-Seitenverhältnis eingerechnet).
+    pub fn display_width(&self) -> f64 {
+        self.width * self.par()
+    }
 }
 
 impl Default for MediaAsset {
@@ -51,6 +67,7 @@ impl Default for MediaAsset {
             transform: identity(),
             is_image: false,
             is_hdr: None,
+            pixel_aspect: None,
         }
     }
 }

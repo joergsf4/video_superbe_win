@@ -2,6 +2,54 @@ use super::*;
 use crate::app::App;
 use eframe::egui::{Align2, RichText};
 
+/// Seitenverhältnisse in den Filmeinstellungen (Breite, Höhe, Name).
+const RATIOS: [(f64, f64, &str); 10] = [
+    (16.0, 9.0, "16:9 Querformat (YouTube)"),
+    (9.0, 16.0, "9:16 Hochformat (Shorts, Reels)"),
+    (1.0, 1.0, "1:1 Quadrat"),
+    (4.0, 5.0, "4:5 Hochformat (Instagram)"),
+    (4.0, 3.0, "4:3 Querformat"),
+    (3.0, 4.0, "3:4 Hochformat"),
+    (1.85, 1.0, "1,85:1 Kino (Flat)"),
+    (2.0, 1.0, "2:1 Univisium"),
+    (21.0, 9.0, "21:9 Kino"),
+    (2.39, 1.0, "2,39:1 Cinemascope"),
+];
+
+/// Entwurf der Filmeinstellungen: Seitenverhältnis (Breite : Höhe), kurze Seite, Bildrate; erst „OK“ übernimmt ihn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SettingsDraft {
+    pub(crate) ratio: (f64, f64),
+    pub(crate) short: i64,
+    pub(crate) fps: i64,
+}
+
+/// Gleiches Seitenverhältnis (auf 0,5 % genau; gerade Pixelzahlen weichen etwas ab).
+pub(crate) fn same_ratio(a: (f64, f64), b: (f64, f64)) -> bool {
+    let (x, y) = (a.0 / a.1.max(1e-9), b.0 / b.1.max(1e-9));
+    (x / y - 1.0).abs() < 0.005
+}
+
+/// Kürzt ein Pixelmaß zu einem lesbaren Verhältnis: 2560 × 1080 → 64 : 27, krumme Werte → x : 1.
+pub(crate) fn reduce(r: (f64, f64)) -> (f64, f64) {
+    let (w, h) = (r.0.round() as i64, r.1.round() as i64);
+    if (r.0 - w as f64).abs() > 1e-6 || (r.1 - h as f64).abs() > 1e-6 || w <= 0 || h <= 0 {
+        return r;
+    }
+    let (mut a, mut b) = (w, h);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let (w, h) = (w / a, h / a);
+    if w.max(h) > 100 { ((w as f64 / h as f64 * 100.0).round() / 100.0, 1.0) } else { (w as f64, h as f64) }
+}
+
+fn ratio_text(r: (f64, f64)) -> String {
+    let (w, h) = reduce(r);
+    let f = |v: f64| if v.fract().abs() < 1e-9 { format!("{v:.0}") } else { format!("{v:.2}").replace('.', ",") };
+    format!("{}:{}", f(w), f(h))
+}
+
 impl App {
     pub(crate) fn menu_bar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
@@ -398,28 +446,11 @@ impl App {
             self.settings_draft = None;
             return;
         }
-        let ratios: [(i64, i64, &str); 7] = [
-            (16, 9, "16:9 Querformat (YouTube)"),
-            (9, 16, "9:16 Hochformat (Shorts, Reels)"),
-            (1, 1, "1:1 Quadrat"),
-            (4, 5, "4:5 Hochformat (Instagram)"),
-            (4, 3, "4:3 Querformat"),
-            (3, 4, "3:4 Hochformat"),
-            (21, 9, "21:9 Kino"),
-        ];
         let p = &self.project;
-        let draft = self.settings_draft.get_or_insert_with(|| {
-            let g = {
-                let (mut a, mut b) = (p.render_width, p.render_height);
-                while b != 0 {
-                    (a, b) = (b, a % b);
-                }
-                a.max(1)
-            };
-            let key = (p.render_width / g, p.render_height / g);
-            let idx = ratios.iter().position(|r| (r.0, r.1) == key).unwrap_or(0);
-            (idx, p.render_width.min(p.render_height), p.fps)
-        });
+        // Entwurf: Seitenverhältnis als Zahlenpaar (nicht als Listenplatz, sonst wird z. B. 2520 × 1080 = 7:3 nicht als 21:9
+        // erkannt und fällt auf 16:9 zurück, #2), kurze Seite, Bildrate
+        let initial = SettingsDraft { ratio: (p.render_width.max(1) as f64, p.render_height.max(1) as f64), short: p.render_width.min(p.render_height), fps: p.fps };
+        let draft = self.settings_draft.get_or_insert(initial);
         let mut apply = false;
         let mut cancel = false;
         egui::Window::new("Filmeinstellungen")
@@ -430,29 +461,46 @@ impl App {
                 ui.set_width(380.0);
                 egui::Grid::new("settings").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                     ui.label("Seitenverhältnis");
-                    egui::ComboBox::from_id_salt("ratio").selected_text(ratios[draft.0].2).width(260.0).show_ui(ui, |ui| {
-                        for (i, r) in ratios.iter().enumerate() {
-                            ui.selectable_value(&mut draft.0, i, r.2);
+                    let preset = RATIOS.iter().find(|r| same_ratio((r.0, r.1), draft.ratio));
+                    let custom_label = format!("Eigenes ({})", ratio_text(draft.ratio));
+                    egui::ComboBox::from_id_salt("ratio").selected_text(preset.map_or(custom_label, |r| r.2.to_string())).width(260.0).show_ui(ui, |ui| {
+                        for r in RATIOS {
+                            if ui.selectable_label(preset.is_some_and(|p| p.2 == r.2), r.2).clicked() {
+                                draft.ratio = (r.0, r.1);
+                            }
                         }
                     });
                     ui.end_row();
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        // freie Eingabe, z. B. 2,76 : 1 (Ultra Panavision) oder 5 : 4
+                        let (mut rw, mut rh) = preset.map_or_else(|| reduce(draft.ratio), |r| (r.0, r.1));
+                        let a = ui.add(egui::DragValue::new(&mut rw).range(0.1..=100.0).speed(0.01).max_decimals(2));
+                        ui.label(":");
+                        let b = ui.add(egui::DragValue::new(&mut rh).range(0.1..=100.0).speed(0.01).max_decimals(2));
+                        if a.changed() || b.changed() {
+                            draft.ratio = (rw, rh);
+                        }
+                        ui.weak(format!("= {:.3} : 1", rw / rh.max(0.001)));
+                    });
+                    ui.end_row();
                     ui.label("Auflösung");
-                    let short_label = match draft.1 { 720 => "HD (720)".to_string(), 1080 => "Full HD (1080)".to_string(), 1440 => "QHD (1440)".to_string(), 2160 => "4K (2160)".to_string(), v => format!("{v}") };
+                    let short_label = match draft.short { 720 => "HD (720)".to_string(), 1080 => "Full HD (1080)".to_string(), 1440 => "QHD (1440)".to_string(), 2160 => "4K (2160)".to_string(), v => format!("{v}") };
                     egui::ComboBox::from_id_salt("short").selected_text(short_label).width(260.0).show_ui(ui, |ui| {
                         for (v, n) in [(720, "HD (720)"), (1080, "Full HD (1080)"), (1440, "QHD (1440)"), (2160, "4K (2160)")] {
-                            ui.selectable_value(&mut draft.1, v, n);
+                            ui.selectable_value(&mut draft.short, v, n);
                         }
                     });
                     ui.end_row();
                     ui.label("Bildrate");
-                    egui::ComboBox::from_id_salt("fps").selected_text(format!("{} Bilder/s", draft.2)).width(260.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("fps").selected_text(format!("{} Bilder/s", draft.fps)).width(260.0).show_ui(ui, |ui| {
                         for f in [24, 25, 30, 50, 60] {
-                            ui.selectable_value(&mut draft.2, f, format!("{f} Bilder/s"));
+                            ui.selectable_value(&mut draft.fps, f, format!("{f} Bilder/s"));
                         }
                     });
                     ui.end_row();
                 });
-                let (w, h) = Self::settings_size(ratios[draft.0], draft.1);
+                let (w, h) = Self::settings_size(draft.ratio, draft.short);
                 ui.add_space(6.0);
                 ui.label(RichText::new(format!("Zielgröße: {w} × {h} Pixel")).color(SECONDARY).monospace());
                 ui.add_space(8.0);
@@ -467,10 +515,7 @@ impl App {
             });
         if apply {
             if let Some(d) = self.settings_draft.take() {
-                let (w, h) = Self::settings_size(ratios[d.0], d.1);
-                self.project.render_width = w;
-                self.project.render_height = h;
-                self.project.fps = d.2;
+                Self::apply_settings(&mut self.project, d, initial);
             }
             self.show_settings = false;
         } else if cancel {
@@ -479,10 +524,20 @@ impl App {
         }
     }
 
-    /// Zielgröße aus Seitenverhältnis und kurzer Seite (wie `MovieSettingsView.Model.size`).
-    pub(crate) fn settings_size(ratio: (i64, i64, &str), short: i64) -> (i64, i64) {
-        let long = ((short as f64 * ratio.0.max(ratio.1) as f64 / ratio.0.min(ratio.1) as f64 / 2.0).round() as i64) * 2;
-        if ratio.0 >= ratio.1 { (long, short) } else { (short, long) }
+    /// Übernimmt den Entwurf. Ein unverändertes Format bleibt Pixel für Pixel erhalten (OK nach Änderung nur der Bildrate).
+    pub(crate) fn apply_settings(p: &mut crate::model::Project, d: SettingsDraft, initial: SettingsDraft) {
+        if !(same_ratio(d.ratio, initial.ratio) && d.short == initial.short) {
+            (p.render_width, p.render_height) = Self::settings_size(d.ratio, d.short);
+        }
+        p.fps = d.fps;
+    }
+
+    /// Zielgröße aus Seitenverhältnis (Breite : Höhe) und kurzer Seite; beide Seiten gerade.
+    pub(crate) fn settings_size(ratio: (f64, f64), short: i64) -> (i64, i64) {
+        let (rw, rh) = (ratio.0.max(0.001), ratio.1.max(0.001));
+        let long = ((short as f64 * rw.max(rh) / rw.min(rh) / 2.0).round() as i64) * 2;
+        let short = (short / 2) * 2;
+        if rw >= rh { (long, short) } else { (short, long) }
     }
 
     /// Dialog zum Umbenennen einer Kapitelmarke.

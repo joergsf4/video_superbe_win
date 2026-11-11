@@ -123,6 +123,8 @@ impl App {
         let mut missing = false;
         for tr in self.project.tracks.iter().filter(|tr| !tr.hidden) {
             for c in tr.clips.iter().filter(|c| !c.is_audio() && t >= c.start && t < c.end()) {
+                // welche Clips sichtbar sind (sonst bleibt beim Wechsel von Foto zu Foto das erste stehen, #5)
+                sig = (sig ^ c.id.as_u64_pair().0 ^ c.id.as_u64_pair().1).wrapping_mul(0x100000001b3);
                 let Some(a) = c.asset_id().and_then(|id| self.project.asset(id)) else { continue };
                 if a.is_image {
                     continue;
@@ -326,7 +328,7 @@ impl App {
     fn source_project(&self, a: &crate::model::MediaAsset) -> crate::model::Project {
         use crate::model::*;
         let mut p = Project::default();
-        p.render_width = (a.width.max(16.0)) as i64;
+        p.render_width = (a.display_width().max(16.0)) as i64;
         p.render_height = (a.height.max(16.0)) as i64;
         let pic = MediaAsset { has_audio: false, ..a.clone() };
         p.assets.push(pic.clone());
@@ -460,7 +462,7 @@ impl App {
         if let Some((_, a)) = &src {
             // Quelle: Bild einpassen; Ziehen aus dem Monitor legt den gewählten Bereich auf die Timeline
             let ctx = ui.ctx().clone();
-            let aspect = (a.width.max(1.0) / a.height.max(1.0)) as f32;
+            let aspect = (a.display_width().max(1.0) / a.height.max(1.0)) as f32;
             let full_area = monitor.shrink(8.0);
             let mut size = Vec2::new(full_area.width(), full_area.width() / aspect);
             if size.y > full_area.height() {

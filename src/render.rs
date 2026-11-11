@@ -84,8 +84,8 @@ impl FrameSource for BlockingFrames {
 }
 
 pub struct Renderer {
-    /// Bilder in Verkleinerungsstufen (Stufe 0 = Original)
-    images: HashMap<Uuid, Option<Vec<Arc<Img>>>>,
+    /// Bilder in Verkleinerungsstufen (Stufe 0 = Original), je Medium und Pixel-Seitenverhältnis
+    images: HashMap<(Uuid, u64), Option<Vec<Arc<Img>>>>,
     titles: HashMap<String, Arc<Img>>,
     regular: Option<FontVec>,
     bold: Option<FontVec>,
@@ -95,6 +95,8 @@ pub struct Renderer {
     luts: HashMap<String, Option<Arc<Lut>>>,
     /// Fotos mit Foto-Effekten (Auto-Verbessern, Rauschentfernung), je Medium und Einstellung, in Verkleinerungsstufen
     photos: HashMap<String, Option<Vec<Arc<Img>>>>,
+    /// zuletzt in die Breite gezogenes Videobild je Medium (Quellbild, Faktor, Ergebnis)
+    stretched: HashMap<Uuid, (MediaFrame, f64, MediaFrame)>,
     blocking: BlockingFrames,
 }
 
@@ -191,6 +193,19 @@ fn transition_kind(clip: &Clip) -> &str {
 }
 
 impl Renderer {
+    /// Videobild anamorphen Materials in die Breite ziehen (das letzte Ergebnis je Medium wird wiederverwendet).
+    fn stretch_frame(&mut self, id: Uuid, f: MediaFrame, k: f64) -> MediaFrame {
+        if let Some((src, kk, out)) = self.stretched.get(&id) {
+            if Arc::ptr_eq(src, &f) && *kk == k {
+                return out.clone();
+            }
+        }
+        let (rgba, nw) = stretch_h(&f.rgba, f.width, f.height, k);
+        let out = Arc::new(Frame { width: nw, height: f.height, rgba, time: f.time });
+        self.stretched.insert(id, (f, k, out.clone()));
+        out
+    }
+
     pub fn new() -> Self {
         Self {
             images: HashMap::new(),
@@ -200,6 +215,7 @@ impl Renderer {
             faces: HashMap::new(),
             luts: HashMap::new(),
             photos: HashMap::new(),
+            stretched: HashMap::new(),
             blocking: BlockingFrames::default(),
         }
     }
@@ -376,12 +392,12 @@ impl Renderer {
                             let levels = match photo {
                                 Some(ph) => {
                                     let (e, dn) = (ph.enhance.unwrap_or(0.0), ph.denoise.unwrap_or(0.0));
-                                    let key = format!("{}|{e:.3}|{dn:.3}", m.v);
+                                    let key = format!("{}|{e:.3}|{dn:.3}|{:.4}", m.v, asset.par());
                                     if !self.photos.contains_key(&key) {
                                         if self.photos.len() > 24 {
                                             self.photos.clear();
                                         }
-                                        let img = load_image(&asset.path).map(|mut i| {
+                                        let img = load_image_par(&asset.path, asset.par()).map(|mut i| {
                                             fxlib::photo_fx(&mut i.px, i.w, i.h, e, dn);
                                             vec![Arc::new(i)]
                                         });
@@ -389,7 +405,7 @@ impl Renderer {
                                     }
                                     self.photos.get_mut(&key).unwrap()
                                 }
-                                None => self.images.entry(m.v).or_insert_with(|| load_image(&asset.path).map(|i| vec![Arc::new(i)])),
+                                None => self.images.entry((m.v, asset.par().to_bits())).or_insert_with(|| load_image_par(&asset.path, asset.par()).map(|i| vec![Arc::new(i)])),
                             };
                             let Some(levels) = levels else { continue };
                             let (ow, oh) = Orient::from_fx(&fx).map(|o| o.dims(levels[0].w as f32, levels[0].h as f32)).map(|d| (d.0 as usize, d.1 as usize)).unwrap_or((levels[0].w, levels[0].h));
@@ -397,6 +413,8 @@ impl Renderer {
                             (Src::Img(pick_level(levels, k)), false)
                         } else {
                             let Some(f) = frames.frame(asset, c.source_in + rel * c.speed) else { continue };
+                            let k = asset.par();
+                            let f = if k == 1.0 { f } else { self.stretch_frame(asset.id, f, k) };
                             (Src::Frame(f), false)
                         }
                     }
@@ -708,6 +726,40 @@ fn blur_cov(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
 fn load_image(path: &str) -> Option<Img> {
     let i = image::open(path).ok()?.to_rgba8();
     Some(Img { w: i.width() as usize, h: i.height() as usize, px: i.into_raw() })
+}
+
+/// Bild laden und bei Pixel-Seitenverhältnis ≠ 1 in die Breite ziehen.
+fn load_image_par(path: &str, k: f64) -> Option<Img> {
+    let i = load_image(path)?;
+    if k == 1.0 {
+        return Some(i);
+    }
+    let (px, w) = stretch_h(&i.px, i.w, i.h, k);
+    Some(Img { w, h: i.h, px })
+}
+
+/// Zieht ein RGBA-Bild waagerecht um den Faktor `k` in die Breite (linear interpoliert), z. B. anamorphes Material.
+pub(crate) fn stretch_h(px: &[u8], w: usize, h: usize, k: f64) -> (Vec<u8>, usize) {
+    let nw = ((w as f64 * k).round() as usize).max(1);
+    let mut out = vec![0u8; nw * h * 4];
+    if w == 0 || h == 0 {
+        return (out, nw);
+    }
+    let step = w as f32 / nw as f32;
+    par_rows(&mut out, nw * 4, |y0, band| {
+        for (ry, row) in band.chunks_mut(nw * 4).enumerate() {
+            let src = &px[(y0 + ry) * w * 4..(y0 + ry + 1) * w * 4];
+            for x in 0..nw {
+                let sx = ((x as f32 + 0.5) * step - 0.5).clamp(0.0, (w - 1) as f32);
+                let (i, f) = (sx as usize, sx.fract());
+                let j = (i + 1).min(w - 1);
+                for c in 0..4 {
+                    row[x * 4 + c] = (src[i * 4 + c] as f32 * (1.0 - f) + src[j * 4 + c] as f32 * f + 0.5) as u8;
+                }
+            }
+        }
+    });
+    (out, nw)
 }
 
 /// Wählt die Verkleinerungsstufe, deren Auflösung zur Darstellungsgröße passt (k = Zielpixel je Quellpixel).

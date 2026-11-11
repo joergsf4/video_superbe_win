@@ -16,7 +16,7 @@ pub use monitor::PreviewState;
 mod pool;
 pub(crate) mod timeline;
 pub(crate) mod volume;
-mod toolbar;
+pub(crate) mod toolbar;
 
 use eframe::egui::{self, Color32, FontFamily, FontId, Response, Sense, Ui, Vec2};
 

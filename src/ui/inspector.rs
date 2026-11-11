@@ -59,6 +59,10 @@ impl App {
                 },
             );
         }
+        if let Some(a) = c.asset_id().and_then(|a| self.project.asset(a)).filter(|a| a.has_video || a.is_image).cloned() {
+            ui.add_space(6.0);
+            self.pixel_aspect_row(ui, &a);
+        }
         ui.add_space(8.0);
         let (title, max) = if c.is_audio() { ("Lautstärke", 2.0) } else { ("Deckkraft", 1.0) };
         let mut v = c.volume;
@@ -113,6 +117,45 @@ impl App {
         }
         ui.add_space(8.0);
         ui.label(RichText::new(format!("Start  {}\nDauer  {}", timecode(c.start, fps), timecode(c.duration, fps))).size(11.5).monospace().color(SECONDARY));
+    }
+
+    /// Pixel-Seitenverhältnis des Mediums: entzerrt anamorphes Material (gilt für alle Clips dieses Mediums).
+    fn pixel_aspect_row(&mut self, ui: &mut Ui, a: &MediaAsset) {
+        const PRESETS: [(f64, &str); 6] = [
+            (1.0, "Quadratisch (normal)"),
+            (4.0 / 3.0, "Anamorph 1,33× (4:3 → 16:9)"),
+            (1.5, "Anamorph 1,5×"),
+            (1.55, "Anamorph 1,55×"),
+            (1.8, "Anamorph 1,8×"),
+            (2.0, "Anamorph 2×"),
+        ];
+        let cur = a.par();
+        let preset = PRESETS.iter().find(|p| (p.0 - cur).abs() < 1e-3);
+        let mut set: Option<f64> = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Pixel-Seitenverhältnis").size(12.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut k = cur;
+                if ui.add(egui::DragValue::new(&mut k).range(0.5..=3.0).speed(0.005).fixed_decimals(3).suffix("×")).on_hover_text("Eigener Faktor: Breite eines Pixels im Verhältnis zur Höhe").changed() {
+                    set = Some(k);
+                }
+                egui::ComboBox::from_id_salt(("par", a.id)).width(150.0).selected_text(preset.map_or("Eigenes", |p| p.1)).show_ui(ui, |ui| {
+                    for (k, name) in PRESETS {
+                        if ui.selectable_label(preset.is_some_and(|p| p.0 == k), name).clicked() {
+                            set = Some(k);
+                        }
+                    }
+                });
+            });
+        });
+        if cur != 1.0 {
+            caption(ui, &format!("Anzeige {}×{} · gilt für alle Clips dieses Mediums", a.display_width().round() as i64, a.height as i64));
+        }
+        if let Some(k) = set {
+            if let Some(m) = self.project.assets.iter_mut().find(|m| m.id == a.id) {
+                m.pixel_aspect = ((k - 1.0).abs() > 1e-6).then_some(k);
+            }
+        }
     }
 
     /// Regler mit Keyframe-Raute: animierte Kanäle zeigen den Wert an der Abspielposition und setzen beim Ziehen

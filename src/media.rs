@@ -144,11 +144,13 @@ pub struct Prefs {
     pub export_presets: Vec<crate::export::ExportPresetItem>,
     /// Zuletzt gewählte Voreinstellung im Export-Dialog
     pub last_export_preset: Option<String>,
+    /// Ordner des letzten erfolgreichen Imports (dort öffnet der Import-Dialog wieder, #4)
+    pub last_import_dir: Option<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { pool_view: PoolView::Large, pool_sort: PoolSort::Imported, pool_ascending: true, copy_imports_local: false, export_presets: vec![], last_export_preset: None }
+        Prefs { pool_view: PoolView::Large, pool_sort: PoolSort::Imported, pool_ascending: true, copy_imports_local: false, export_presets: vec![], last_export_preset: None, last_import_dir: None }
     }
 }
 

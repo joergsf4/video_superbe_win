@@ -61,7 +61,7 @@ pub fn intrinsic_size(clip: &Clip, p: &Project, title_size: impl FnOnce() -> Opt
                 return None;
             }
             let fx = &clip.fx;
-            let sw = a.width as f32 * (1.0 - fx.crop_l as f32 - fx.crop_r as f32);
+            let sw = a.display_width() as f32 * (1.0 - fx.crop_l as f32 - fx.crop_r as f32);
             let sh = a.height as f32 * (1.0 - fx.crop_t as f32 - fx.crop_b as f32);
             if sw <= 1.0 || sh <= 1.0 {
                 return None;
