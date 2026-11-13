@@ -59,6 +59,79 @@ pub fn init() {
     }
 }
 
+/// H.264-Profile, die der Decoder von Windows nicht kann: High 10 (110), High 4:2:2 (122, z. B. Panasonic GH5 „10bit
+/// 4:2:2“), High 4:4:4 (244). Liefert die Fehlermeldung oder `None`.
+pub(crate) fn unsupported_h264(path: &Path) -> Option<String> {
+    unsafe {
+        let wpath = HSTRING::from(path.as_os_str());
+        let r = MFCreateSourceReaderFromURL(PCWSTR(wpath.as_ptr()), None).ok()?;
+        let nt = r.GetNativeMediaType(VIDEO, 0).ok()?;
+        if nt.GetGUID(&MF_MT_SUBTYPE).ok()? != MFVideoFormat_H264 {
+            return None;
+        }
+        let what = match nt.GetUINT32(&MF_MT_MPEG2_PROFILE).ok()? {
+            110 => "10 Bit (High 10)",
+            122 => "10 Bit, 4:2:2 (High 4:2:2)",
+            244 => "4:4:4 (High 4:4:4)",
+            _ => return None,
+        };
+        Some(format!("H.264 mit {what}"))
+    }
+}
+
+/// MPEG-Transportstrom (AVCHD `.mts`/`.m2ts`, `.ts`)?
+pub(crate) fn is_ts(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "mts" | "m2ts" | "ts")
+}
+
+/// MPEG-TS (AVCHD `.mts`/`.m2ts`, `.ts`): Die Zeitstempel beginnen nicht bei 0, sondern z. B. bei 0,75 s, und Media
+/// Foundation rechnet das nicht heraus. Liefert den gemeinsamen Versatz von Bild und Ton in Sekunden (sonst 0), damit
+/// Quellzeit 0 das erste Bild ist und das Ende nicht abgeschnitten wird (#6). Je Datei einmal ermittelt.
+pub(crate) fn time_offset(path: &Path) -> f64 {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, f64>>> = std::sync::OnceLock::new();
+    if !is_ts(path) {
+        return 0.0;
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(path) {
+        return *v;
+    }
+    init();
+    // erste Zeitstempel der (noch komprimierten) Bild- und Tonspur, ohne zu decodieren
+    let first = |stream: u32| -> Option<f64> {
+        unsafe {
+            let wpath = HSTRING::from(path.as_os_str());
+            let r = MFCreateSourceReaderFromURL(PCWSTR(wpath.as_ptr()), None).ok()?;
+            r.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false).ok()?;
+            r.SetStreamSelection(stream, true).ok()?;
+            for _ in 0..8 {
+                let (mut fl, mut ts) = (0u32, 0i64);
+                let mut smp: Option<IMFSample> = None;
+                r.ReadSample(stream, 0, None, Some(&mut fl), Some(&mut ts), Some(&mut smp)).ok()?;
+                if smp.is_some() {
+                    return Some(ts as f64 / 1e7);
+                }
+                if fl & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                    break;
+                }
+            }
+            None
+        }
+    };
+    let off = match (first(VIDEO), first(AUDIO)) {
+        (Some(v), Some(a)) => v.min(a),
+        (Some(v), None) => v,
+        (None, Some(a)) => a,
+        _ => 0.0,
+    }
+    .max(0.0);
+    cache.lock().unwrap().insert(path.to_path_buf(), off);
+    off
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Info {
     pub duration: f64,
@@ -96,6 +169,11 @@ pub struct Decoder {
     /// Zeit, ab der die Quelle nach dem letzten Lesen weiterläuft (für sequentielles Lesen).
     next_time: f64,
     eof: bool,
+    /// Zeitstempel des ersten Bildes und Versatz der Zeitstempel der Datei (MPEG-TS, siehe `time_offset`)
+    first_time: f64,
+    t_off: f64,
+    /// So weit vor dem Ziel setzt ein Sprung an (gelernt: MPEG-TS landet bis über 1 s hinter der Sprungposition)
+    seek_back: f64,
 }
 
 fn pack_u32_pair(v: u64) -> (u32, u32) {
@@ -122,6 +200,11 @@ impl Decoder {
 
     pub fn open(path: &Path) -> Result<Self, String> {
         init();
+        // H.264 mit 10 Bit bzw. 4:2:2 kann Windows nicht decodieren; gar nicht erst versuchen (manche Grafiktreiber hängen
+        // dabei, #10)
+        if let Some(e) = unsupported_h264(path) {
+            return Err(e);
+        }
         let mut last_err = String::new();
         // H.265 (HEVC) in MP4/MOV: eigener Weg über die Grafikkarte bzw. libde265, ohne Umweg über Media Foundation
         let is_hevc = crate::hevc::parse_file(path).is_ok();
@@ -134,6 +217,7 @@ impl Decoder {
                 Ok(mut d) => match d.read_one() {
                     Some(f) => {
                         d.next_time = f.time;
+                        d.first_time = f.time;
                         d.last = Some(f);
                         return Ok(d);
                     }
@@ -161,6 +245,9 @@ impl Decoder {
                     last: first,
                     next_time,
                     eof: false,
+                    first_time: 0.0,
+                    t_off: 0.0,
+                    seek_back: 0.0,
                 })
             }
             Err(he) => Err(if he.starts_with("Keine HEVC") { last_err } else if is_hevc { format!("Format (HEVC): {he}") } else { format!("{last_err}; HEVC: {he}") }),
@@ -231,6 +318,9 @@ impl Decoder {
                 flip: d3d && cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|v| (v as i32) < 0).unwrap_or(false),
                 last: None,
                 next_time: -1.0,
+                first_time: 0.0,
+                t_off: time_offset(path),
+                seek_back: 0.0,
                 eof: false,
             })
         }
@@ -300,13 +390,15 @@ impl Decoder {
             let (w, h) = (ow, oh);
             let _ = buf.Unlock();
             let (fw, fh, rgba) = rotate(out, w, h, self.info.rotation);
-            Some(Frame { width: fw, height: fh, rgba, time: ts as f64 / 1e7 })
+            Some(Frame { width: fw, height: fh, rgba, time: ts as f64 / 1e7 - self.t_off })
         }
     }
 
     /// Liefert das Bild, das zur Quellzeit `t` gehört (Sekunden).
     pub fn frame_at(&mut self, t: f64) -> Option<&Frame> {
-        let t = t.max(0.0);
+        // 0,1 ms Spielraum: Anfragen genau auf dem Bildraster (Export) dürfen durch Rundung nicht vor dem Bild landen,
+        // sonst wird ein Bild wiederholt und das nächste übersprungen
+        let t = t.max(0.0) + 1e-4;
         let frame_dt = 1.0 / self.info.fps.max(1.0);
         if let Some(h) = self.hevc.as_mut() {
             if let Some(f) = &self.last {
@@ -327,15 +419,38 @@ impl Decoder {
             }
         }
         let at_start = have.is_none() && t < 0.001 && self.next_time < 0.0;
+        // vor dem ersten Bild (MPEG-TS beginnt oft erst bei 0,5–1 s): das erste Bild zeigen, ohne zu springen
+        if t < self.first_time && have.is_some_and(|ft| (ft - self.first_time).abs() < 1e-6) {
+            return self.last.as_ref();
+        }
         if !sequential && !at_start {
-            unsafe {
-                let v = windows::Win32::System::Com::StructuredStorage::PROPVARIANT::from((t * 1e7) as i64);
-                if self.reader.as_ref().is_none_or(|r| r.SetCurrentPosition(&GUID::zeroed(), &v).is_err()) {
-                    return self.last.as_ref();
+            // Media Foundation landet beim Springen in MPEG-TS (AVCHD) oft hinter dem Ziel, beim nächsten Schlüsselbild.
+            // Dann früher ansetzen und vorlesen, sonst springt jedes folgende Bild erneut und das Video ruckelt (#6).
+            let mut back = self.seek_back;
+            loop {
+                // bis zum echten Dateianfang (Quellzeit −Versatz) zurück
+                let to = (t - back).max(-self.t_off);
+                unsafe {
+                    let v = windows::Win32::System::Com::StructuredStorage::PROPVARIANT::from(((to + self.t_off) * 1e7) as i64);
+                    if self.reader.as_ref().is_none_or(|r| r.SetCurrentPosition(&GUID::zeroed(), &v).is_err()) {
+                        return self.last.as_ref();
+                    }
                 }
+                self.eof = false;
+                self.last = None;
+                let Some(f) = self.read_one() else { break };
+                let late = f.time > t && f.time > self.first_time + 1e-6;
+                self.next_time = f.time;
+                self.last = Some(f);
+                if !late || to <= -self.t_off || back >= 16.0 {
+                    break;
+                }
+                back = if back == 0.0 { 0.5 } else { back * 2.0 };
+                self.seek_back = back;
             }
-            self.eof = false;
-            self.last = None;
+            if self.last.as_ref().is_some_and(|f| f.time + frame_dt > t) {
+                return self.last.as_ref();
+            }
         }
         let mut guard = 0;
         loop {
@@ -575,4 +690,104 @@ pub fn gpu_info() -> String {
         }
     }
     out
+}
+
+/// Beispieldateien für Tests (siehe `ts_tests::samples`).
+#[cfg(test)]
+pub(crate) fn ts_tests_samples(ext: &[&str]) -> Vec<std::path::PathBuf> {
+    ts_tests::samples(ext)
+}
+
+#[cfg(test)]
+mod ts_tests {
+    use super::*;
+
+    /// Beispieldateien (AVCHD usw.): `VSB_SAMPLES` oder der Ordner `samples` neben dem Repository.
+    pub(crate) fn samples(ext: &[&str]) -> Vec<std::path::PathBuf> {
+        let dir = std::env::var_os("VSB_SAMPLES").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("samples"));
+        let mut v: Vec<_> = std::fs::read_dir(dir).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| ext.iter().any(|x| e.eq_ignore_ascii_case(x)))).collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    fn mad(a: &[u8], b: &[u8]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as u64).sum::<u64>() as f64 / a.len().max(1) as f64
+    }
+
+    /// #6: 50p-AVCHD ruckelte, weil Sprünge in MPEG-TS hinter dem Ziel landen, die Zeitstempel bei ~0,75 s beginnen und
+    /// der Ton nach einem Sprung um einen AC-3-Block verschoben war.
+    #[test]
+    fn mpeg_ts_seeks_land_exactly_and_audio_stays_in_place() {
+        let files = samples(&["mts", "m2ts"]);
+        if files.is_empty() {
+            eprintln!("keine AVCHD-Beispieldatei, Test übersprungen");
+            return;
+        }
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let mut d = Decoder::open(&path).expect("öffnen");
+            d.step = 2;
+            let fps = d.info.fps;
+            assert!(d.last.as_ref().is_some_and(|f| f.time.abs() < 0.03), "{name}: Quellzeit 0 = erstes Bild");
+            // Folgebilder ab einem Sprung: jedes Bild neu, Zeit passt
+            let mut prev: Option<Vec<u8>> = None;
+            for i in 0..40 {
+                let t = 2.0 + i as f64 / fps;
+                let (ft, px) = d.frame_at(t).map(|f| (f.time, f.rgba.clone())).unwrap();
+                assert!((ft - t).abs() < 0.5 / fps, "{name}: Bild bei {t:.3} hat Zeit {ft:.3}");
+                if let Some(p) = &prev {
+                    assert!(mad(p, &px) > 0.01, "{name}: Bild bei {t:.3} wiederholt das vorige");
+                }
+                prev = Some(px);
+            }
+            // rückwärts springen trifft genau
+            let ft = d.frame_at(1.0).unwrap().time;
+            assert!((ft - 1.0).abs() < 0.5 / fps, "{name}: Sprung zurück auf 1,0 landet bei {ft:.3}");
+            // letztes Bild passt zur Dauer (nichts abgeschnitten)
+            let ft = d.frame_at(d.info.duration - 0.1).unwrap().time;
+            assert!((ft - (d.info.duration - 0.1)).abs() < 0.1, "{name}: Ende bei {ft:.3}, Dauer {:.3}", d.info.duration);
+            // Ton: angesprungen = durchgelesen
+            let mut seq = crate::audio::AudioDecoder::open(&path).unwrap();
+            let mut all = vec![];
+            for k in 0..30 {
+                all.extend(seq.read(k * 4800, 4800));
+            }
+            for at in [24000usize, 96000] {
+                let mut jd = crate::audio::AudioDecoder::open(&path).unwrap();
+                let _ = jd.read(6 * 48000, 100);
+                let j = jd.read(at as i64, 4800);
+                let dev = all[at * 2..at * 2 + 9600].iter().zip(&j).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                assert!(dev < 0.02, "{name}: Ton nach Sprung auf {:.2} s weicht ab ({dev})", at as f64 / 48000.0);
+            }
+        }
+    }
+
+    /// #6 bis zum Ergebnis: Export eines Ausschnitts mit 50 Bildern/s enthält keine doppelten Bilder.
+    #[test]
+    fn mpeg_ts_export_has_no_repeated_frames() {
+        use crate::model::*;
+        let Some(path) = samples(&["mts", "m2ts"]).into_iter().next() else { return };
+        let info = probe(&path).unwrap();
+        let mut p = Project::default();
+        let a = MediaAsset { path: path.to_string_lossy().into_owned(), name: "s".into(), duration: info.duration, has_video: true, has_audio: true, width: info.width as f64, height: info.height as f64, fps: info.fps, ..Default::default() };
+        let aid = a.id;
+        p.assets.push(a);
+        let mut c = crate::render::tests::clip(aid, 0.0, 2.0);
+        c.source_in = 1.5;
+        p.tracks[0].clips.push(c);
+        (p.render_width, p.render_height, p.fps) = (320, 180, info.fps.round() as i64);
+        let out = std::env::temp_dir().join("video-superbe-tests").join("ts_export.mp4");
+        crate::export::export(&p, &out, &crate::export::ExportOpts::from_project(&p), &mut |_| true).unwrap();
+        let mut d = Decoder::open(&out).unwrap();
+        d.step = 1;
+        let (mut prev, mut dups, mut n) = (None::<Vec<u8>>, 0, 0);
+        while let Some(f) = d.read_one() {
+            if prev.as_ref().is_some_and(|p| mad(p, &f.rgba) < 0.05) {
+                dups += 1;
+            }
+            n += 1;
+            prev = Some(f.rgba);
+        }
+        assert!(n >= 95 && dups <= 1, "{n} Bilder, davon {dups} Wiederholungen");
+    }
 }

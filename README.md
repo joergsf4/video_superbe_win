@@ -90,6 +90,18 @@ VideoToolbox), Hintergrund-Effekte hinter dem Motiv und Smart-Kamerafahrt (Motiv
 außerdem Webcam- und Bildschirmaufnahme, rückwärts abspielen und automatische Untertitel per Spracherkennung.
 Projekte mit diesen Einstellungen lassen sich trotzdem öffnen und bearbeiten; die Einstellungen bleiben in der Datei erhalten.
 
+## Formate: Grenzen und Besonderheiten
+
+- **AVCHD (`.mts`, `.m2ts`)**: Windows springt in MPEG-Transportströmen ungenau (gut 1 s hinter das Ziel), die Zeitstempel
+  beginnen oft erst bei 0,5–1 s, und der AC-3-Ton liegt nach einem Sprung einen Block (32 ms) zu früh. Video superbe gleicht
+  alle drei aus; getestet mit 50p-Material einer Panasonic FZ200.
+- **H.264 mit 10 Bit, 4:2:2 oder 4:4:4** (z. B. Panasonic GH5 „10bit 4:2:2“): kann der H.264-Decoder von Windows nicht.
+  Solche Dateien werden beim Import sofort mit einem Hinweis abgewiesen (in der Kamera 8 Bit / 4:2:0 wählen oder vorher
+  umwandeln). HEVC mit 10 Bit geht dagegen (siehe unten).
+- **Fotos** werden nach ihrer EXIF-Ausrichtung gedreht (Hochkant-Aufnahmen aus Kamera und Handy).
+- Tests mit echten Kameradateien suchen sie im Ordner `samples` neben dem Repository (oder in `VSB_SAMPLES`) und werden
+  ohne diese Dateien übersprungen.
+
 ## HEVC / H.265 (iPhone, GoPro) und HDR
 
 Windows hat für Programme ohne Installation keinen HEVC-Decoder. Video superbe bringt deshalb einen eigenen Weg mit:

@@ -24,6 +24,26 @@ pub(crate) struct ExportJob {
     pub(crate) reveal: bool,
 }
 
+/// Fortschritt mehrerer Messdurchgänge (je 0…1) in einem Balken: jeder Durchgang belegt 10 %, höchstens drei, und der
+/// Balken läuft nie zurück. Ein neuer Durchgang ist daran zu erkennen, dass der Wert wieder klein wird.
+#[derive(Default)]
+pub(crate) struct Passes {
+    pass: u32,
+    last: f64,
+    shown: f64,
+}
+
+impl Passes {
+    pub(crate) fn map(&mut self, f: f64) -> f64 {
+        if f + 0.5 < self.last {
+            self.pass += 1;
+        }
+        self.last = f;
+        self.shown = self.shown.max(((self.pass as f64 + f.clamp(0.0, 1.0)) * 0.1).min(0.3));
+        self.shown
+    }
+}
+
 /// Einstellungen im Export-Fenster (vor dem Speichern-Dialog).
 pub(crate) struct ExportCfg {
     /// gewählte Voreinstellung und die (veränderbaren) Einstellungen
@@ -478,15 +498,17 @@ impl App {
         std::thread::spawn(move || {
             let mut base = 0.0;
             if cfg.normalize && export::has_audio(&p) {
-                // fehlt die Messung, wird sie vor dem Export nachgeholt; mit Limiter wird nachgemessen (erste 10–30 % des Balkens)
+                // fehlt die Messung, wird sie vor dem Export nachgeholt; mit Limiter wird bis zu zweimal nachgemessen.
+                // Jeder Durchgang belegt 10 % des Balkens, der Balken läuft nie zurück (#9).
+                let mut passes = Passes::default();
                 let mut prog = |f: f64| {
-                    pr.store((f * 100.0) as u32, Ordering::Relaxed);
+                    pr.store((passes.map(f) * 1000.0) as u32, Ordering::Relaxed);
                     !ca.load(Ordering::Relaxed)
                 };
                 let m = known.or_else(|| crate::loudness::measure(&p, range, &mut prog));
                 if let Some(m) = m {
                     let (g, limited) = crate::loudness::normalize_gain(&p, range, m, cfg.target, &mut prog);
-                    base = 0.1;
+                    base = pr.load(Ordering::Relaxed) as f64 / 1000.0;
                     opts.audio_gain = g as f32;
                     opts.limiter = true;
                     *note.lock().unwrap() = Some(format!(
@@ -1058,7 +1080,7 @@ impl App {
             self.import_failed(&p, format!("Dateityp „.{ext}“ wird nicht unterstützt. Möglich sind Videos (mp4, mov, m4v, wmv, avi, mkv, mts, m2ts, ts), Bilder (png, jpg) und Ton (wav, mp3, m4a, aac, wma, flac)."));
             return;
         }
-        match image::image_dimensions(&p) {
+        match crate::render::image_size(&p) {
             Ok((w, h)) => {
                 let a = MediaAsset {
                     path: p.to_string_lossy().into_owned(),
@@ -1154,7 +1176,11 @@ pub(crate) fn videos_dir() -> Option<PathBuf> {
 
 /// Verständliche Erklärung für einen Video-Importfehler.
 pub(crate) fn explain_video_error(e: &str) -> String {
-    if e.contains("(HEVC)") || e.contains("(hvc1)") || e.contains("(hev1)") {
+    if e.starts_with("H.264 mit ") {
+        format!(
+            "{e} kann Windows nicht decodieren. Abhilfe: in der Kamera 8 Bit / 4:2:0 wählen (bei der GH5 z. B. „FHD 8bit“) oder das Video vorher umwandeln, etwa mit HandBrake nach H.264 oder H.265."
+        )
+    } else if e.contains("(HEVC)") || e.contains("(hvc1)") || e.contains("(hev1)") {
         format!("Dieses H.265/HEVC-Video ließ sich nicht decodieren ({e}). Als Ausweg das Video vorher nach H.264 umwandeln (z. B. mit HandBrake).")
     } else if e.contains("Kein Videostrom") {
         "Die Datei enthält keinen Videostrom.".to_string()

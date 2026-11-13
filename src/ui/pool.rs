@@ -47,7 +47,7 @@ impl App {
         std::thread::spawn(move || {
             let res = (|| {
                 let rgba = if asset.is_image {
-                    image::open(&asset.path).ok()?.thumbnail(260, 160).to_rgba8()
+                    crate::render::open_image(&asset.path).ok()?.thumbnail(260, 160).to_rgba8()
                 } else if asset.has_video {
                     let d = video::Decoder::open(std::path::Path::new(&asset.path)).ok()?;
                     let f = d.last.as_ref()?;

@@ -1831,3 +1831,74 @@ fn pixel_aspect_stretches_anamorphic_media() {
     assert_eq!((nw, out.len()), (30, 30 * 10 * 4));
     assert!(out.iter().all(|v| *v == 255), "gleichmäßige Fläche bleibt gleich");
 }
+
+#[test]
+fn unsupported_h264_is_rejected_quickly_with_advice() {
+    // #10: GH5 „10bit 4:2:2“ (H.264 High 4:2:2) – sofort klare Meldung statt Decodierversuchen
+    let Some(path) = crate::video::ts_tests_samples(&["mp4"]).into_iter().find(|p| p.to_string_lossy().contains("422")) else {
+        eprintln!("keine 4:2:2-Beispieldatei, Test übersprungen");
+        return;
+    };
+    let (p, _) = project();
+    let mut h = H::new(p);
+    let before = h.app.project.assets.len();
+    let t0 = std::time::Instant::now();
+    h.app.import_file(path);
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2), "schnell: {:?}", t0.elapsed());
+    let (_, why) = h.app.import_errors.last().expect("Fehlermeldung");
+    assert!(why.contains("4:2:2") && why.contains("HandBrake"), "{why}");
+    assert_eq!(h.app.project.assets.len(), before, "nicht importiert");
+}
+
+#[test]
+fn export_progress_of_several_measuring_passes_never_runs_backwards() {
+    // #9: Messen + zwei Nachmessungen liefen je von 0 bis 10 % und fingen von vorn an
+    let mut p = crate::app::Passes::default();
+    let mut shown = vec![];
+    for _ in 0..3 {
+        for k in 0..=10 {
+            shown.push(p.map(k as f64 / 10.0));
+        }
+    }
+    assert!(shown.windows(2).all(|w| w[1] >= w[0]), "{shown:?}");
+    assert!((shown[10] - 0.1).abs() < 1e-9 && (shown[21] - 0.2).abs() < 1e-9 && (shown[32] - 0.3).abs() < 1e-9, "{shown:?}");
+    assert!(p.map(1.0) <= 0.3, "höchstens 30 % für die Messungen");
+}
+
+#[test]
+fn photos_are_rotated_by_their_exif_orientation() {
+    // #8: JPEG 40 × 20 (links rot, rechts blau) mit EXIF-Ausrichtung 6 („um 90° im Uhrzeigersinn drehen“)
+    let img = image::RgbImage::from_fn(40, 20, |x, _| if x < 20 { image::Rgb([220, 20, 20]) } else { image::Rgb([20, 20, 220]) });
+    let mut jpg = vec![];
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 95).encode_image(&img).unwrap();
+    let mut exif = b"Exif\0\0II*\0".to_vec();
+    exif.extend(8u32.to_le_bytes());
+    exif.extend(1u16.to_le_bytes());
+    exif.extend(0x0112u16.to_le_bytes());
+    exif.extend(3u16.to_le_bytes());
+    exif.extend(1u32.to_le_bytes());
+    exif.extend(6u16.to_le_bytes());
+    exif.extend(0u16.to_le_bytes());
+    exif.extend(0u32.to_le_bytes());
+    let mut file = jpg[..2].to_vec(); // SOI
+    file.extend([0xFF, 0xE1]);
+    file.extend(((exif.len() + 2) as u16).to_be_bytes());
+    file.extend(&exif);
+    file.extend(&jpg[2..]);
+    let dir = std::env::temp_dir().join("video-superbe-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("exif_rot6.jpg");
+    std::fs::write(&path, file).unwrap();
+    assert_eq!(crate::render::image_size(&path).unwrap(), (20, 40), "Hochformat");
+    let o = crate::render::open_image(&path).unwrap().to_rgb8();
+    assert_eq!(o.dimensions(), (20, 40));
+    let (top, bottom) = (o.get_pixel(10, 5), o.get_pixel(10, 35));
+    assert!(top[0] > 150 && top[2] < 90, "oben rot (vorher links): {top:?}");
+    assert!(bottom[2] > 150 && bottom[0] < 90, "unten blau: {bottom:?}");
+    // Import: Hochformat im Medienpool, Vorschau zeigt es gedreht
+    let (p, _) = project();
+    let mut h = H::new(p);
+    h.app.import_file(path);
+    let a = h.app.project.assets.last().unwrap();
+    assert!(a.is_image && (a.width, a.height) == (20.0, 40.0), "{a:?}");
+}

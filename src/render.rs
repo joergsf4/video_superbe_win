@@ -723,8 +723,30 @@ fn blur_cov(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
     }
 }
 
+/// Öffnet ein Bild und dreht bzw. spiegelt es nach der EXIF-Ausrichtung (Hochkant-Fotos aus Kamera und Handy, #8).
+pub fn open_image(path: impl AsRef<Path>) -> image::ImageResult<image::DynamicImage> {
+    use image::ImageDecoder;
+    let mut dec = image::ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let o = dec.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(dec)?;
+    img.apply_orientation(o);
+    Ok(img)
+}
+
+/// Bildgröße nach EXIF-Ausrichtung (bei 90°/270° Breite und Höhe getauscht), ohne das Bild zu decodieren.
+pub fn image_size(path: impl AsRef<Path>) -> image::ImageResult<(u32, u32)> {
+    use image::metadata::Orientation::*;
+    use image::ImageDecoder;
+    let mut dec = image::ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let (w, h) = dec.dimensions();
+    Ok(match dec.orientation().unwrap_or(NoTransforms) {
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH => (h, w),
+        _ => (w, h),
+    })
+}
+
 fn load_image(path: &str) -> Option<Img> {
-    let i = image::open(path).ok()?.to_rgba8();
+    let i = open_image(path).ok()?.to_rgba8();
     Some(Img { w: i.width() as usize, h: i.height() as usize, px: i.into_raw() })
 }
 

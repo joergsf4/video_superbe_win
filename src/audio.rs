@@ -19,6 +19,13 @@ pub struct AudioDecoder {
     /// Frame, bei dem das nächste `read` ohne Seek weitermacht.
     pos: Option<i64>,
     eof: bool,
+    /// Versatz der Zeitstempel in Frames (MPEG-TS, siehe `video::time_offset`)
+    off: i64,
+    /// So weit (Frames) vor dem Ziel setzt ein Sprung an, gelernt wie beim Bild-Decoder
+    seek_back: i64,
+    /// MPEG-TS: nach einem Sprung liefert der Decoder (AC-3) den Inhalt um einen Block später, als der Zeitstempel sagt
+    ts_file: bool,
+    after_seek: bool,
 }
 
 impl AudioDecoder {
@@ -47,18 +54,31 @@ impl AudioDecoder {
             mt.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1).map_err(e)?;
             reader.SetCurrentMediaType(AUDIO, None, &mt).map_err(|er| format!("Tonformat: {er}"))?;
             reader.SetStreamSelection(AUDIO, true).map_err(e)?;
-            Ok(Self { reader, buf: vec![], buf_start: 0, pos: None, eof: false })
+            let off = (crate::video::time_offset(path) * RATE as f64).round() as i64;
+            Ok(Self { reader, buf: vec![], buf_start: 0, pos: None, eof: false, off, seek_back: 0, ts_file: crate::video::is_ts(path), after_seek: false })
         }
     }
 
+    /// Springt vor `frame`. Media Foundation landet in MPEG-TS (AVCHD) oft hinter dem Ziel; dann früher ansetzen,
+    /// sonst fehlt nach jedem Sprung ein Stück Ton (#6).
     fn seek(&mut self, frame: i64) {
-        unsafe {
-            let v = windows::Win32::System::Com::StructuredStorage::PROPVARIANT::from(frame * 10_000_000 / RATE);
-            let _ = self.reader.SetCurrentPosition(&windows::core::GUID::zeroed(), &v);
+        let mut back = self.seek_back;
+        loop {
+            let to = (frame - back).max(-self.off);
+            unsafe {
+                let v = windows::Win32::System::Com::StructuredStorage::PROPVARIANT::from((to + self.off) * 10_000_000 / RATE);
+                let _ = self.reader.SetCurrentPosition(&windows::core::GUID::zeroed(), &v);
+            }
+            self.buf.clear();
+            self.buf_start = -1;
+            self.eof = false;
+            self.after_seek = true;
+            if !self.pull() || self.buf_start <= frame || to <= -self.off || back >= 16 * RATE {
+                break;
+            }
+            back = if back == 0 { RATE / 2 } else { back * 2 };
+            self.seek_back = back;
         }
-        self.buf.clear();
-        self.buf_start = -1;
-        self.eof = false;
     }
 
     /// Hängt das nächste decodierte Sample an. Gibt false zurück, wenn nichts mehr kommt.
@@ -82,7 +102,12 @@ impl AudioDecoder {
             let n = len as usize / 4;
             let data = std::slice::from_raw_parts(p as *const f32, n);
             if self.buf_start < 0 {
-                self.buf_start = ts * RATE / 10_000_000;
+                self.buf_start = ts * RATE / 10_000_000 - self.off;
+                // gemessen an AVCHD (AC-3): ohne Ausgleich liegt der Ton nach jedem Sprung 32 ms (ein Block) zu früh (#6)
+                if self.after_seek && self.ts_file {
+                    self.buf_start += (n / 2) as i64;
+                }
+                self.after_seek = false;
             }
             self.buf.extend_from_slice(data);
             let _ = b.Unlock();
